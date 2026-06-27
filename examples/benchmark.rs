@@ -66,7 +66,6 @@ fn main() {
                             && text == "ping"
                         {
                             info!("Received text ping, sending pong...");
-
                             let pong_text = format!("pong {}", ctx.info.id);
 
                             let reply_message = wa::Message {

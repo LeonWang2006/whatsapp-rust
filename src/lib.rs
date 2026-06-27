@@ -70,6 +70,8 @@ pub use features::{
     message_range,
 };
 
+pub mod api;
+
 pub mod bot;
 pub mod lid_pn_cache;
 pub mod spam_report;

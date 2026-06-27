@@ -14,6 +14,7 @@ use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic;
 use thiserror::Error;
 use wacore::runtime::Runtime;
 use waproto::whatsapp as wa;
@@ -40,9 +41,31 @@ impl MessageContext {
         &self,
         message: wa::Message,
     ) -> Result<crate::send::SendResult, anyhow::Error> {
-        self.client
+        let result = self
+            .client
             .send_message(self.info.source.chat.clone(), message)
-            .await
+            .await;
+
+        match &result {
+            Ok(send_result) => {
+                log::info!(
+                    target: "MessageContext",
+                    "Message SENT to {}: message_id={}",
+                    self.info.source.chat,
+                    send_result.message_id
+                );
+            }
+            Err(e) => {
+                log::error!(
+                    target: "MessageContext",
+                    "Failed to send message to {}: {}",
+                    self.info.source.chat,
+                    e
+                );
+            }
+        }
+
+        result
     }
 
     /// Build a quote context for this message.
@@ -96,10 +119,44 @@ type EventHandlerCallback =
 struct BotEventHandler {
     client: Arc<Client>,
     event_handler: Option<EventHandlerCallback>,
+    pair_code_options: Option<PairCodeOptions>,
+    pair_code_requested: Arc<atomic::AtomicBool>,
 }
 
 impl EventHandler for BotEventHandler {
     fn handle_event(&self, event: &Event) {
+        // Handle pairing code request when QR code is generated (indicates server is ready for pairing)
+        if matches!(event, Event::PairingQrCode { .. }) && self.pair_code_options.is_some() {
+            if !self
+                .pair_code_requested
+                .swap(true, atomic::Ordering::SeqCst)
+            {
+                let client_for_pair = self.client.clone();
+                let options = self.pair_code_options.clone().unwrap();
+                self.client.runtime.spawn(Box::pin(async move {
+                    // Small delay to ensure connection is fully stable
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+                    // Check if already logged in (paired via QR or existing session)
+                    if client_for_pair.is_logged_in() {
+                        info!(target: "Bot/PairCode", "Already logged in, skipping pair code request");
+                        return;
+                    }
+
+                    // Request pair code
+                    match client_for_pair.pair_with_code(options).await {
+                        Ok(code) => {
+                            info!(target: "Bot/PairCode", "Pair code generated: {}", code);
+                        }
+                        Err(e) => {
+                            warn!(target: "Bot/PairCode", "Failed to request pair code: {}", e);
+                        }
+                    }
+                })).detach();
+            }
+        }
+
+        // Call user event handler
         if let Some(handler) = &self.event_handler {
             let handler_clone = handler.clone();
             let event_clone = event.clone();
@@ -185,42 +242,14 @@ impl Bot {
                 .detach();
         }
 
+        let pair_code_requested = Arc::new(atomic::AtomicBool::new(false));
         let handler = Arc::new(BotEventHandler {
             client: self.client.clone(),
             event_handler: self.event_handler.take(),
+            pair_code_options: self.pair_code_options.take(),
+            pair_code_requested: pair_code_requested.clone(),
         });
         self.client.core.event_bus.add_handler(handler);
-
-        // If pair code options are set, spawn a task to request pair code after socket is ready
-        if let Some(options) = self.pair_code_options.take() {
-            let client_for_pair = self.client.clone();
-            self.client.runtime.spawn(Box::pin(async move {
-                // Wait for socket to be ready (before login) with 30 second timeout
-                if let Err(e) = client_for_pair
-                    .wait_for_socket(std::time::Duration::from_secs(30))
-                    .await
-                {
-                    warn!(target: "Bot/PairCode", "Timeout waiting for socket: {}", e);
-                    return;
-                }
-
-                // Check if already logged in (paired via QR or existing session)
-                if client_for_pair.is_logged_in() {
-                    info!(target: "Bot/PairCode", "Already logged in, skipping pair code request");
-                    return;
-                }
-
-                // Request pair code
-                match client_for_pair.pair_with_code(options).await {
-                    Ok(code) => {
-                        info!(target: "Bot/PairCode", "Pair code generated: {}", code);
-                    }
-                    Err(e) => {
-                        warn!(target: "Bot/PairCode", "Failed to request pair code: {}", e);
-                    }
-                }
-            })).detach();
-        }
 
         let client_for_run = self.client.clone();
         let (done_tx, done_rx) = futures::channel::oneshot::channel::<()>();

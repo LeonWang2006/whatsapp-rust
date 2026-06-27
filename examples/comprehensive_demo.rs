@@ -126,9 +126,14 @@ async fn handle_event(
 
         // Message Events
         Event::Message(msg, info) => {
+            let direction = if info.source.is_from_me {
+                "SENT"
+            } else {
+                "RECEIVED"
+            };
             info!(
-                "Message from {}: message_id={}",
-                info.source.sender, info.id
+                "Message [{}]: from={}, message_id={}",
+                direction, info.source.sender, info.id
             );
 
             let ctx = MessageContext {
