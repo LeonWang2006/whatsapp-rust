@@ -11,6 +11,13 @@ const GROUP_DEVICES_MEMO_CAPACITY: u64 = 64;
 /// entry is only the device list plus its member set.
 const DM_DEVICES_MEMO_CAPACITY: u64 = 512;
 
+/// `authenticated_generation` when no connection has published one.
+///
+/// Not zero: that is a real generation, the one a freshly built client is on,
+/// so zero would read as authenticated before anything had authenticated.
+/// `connection_generation` only ever counts up, so this can never collide.
+pub(crate) const NO_AUTHENTICATED_GENERATION: u64 = u64::MAX;
+
 impl Drop for Client {
     fn drop(&mut self) {
         self.signal_shutdown_sync();
@@ -41,6 +48,7 @@ impl Client {
         self.expected_disconnect.store(true, Ordering::Relaxed);
         self.is_running.store(false, Ordering::Relaxed);
         self.shutdown_notifier.notify();
+        self.notify_session_state();
         #[cfg(feature = "client-lifecycle")]
         if let Some(lifecycle) = &self.lifecycle {
             lifecycle.signal_shutdown_sync();
@@ -62,6 +70,18 @@ impl Client {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .notify();
+        // Also the session signal, because this is the one point every
+        // connection ends through — planned or fatal. `handle_stream_error`
+        // makes a client terminal by setting `enable_auto_reconnect` and
+        // `expected_disconnect` and then calling only this; work parked in
+        // `await_connection` would otherwise wait for the run loop to unwind far
+        // enough to announce it, and the invariant on `is_terminal` promises
+        // better than "eventually, if some other loop gets there".
+        //
+        // A teardown that a reconnect follows wakes the wait for nothing, which
+        // costs a state re-read and a re-park. That is the trade this notifier
+        // is built for.
+        self.notify_session_state();
     }
 
     /// Reset the per-connection notifier. Call at the start of each new
@@ -79,23 +99,75 @@ impl Client {
         self.expected_disconnect.load(Ordering::Relaxed) || !self.is_running.load(Ordering::Relaxed)
     }
 
-    /// Whether the client is going away for good, as opposed to between
+    /// Whether the client is finished for good, as opposed to being between
     /// connections.
     ///
-    /// [`is_shutting_down`](Self::is_shutting_down) answers both at once, and
-    /// that conflation is a trap for anything that outlives a connection: a
-    /// planned reconnect makes it true, so work that treats it as "stop" throws
-    /// itself away instead of waiting for the replacement. Callers that must
-    /// survive a reconnect want this; callers that must not touch the socket
-    /// right now want `is_shutting_down`.
-    pub(crate) fn is_stopping(&self) -> bool {
-        !self.is_running.load(Ordering::Relaxed)
+    /// [`is_shutting_down`](Self::is_shutting_down) answers both at once, which
+    /// is a trap for work that outlives a connection: a planned reconnect makes
+    /// it true, so anything reading it as "stop" throws itself away instead of
+    /// waiting for the replacement.
+    ///
+    /// Built from the signals that actually mean *terminal*. The shutdown
+    /// notifier is deliberately left untouched by reconnects, and it is fired by
+    /// `disconnect`, `logout` and `signal_shutdown_sync`. The stream errors that
+    /// end a session without going through those clear `enable_auto_reconnect`
+    /// and set `expected_disconnect` together, which is what tells them apart
+    /// from an application merely turning auto-reconnect off.
+    ///
+    /// Not `is_running` on its own: that tracks whether `run()`'s supervision
+    /// loop is active, which a direct-connect client never starts, so a healthy
+    /// one would look permanently stopped the moment its application expressed a
+    /// reconnect preference.
+    ///
+    /// Every transition that can make this true fires
+    /// [`session_state_notifier`](Client::session_state_notifier), because a
+    /// waiter parked on a connection that is never coming has no other way to
+    /// learn that it should stop.
+    pub(crate) fn is_terminal(&self) -> bool {
+        if self.shutdown_signal().is_fired() {
+            return true;
+        }
+        // `enable_auto_reconnect` alone is a preference, not proof: it is public,
+        // and an application may clear it on a healthy connection to mean "do
+        // not come back after this one ends". The internal paths that really do
+        // end the session — conflict, 516, an unrecoverable connect failure —
+        // always set `expected_disconnect` alongside it, so the pair is what
+        // separates a policy from a verdict.
+        //
+        // The second half is the run loop's own exit: it stops by clearing
+        // `is_running` and breaking, without firing the notifier or touching
+        // `expected_disconnect`, so that pairing has to count too. It is read
+        // together with a dead socket, because `is_running` is also false for a
+        // direct-connect client that never started a supervision loop — and one
+        // of those with a live connection is not finished, it just never had a
+        // loop to end. By the time the run loop breaks, `cleanup_connection_state`
+        // has already cleared `is_connected`, so the real exit still reads as one.
+        !self.enable_auto_reconnect.load(Ordering::Relaxed)
+            && (self.expected_disconnect.load(Ordering::Relaxed)
+                || (!self.is_running.load(Ordering::Relaxed) && !self.is_connected()))
     }
 
-    /// Whether a planned reconnect is in flight: the client is staying, but the
-    /// socket is not usable and anything sent now is a no-op.
-    pub(crate) fn is_reconnecting(&self) -> bool {
-        self.expected_disconnect.load(Ordering::Relaxed) && !self.is_stopping()
+    /// Wake everything waiting on whether this client can still do work.
+    ///
+    /// Call after any store that may have flipped [`is_terminal`](Self::is_terminal)
+    /// or completed authentication. Spurious calls are free: every waiter
+    /// re-reads the state and parks again, so this is only ever a hint that the
+    /// answer is worth asking for again.
+    pub(crate) fn notify_session_state(&self) {
+        self.session_state_notifier.notify(usize::MAX);
+    }
+
+    /// The supervision loop giving up for good.
+    ///
+    /// A named transition rather than two stores at the branch, because the
+    /// notify is not optional here and there is nowhere else to learn of it:
+    /// this is the only terminal transition that fires no notifier — a later
+    /// `run()` must stay possible, so the shutdown one is deliberately left
+    /// alone — and announces no socket, ever again. Work parked waiting for a
+    /// connection finds out here or not at all.
+    pub(crate) fn stop_supervision_loop(&self) {
+        self.is_running.store(false, Ordering::Relaxed);
+        self.notify_session_state();
     }
 
     /// Returns `true` when the client has completed its full startup:
@@ -370,6 +442,8 @@ impl Client {
             socket_ready_notifier: Arc::new(event_listener::Event::new()),
             is_ready: Arc::new(AtomicBool::new(false)),
             connected_notifier: Arc::new(event_listener::Event::new()),
+            authenticated_generation: Arc::new(AtomicU64::new(NO_AUTHENTICATED_GENERATION)),
+            session_state_notifier: Arc::new(event_listener::Event::new()),
             major_sync_task_sender: tx,
             pairing_cancellation_tx: Arc::new(Mutex::new(None)),
             pairing_qr_refresh_tx: Arc::new(Mutex::new(None)),
@@ -566,7 +640,7 @@ impl Client {
 
             if !self.enable_auto_reconnect.load(Ordering::Relaxed) {
                 info!("Auto-reconnect disabled, shutting down.");
-                self.is_running.store(false, Ordering::Relaxed);
+                self.stop_supervision_loop();
                 break;
             }
 
@@ -758,6 +832,16 @@ impl Client {
         // fired on the prior cleanup_connection_state.
         self.reset_connection_shutdown();
 
+        // Invalidated before the socket is published, not after `<success>`
+        // lands. `handle_success` sets `is_logged_in` one step before it
+        // increments the generation, and the value left behind by the *previous*
+        // connection equals the generation still in place during that step — so
+        // without this the window reads as authenticated on a generation the
+        // next instruction retires. Nothing is authenticated until this
+        // connection says so itself.
+        self.authenticated_generation
+            .store(NO_AUTHENTICATED_GENERATION, Ordering::SeqCst);
+
         *self.transport.lock().await = Some(transport);
         *self.transport_events.lock().await = Some(transport_events);
         *self.noise_socket.lock().await = Some(noise_socket);
@@ -816,6 +900,7 @@ impl Client {
         self.expected_disconnect.store(true, Ordering::Relaxed);
         self.is_running.store(false, Ordering::Relaxed);
         self.shutdown_notifier.notify();
+        self.notify_session_state();
         #[cfg(feature = "client-lifecycle")]
         self.request_lifecycle_shutdown();
 
@@ -1276,6 +1361,34 @@ impl Client {
 
     pub fn is_logged_in(&self) -> bool {
         self.is_logged_in.load(Ordering::Relaxed)
+    }
+
+    /// Whether an IQ sent right now could actually be answered.
+    ///
+    /// Three separate conditions that were once asked as one, each of which
+    /// alone admits a request that cannot come back: a socket, so there is
+    /// somewhere to send it; authentication, because `<success>` both makes the
+    /// server willing to answer and fixes the generation the answer is admitted
+    /// under; and a supervision loop, because `send_and_wait_iq` refuses without
+    /// one — a direct-connect client has no reader, so its every request would
+    /// time out.
+    ///
+    /// Authentication is read as *the generation is final*, not as
+    /// `is_logged_in` alone: that flag is set by the duplicate-`<success>` guard
+    /// one step before the increment, and a caller that binds a scope in between
+    /// binds a generation the next instruction retires.
+    pub(crate) fn can_reach_server(&self) -> bool {
+        self.is_connected()
+            && self.is_logged_in()
+            && self.authenticated_generation.load(Ordering::SeqCst)
+                == self.connection_generation.load(Ordering::SeqCst)
+            && self.is_running.load(Ordering::Relaxed)
+            // A socket already marked for retirement will answer, and then the
+            // answer will be thrown away. `reconnect_immediately` sets this
+            // before its bounded flushes and closes the transport only after,
+            // so the window is wide enough to admit a whole sync that the
+            // replacement generation then retires — attempt charged, work lost.
+            && !self.expected_disconnect.load(Ordering::Relaxed)
     }
 }
 

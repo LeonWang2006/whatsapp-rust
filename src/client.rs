@@ -1175,6 +1175,30 @@ pub struct Client {
     /// Notifier for when the client is fully connected and logged in.
     /// Triggered after Event::Connected is dispatched.
     pub(crate) connected_notifier: Arc<event_listener::Event>,
+    /// The `connection_generation` that `<success>` finished publishing.
+    ///
+    /// `is_logged_in` is set by the dedup swap that has to come *before* the
+    /// generation is incremented, so between those two stores a reader sees an
+    /// authenticated client whose generation is about to change underneath it.
+    /// Work that bound a scope in that window had every attempt rejected as
+    /// retired. This lags `connection_generation` by exactly that window, so
+    /// equality means the generation a caller is about to bind is the final one.
+    pub(crate) authenticated_generation: Arc<AtomicU64>,
+    /// Fired whenever the answer to *can work reach the server, and is it still
+    /// worth waiting* may have changed: the session authenticated, or the client
+    /// became terminal.
+    ///
+    /// Neither of the other two notifiers answers that. `socket_ready_notifier`
+    /// fires before login, so a waiter released by it can send an IQ the server
+    /// will not answer and whose generation `<success>` then retires;
+    /// `connected_notifier` fires only after the critical sync, which app-state
+    /// work must not sit through because it may *be* that sync. And nothing at
+    /// all announces a client that stops without a replacement socket ever
+    /// arriving — the case that leaves a detached retry parked forever, holding
+    /// the `Arc<Client>` whose drop would have been the only other way out.
+    ///
+    /// Every terminal transition must fire this. See [`Client::is_terminal`].
+    pub(crate) session_state_notifier: Arc<event_listener::Event>,
     pub(crate) major_sync_task_sender: async_channel::Sender<MajorSyncTask>,
     pub(crate) pairing_cancellation_tx: Arc<Mutex<Option<async_channel::Sender<()>>>>,
     /// Asks the QR rotation task to re-render the ref it is already showing.

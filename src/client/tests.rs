@@ -4705,3 +4705,49 @@ fn phash_waiter_sweep_drops_only_entries_that_lived_through_a_sweep() {
         "the sweep must never touch IQ waiters, which have their own cleanup"
     );
 }
+
+/// A non-reconnectable connect failure releases work parked in
+/// `await_connection`, having decided the session is over.
+///
+/// What this pins is the outcome, and only that. It does **not** pin the order
+/// of the stores and the notify inside `handle_connect_failure`, and no test at
+/// this level can: nothing awaits between them, so the waiter is never
+/// scheduled into the gap and the assertions below hold either way. Reordering
+/// them keeps this test green.
+///
+/// That order is held by the comment at the notify, not from here. It is worth
+/// holding because the announcement is what wakes the wait, and the wait
+/// answers by reading state — announcing first offers it a client that has not
+/// yet decided. Pinning it would mean a pause hook between the two, in
+/// production code, to catch a race that `cleanup_connection_state` and the run
+/// loop's exit both go on to correct. Not worth the hook.
+#[tokio::test]
+async fn a_terminal_connect_failure_releases_a_parked_wait() {
+    let client = create_offline_sync_test_client().await;
+    client.is_running.store(true, Ordering::Relaxed);
+
+    let waiter = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move { client.await_connection().await })
+    };
+    crate::test_utils::poll_until("the waiter to park on the notifier", || {
+        client.session_state_notifier.total_listeners() >= 1
+    })
+    .await;
+
+    // 403 is REASON_LOCKED: not transient, so no replacement is coming.
+    let failure = NodeBuilder::new("failure").attr("reason", "403").build();
+    client.handle_connect_failure(&failure.as_node_ref()).await;
+
+    assert!(
+        client.is_terminal(),
+        "the failure decided the session is over"
+    );
+    assert!(
+        !tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("and the wait must end on that decision")
+            .expect("the waiter should not panic"),
+        "reporting that no connection arrived"
+    );
+}

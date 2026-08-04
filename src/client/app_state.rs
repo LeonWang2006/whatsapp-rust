@@ -41,14 +41,56 @@ const APP_STATE_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(60 * 60);
 /// this is what a single connection can promise, and the doubling already puts
 /// the last wait minutes out.
 const APP_STATE_RETRY_MAX_ROUNDS: u32 = 8;
+/// How many extra rounds the loop may burn waiting for a writer to release a
+/// collection before the attempt budget is spent.
+const APP_STATE_RETRY_ROUND_SLACK: u32 = 4;
 
-/// Delay before retry `round` (zero-based), doubling from
+/// Delay before the attempt after `attempts` failures, doubling from
 /// [`APP_STATE_RETRY_BACKOFF_MIN`] and clamped at
 /// [`APP_STATE_RETRY_BACKOFF_MAX`].
-fn app_state_retry_backoff(round: u32) -> Duration {
+///
+/// Indexed by failed attempts rather than by loop iterations: rounds also pass
+/// while waiting for a socket or for another writer, and those are not failures
+/// to back off from. Letting them advance the exponent would put the next real
+/// attempt an hour away once the clamp is reached.
+fn app_state_retry_backoff(attempts: u32) -> Duration {
     APP_STATE_RETRY_BACKOFF_MIN
-        .saturating_mul(2u32.saturating_pow(round))
+        .saturating_mul(2u32.saturating_pow(attempts))
         .min(APP_STATE_RETRY_BACKOFF_MAX)
+}
+
+/// What a sync run actually achieved.
+///
+/// `Result<()>` could not tell "the collection is current" from "the connection
+/// went away before anything was asked", so every caller re-derived the
+/// difference from lifecycle flags — each with its own approximation, each
+/// missing a case the next one caught. The 429 and 503 stream errors are the
+/// ones they all missed: those clear `is_logged_in` without setting
+/// `expected_disconnect` or retiring the generation, so a run cut short there
+/// answered `Ok(())` and every proxy read it as done. The trigger is consumed
+/// by then, and nothing asks again.
+///
+/// Skipping is not a variant of finishing, so it is not a variant of `Ok(())`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SyncOutcome {
+    /// The server was asked, and answered until it had nothing more to send.
+    Completed,
+    /// Nothing was asked, or the run stopped with pages outstanding. Whatever
+    /// arrived is persisted, but the trigger has not been honoured and the work
+    /// is still owed.
+    Deferred,
+}
+
+/// Whether an attempt that ended this way leaves the collection still owed a
+/// sync.
+///
+/// One function rather than a condition rewritten at each caller, and phrased
+/// so that only [`SyncOutcome::Completed`] discharges the request: a deferral,
+/// an error, a variant added later — all keep it. The alternative is to
+/// enumerate the ways to fail, and the ways to fail is exactly the list that
+/// kept turning out to be one short.
+fn sync_still_owed(outcome: &Result<SyncOutcome>) -> bool {
+    !matches!(outcome, Ok(SyncOutcome::Completed))
 }
 
 /// The connection a piece of app-state work belongs to, and the clock it runs
@@ -141,11 +183,48 @@ impl BootstrapGate {
         self.0.load(Ordering::Acquire) & 1 == 1
     }
 
-    /// Arm unconditionally, for pairing: there is no scope yet, and a fresh
-    /// pairing owes a bootstrap no matter what any connection thinks.
-    pub(crate) fn arm_for_pairing(&self) {
-        self.0
-            .store(Self::encode(u64::MAX >> 1, true), Ordering::Release);
+    /// Arm for a fresh pairing, above every connection that already exists.
+    ///
+    /// Both bounds matter, and each was wrong on its own:
+    ///
+    /// Tagging above *every* generation made the gate unclearable. A freshly
+    /// paired client re-ran the 180s critical bootstrap on every connect for the
+    /// life of the session, however many times that bootstrap succeeded.
+    ///
+    /// Tagging at zero made it clearable by anything, including a scope opened
+    /// on the connection that is live when `pair-success` arrives. Its
+    /// `settle_bootstrap(scope, false)` would clear the arm before the pairing
+    /// reconnect ever happens, and the replacement connection would find nothing
+    /// owed and skip the sync pairing exists to request.
+    ///
+    /// One past the current generation is the bound that says what is meant:
+    /// nothing already in flight can clear this, and the next connection — the
+    /// one the forced 515 brings up — can.
+    ///
+    /// A floor rather than an assignment, because `current_generation` is a
+    /// sample and the tag is shared with [`Self::settle`]. An unconditional
+    /// store can lower a tag a newer connection already set — the one case where
+    /// arming would make the gate *easier* to clear — and it broke the rule
+    /// `settle_bootstrap` relies on, that the tag only ever moves forward. Both
+    /// writers now obey it.
+    pub(crate) fn arm_for_pairing(&self, current_generation: u64) {
+        let mut current = self.0.load(Ordering::Acquire);
+        loop {
+            // One past *both*, not just past the sample. `settle` admits an
+            // equal generation — that is a connection revising its own answer,
+            // which it is entitled to do — so a tag merely level with an
+            // existing one still lets that connection clear the arm.
+            let generation = (current >> 1).max(current_generation).saturating_add(1);
+            match self.0.compare_exchange_weak(
+                current,
+                Self::encode(generation, true),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     /// Record `outstanding` on behalf of `generation`, unless a newer connection
@@ -244,9 +323,32 @@ pub(crate) struct BatchedSyncOutcome {
     pub(crate) retryable: Vec<WAPatchName>,
     /// Another holder had it reserved, so this call did nothing for it.
     pub(crate) skipped: Vec<WAPatchName>,
+    /// Whether a collection IQ actually went out.
+    ///
+    /// Recorded at the send, not inferred from the buckets above. Inferring it
+    /// was wrong in a way that is worth keeping written down: `retryable` looks
+    /// like it means "the server was asked and the answer was retryable", and it
+    /// does hold those — but it also holds the collections a scope loss or a
+    /// reservation timeout dropped *before* the wire. A batch of nothing but
+    /// those reads as a real attempt under any bucket-based test.
+    reached_server: bool,
 }
 
 impl BatchedSyncOutcome {
+    /// Whether this call got as far as asking the server about anything.
+    ///
+    /// A round that reserved nothing sent no IQ and learned nothing. A retry
+    /// that charges an attempt for it spends its budget on whoever is holding
+    /// the collection — waiting again, dressed as trying.
+    pub(crate) fn reached_server(&self) -> bool {
+        self.reached_server
+    }
+
+    /// Record that a collection IQ went out. The single place that decides it.
+    fn note_reached_server(&mut self) {
+        self.reached_server = true;
+    }
+
     /// Every collection this call did not leave synced, whatever the reason.
     pub(crate) fn unsynced(&self) -> impl Iterator<Item = WAPatchName> + '_ {
         self.fatal
@@ -724,8 +826,22 @@ impl Client {
                         return;
                     }
                 };
-                if let Err(e) = self.process_app_state_sync_task(name, full_sync).await {
-                    log::warn!("App state sync task for {name:?} failed: {e}");
+                // The consumer asked once and nothing else will ask again, so
+                // this is the point that has to keep the request alive — for
+                // every way of not having synced, not just the ones the guards
+                // catch. A connection lost while the collection IQ is in flight
+                // is reported by `send_iq` as an error rather than as a
+                // deferral, and an error here used to be logged and dropped.
+                let outcome = self.process_app_state_sync_task(name, full_sync).await;
+                match &outcome {
+                    Err(e) => self.log_sync_error(&format!("app state sync for {name:?}"), e),
+                    Ok(SyncOutcome::Deferred) => {
+                        debug!(target: "Client/AppState", "App state sync for {name:?} was deferred")
+                    }
+                    Ok(SyncOutcome::Completed) => {}
+                }
+                if sync_still_owed(&outcome) {
+                    self.schedule_app_state_task_retry(name, full_sync);
                 }
             }
         }
@@ -749,8 +865,20 @@ impl Client {
             // Matches WA Web which only requests snapshot when version is undefined.
             let res = self.process_app_state_sync_task(name, false).await;
             match res {
-                Ok(()) => {
+                Ok(SyncOutcome::Completed) => {
                     wacore::telemetry::appstate_sync("ok");
+                    return Ok(());
+                }
+                // The send succeeded and the collection is now behind its own
+                // head, which is precisely the state this re-sync exists to
+                // repair. Counting it as `ok` reported a repair that did not
+                // happen; the retry is what actually carries it to the
+                // replacement connection.
+                Ok(SyncOutcome::Deferred) => {
+                    wacore::telemetry::appstate_sync("deferred");
+                    if let Some(client) = self.self_weak.get().and_then(|w| w.upgrade()) {
+                        client.schedule_app_state_task_retry(name, false);
+                    }
                     return Ok(());
                 }
                 Err(e) => {
@@ -892,6 +1020,64 @@ impl Client {
         }
     }
 
+    /// Wait until there is a connection to work on, or the client is finished.
+    ///
+    /// Returns whether one arrived. Bounded by the client's own lifetime rather
+    /// than by a duration: every number tried here was wrong in one direction or
+    /// the other, because the reconnect backoff is jittered, capped at 900s, and
+    /// followed by a handshake — there is no honest constant. Terminal is the
+    /// condition that actually means "stop waiting", and it is already tracked.
+    ///
+    /// Waits for [`Self::can_reach_server`], not for `Connected`: the caller's
+    /// question is whether its IQ can be sent and answered, and the `Connected`
+    /// notifier additionally waits for the critical sync, so a retry would sit
+    /// through a bootstrap it may itself be part of.
+    pub(crate) async fn await_connection(&self) -> bool {
+        loop {
+            if let Some(verdict) = self.connection_wait_verdict() {
+                return verdict;
+            }
+            // Both registered before the re-check, so a transition landing in the
+            // gap is not missed. Socket readiness alone is not enough to wait on:
+            // it fires before login, and nothing fires at all when the client
+            // stops without a replacement socket — a wait on it alone parks
+            // forever, holding the `Arc<Client>` whose drop is the only other
+            // way this task ends.
+            let ready = self.socket_ready_notifier.listen();
+            let session = self.session_state_notifier.listen();
+            if let Some(verdict) = self.connection_wait_verdict() {
+                return verdict;
+            }
+            futures::pin_mut!(ready);
+            futures::pin_mut!(session);
+            // A notification that does not settle the question simply loops: the
+            // wait ends on the state, never on one event.
+            futures::future::select(ready, session).await;
+        }
+    }
+
+    /// Whether [`Self::await_connection`] can stop, and with what answer.
+    fn connection_wait_verdict(&self) -> Option<bool> {
+        // Terminal first. The two are not mutually exclusive during a teardown:
+        // the stream-error paths set the terminal flags before they clear
+        // `is_logged_in` and close the transport, so asking about reachability
+        // first hands out a connection that is already ending.
+        if self.is_terminal() {
+            return Some(false);
+        }
+        if self.can_reach_server() {
+            return Some(true);
+        }
+        // A client with no supervision loop has no reader, so nothing will ever
+        // answer an IQ and no `<success>` will ever arrive. That is not terminal
+        // — the connection is fine and the application may still use it — but it
+        // is unwaitable, and the alternative is parking until the process ends.
+        if !self.is_running.load(Ordering::Relaxed) {
+            return Some(false);
+        }
+        None
+    }
+
     /// Open a scope for work starting now on the live connection.
     pub(crate) fn sync_scope(&self, deadline: Option<wacore::time::Instant>) -> SyncScope {
         SyncScope {
@@ -1000,31 +1186,39 @@ impl Client {
             // long-lived holder burn the budget without the sync being tried
             // once. Rounds still bound the loop overall.
             let mut attempts = 0u32;
-            for round in 0..APP_STATE_RETRY_MAX_ROUNDS * 2 {
+            for _ in 0..APP_STATE_RETRY_MAX_ROUNDS * APP_STATE_RETRY_ROUND_SLACK {
                 if attempts >= APP_STATE_RETRY_MAX_ROUNDS {
                     break;
                 }
-                client.runtime.sleep(app_state_retry_backoff(round)).await;
-                if client.is_stopping() {
-                    debug!(target: "Client/AppState", "App state task retry cancelled: client stopped");
+                client.runtime.sleep(app_state_retry_backoff(attempts)).await;
+                if client.is_terminal() {
+                    debug!(target: "Client/AppState", "App state task retry cancelled: client is finished");
                     return;
                 }
-                // Rebound, not discarded: nothing on the replacement connection
-                // re-issues a consumer's task, and a `full_sync` one is the
-                // snapshot request this scheduler exists to keep alive. A
-                // planned reconnect must not be what loses it.
-                scope.rebind(client.connection_generation.load(Ordering::SeqCst));
-
                 // Wait the planned reconnect out rather than spending an attempt
-                // on it. `process_app_state_sync_task` answers `Ok(())` at its
-                // own shutdown guard without contacting the server, and
-                // `expected_disconnect` makes that guard true for a reconnect as
-                // well as a stop — so attempting here would read a no-op as a
-                // completed sync and drop the request for good.
-                if client.is_reconnecting() {
-                    debug!(target: "Client/AppState", "Holding the {name:?} retry: a reconnect is in flight");
-                    continue;
+                // on it. `process_app_state_sync_task` defers at its own guard
+                // without contacting the server, so attempting here would burn
+                // the budget on rounds that never asked anything.
+                //
+                // Waited on rather than polled, and on the connection itself
+                // rather than on any particular reason there is not one:
+                // `reconnect()` tears down without setting `expected_disconnect`,
+                // so asking about the reason misses the ordinary case.
+                if !client.await_connection().await {
+                    debug!(target: "Client/AppState", "App state task retry cancelled: client is finished");
+                    return;
                 }
+
+                // Rebound after the wait, not before: the generation is only
+                // final once `<success>` has landed, which is what the wait
+                // waits for. Binding first pinned the outgoing connection's
+                // generation, and `admits` then rejected every attempt made on
+                // the replacement — rounds spent without one request being sent.
+                //
+                // Rebound rather than discarded, because nothing on the new
+                // connection re-issues a consumer's task, and a `full_sync` one
+                // is the snapshot request this scheduler exists to keep alive.
+                scope.rebind(client.connection_generation.load(Ordering::SeqCst));
 
                 let guard = match client
                     .reserve_for_sync(name, ReservationWait::Always, scope)
@@ -1038,32 +1232,34 @@ impl Client {
                         continue;
                     }
                 };
-                // The reservation wait is itself an await, so the reconnect can
-                // start inside it and the guard above is already stale. Asked
-                // again before an attempt is counted, because the callee would
-                // answer `Ok(())` at its own shutdown guard and this loop would
-                // read that no-op as the sync having happened.
-                if client.is_shutting_down() || client.admits(scope).is_err() {
+                // The reservation wait is itself an await, so the connection can
+                // go inside it and the answer above is already stale. Asked
+                // again before an attempt is counted, so a round spent waiting
+                // is not charged as one spent asking.
+                if !client.can_reach_server() || client.admits(scope).is_err() {
                     debug!(target: "Client/AppState", "Dropping the {name:?} attempt: state moved while reserving");
                     drop(guard);
                     continue;
                 }
                 attempts += 1;
-                match client.process_app_state_sync_task(name, full_sync).await {
-                    // An `Ok` only counts when the connection held throughout.
-                    // The callee breaks its pagination and answers `Ok(())` the
-                    // moment it observes a shutdown, so a reconnect starting
-                    // mid-attempt would otherwise end the scheduler and lose the
-                    // request — the `full_sync` snapshot included.
-                    Ok(()) if !client.is_shutting_down() && client.admits(scope).is_ok() => return,
-                    Ok(()) => {
-                        debug!(target: "Client/AppState", "The {name:?} attempt was cut short; keeping it queued");
-                    }
-                    Err(e) => {
-                        drop(guard);
-                        client.log_sync_error("app state task retry", &e);
-                    }
+                let outcome = client.process_app_state_sync_task(name, full_sync).await;
+                if let Err(e) = &outcome {
+                    drop(guard);
+                    client.log_sync_error("app state task retry", e);
                 }
+                // The callee says which happened, so this no longer
+                // reconstructs it from lifecycle flags. That proxy read `Ok(())`
+                // as done for every cut-short run whose reason it did not model
+                // — a 429 or 503 clears `is_logged_in` without setting
+                // `expected_disconnect` — and the request was lost with the
+                // `full_sync` snapshot it carried.
+                //
+                // `admits` still gates it: a run that completed against a
+                // retired socket completed for somebody else.
+                if !sync_still_owed(&outcome) && client.admits(scope).is_ok() {
+                    return;
+                }
+                debug!(target: "Client/AppState", "The {name:?} attempt did not settle it; keeping it queued");
             }
             warn!(
                 target: "Client/AppState",
@@ -1112,17 +1308,28 @@ impl Client {
             // exactly what the next round carries, so counting them would keep
             // the gate armed forever after any transient round.
             let mut left_unresolved = already_stranded;
-            for round in 0..APP_STATE_RETRY_MAX_ROUNDS {
-                client.runtime.sleep(app_state_retry_backoff(round)).await;
-                // Only an actual stop ends this. `is_shutting_down()` is also
-                // true for a planned reconnect, and giving up there would drop
-                // the collections for good: the trigger that asked for them is
-                // already consumed, and the reconnection path runs no bootstrap
-                // once the push name is known.
-                if client.is_stopping() {
-                    debug!(target: "Client/AppState", "App state retry cancelled: client stopped");
+            // Attempts and rounds are counted separately. A round spent waiting
+            // for a socket never reached the server, and the reconnect backoff
+            // runs far longer than these delays do, so charging it as an attempt
+            // would exhaust the budget before the replacement connection exists
+            // and drop a trigger that is already consumed.
+            let mut attempts = 0u32;
+            for _ in 0..APP_STATE_RETRY_MAX_ROUNDS * APP_STATE_RETRY_ROUND_SLACK {
+                if attempts >= APP_STATE_RETRY_MAX_ROUNDS {
+                    break;
+                }
+                client.runtime.sleep(app_state_retry_backoff(attempts)).await;
+                // Waited for, not charged for. Without this the loop spends an
+                // attempt on every offline round, and the whole budget is gone
+                // long before a reconnect that backs off in minutes returns —
+                // taking a trigger the server already considers handled.
+                if !client.await_connection().await {
+                    debug!(target: "Client/AppState", "App state retry cancelled: client is finished");
                     return;
                 }
+
+                // Rebound after the wait, not before: the connection that
+                // arrives is the one this attempt belongs to.
                 if scope.rebind(client.connection_generation.load(Ordering::SeqCst)) {
                     // The work carries over; the authority to settle does not.
                     // This run no longer belongs to the bootstrap that scheduled
@@ -1130,14 +1337,35 @@ impl Client {
                     settles = SyncSettles::JustTheCollections;
                 }
 
+                // The same guard the task retry makes, and for the same reason:
+                // the wait can resolve just as a planned reconnect begins, and
+                // the generation does not bump until cleanup. `admits(scope)` is
+                // fresh from the rebind above and would say yes to that retiring
+                // socket, so reachability is the question that catches it.
+                if !client.can_reach_server() {
+                    debug!(target: "Client/AppState", "Dropping the batched {pending:?} attempt: the connection is retiring");
+                    continue;
+                }
+
                 debug!(
                     target: "Client/AppState",
-                    "Retrying app state {pending:?} (round {}/{APP_STATE_RETRY_MAX_ROUNDS})",
-                    round + 1
+                    "Retrying app state {pending:?} (attempt {}/{APP_STATE_RETRY_MAX_ROUNDS})",
+                    attempts + 1
                 );
                 let result = client
                     .sync_collections_batched(pending.clone(), scope)
                     .await;
+                // Charged after the call, for what reached the server. A round
+                // where every collection was held by another writer sent no IQ;
+                // eight of those in a row would otherwise spend the whole budget
+                // on someone else's patch send and drop a consumed trigger.
+                let reached_server = match &result {
+                    Ok(outcome) => outcome.reached_server(),
+                    Err(_) => true,
+                };
+                if reached_server {
+                    attempts += 1;
+                }
 
                 // Rebinding here drops the outcome, not the work: publishing a
                 // retired socket's refusal could have a consumer log out the
@@ -1172,7 +1400,7 @@ impl Client {
             }
             warn!(
                 target: "Client/AppState",
-                "App state {pending:?} still unsynced after {APP_STATE_RETRY_MAX_ROUNDS} retries; \
+                "App state {pending:?} still unsynced after {attempts} attempts; \
                  leaving them to the next sync trigger"
             );
             // Consumers heard about every round that produced buckets, but a
@@ -1414,6 +1642,10 @@ impl Client {
                 timeout: Some(Duration::from_secs(30)),
             };
 
+            // Before the await, not after: the send is what spends an attempt,
+            // and an IQ that errors or times out spent one just as much as one
+            // that answered.
+            outcome.note_reached_server();
             let resp = self.send_iq(iq).await?;
 
             // The IQ can outrun the scope, so the round is re-admitted before
@@ -1682,10 +1914,17 @@ impl Client {
         &self,
         name: WAPatchName,
         full_sync: bool,
-    ) -> Result<()> {
-        if self.is_shutting_down() {
-            debug!(target: "Client/AppState", "Skipping app state sync task {:?}: client is shutting down", name);
-            return Ok(());
+    ) -> Result<SyncOutcome> {
+        // Two questions, where `is_shutting_down()` answered a blend of them: is
+        // the client finished, and can a request reach the server at all. A
+        // planned reconnect is neither — it clears `is_connected` and leaves
+        // everything else alone — so the work waits instead of stopping.
+        if self.is_terminal() || !self.can_reach_server() {
+            debug!(
+                target: "Client/AppState",
+                "Skipping app state sync task {name:?}: no usable connection"
+            );
+            return Ok(SyncOutcome::Deferred);
         }
 
         let backend = self.persistence_manager.backend();
@@ -1702,15 +1941,31 @@ impl Client {
         // has_more_patches=true without advancing the version (WA Web uses 500).
         const MAX_PAGINATION_ITERATIONS: u32 = 500;
         let mut iteration = 0u32;
+        // Every exit below still falls through to `set_version`: the pages
+        // already applied are durable whether or not the rest arrived. Only
+        // what the caller is told changes.
+        let mut outcome = SyncOutcome::Completed;
 
         while has_more {
-            if self.is_shutting_down() {
-                debug!(target: "Client/AppState", "Stopping app state sync task {:?}: shutdown detected", name);
+            if self.is_terminal() || !self.can_reach_server() {
+                debug!(target: "Client/AppState", "Stopping app state sync task {name:?}: no usable connection");
+                outcome = SyncOutcome::Deferred;
                 break;
             }
             iteration += 1;
             if iteration > MAX_PAGINATION_ITERATIONS {
                 warn!(target: "Client/AppState", "App state sync for {:?} exceeded {} iterations, aborting", name, MAX_PAGINATION_ITERATIONS);
+                // `has_more` is still set, so the persisted version is below the
+                // server's head — which is the definition of deferred, whatever
+                // the reason for stopping. Reporting completion here would have
+                // callers drop the trigger and leave it there for good.
+                //
+                // The cost is a retry that may re-page against the same
+                // non-progress, bounded by the attempt budget and its backoff.
+                // That is the cheaper mistake: this cap is a should-never-happen
+                // guard, and if it fires because the server was briefly wedged,
+                // a later attempt is the only thing that ever fixes it.
+                outcome = SyncOutcome::Deferred;
                 break;
             }
             debug!(target: "Client/AppState", "Fetching app state patch batch: name={:?} want_snapshot={want_snapshot} version={} full_sync={} has_more_previous={}", name, state.version, full_sync, has_more);
@@ -1738,8 +1993,9 @@ impl Client {
             };
 
             let resp = self.send_iq(iq).await?;
-            if self.is_shutting_down() {
-                debug!(target: "Client/AppState", "Discarding app state sync response for {:?}: shutdown detected", name);
+            if self.is_terminal() || !self.can_reach_server() {
+                debug!(target: "Client/AppState", "Discarding app state sync response for {name:?}: no usable connection");
+                outcome = SyncOutcome::Deferred;
                 break;
             }
             debug!(target: "Client/AppState", "Received IQ response for {:?}; decoding patches", name);
@@ -1829,8 +2085,8 @@ impl Client {
 
         backend.set_version(name.as_str(), state.clone()).await?;
 
-        debug!(target: "Client/AppState", "Completed and saved app state sync for {:?} (final version={})", name, state.version);
-        Ok(())
+        debug!(target: "Client/AppState", "Finished app state sync for {name:?} as {outcome:?} (final version={})", state.version);
+        Ok(outcome)
     }
 
     /// Request the missing decode keys, wait up to `timeout` for the re-share, then
@@ -3862,21 +4118,64 @@ mod bootstrap_gate_tests {
         assert!(gate.is_armed());
     }
 
-    /// Pairing has no connection to speak for, and a fresh pairing owes a
-    /// bootstrap no matter what any live connection last concluded.
+    /// A fresh pairing owes a bootstrap whatever the live connection concluded,
+    /// and only the connection that comes *after* it may say otherwise.
+    ///
+    /// Both halves have been wrong here. Arming above every generation left the
+    /// gate unclearable and re-ran the 180s critical bootstrap on every connect
+    /// forever; arming at zero let a scope already in flight on the pairing
+    /// connection clear it before the forced reconnect, so the connection that
+    /// was supposed to run the sync found nothing owed.
     #[test]
-    fn pairing_arms_over_any_connection() {
+    fn pairing_arms_over_live_connections_but_not_the_next_one() {
         let gate = BootstrapGate::new(false);
         assert!(gate.settle(9, false));
         assert!(!gate.is_armed());
 
-        gate.arm_for_pairing();
+        // `pair-success` arrives while connection 9 is live.
+        gate.arm_for_pairing(9);
         assert!(gate.is_armed());
+
         assert!(
             !gate.settle(9, false),
-            "and an ordinary connection cannot undo it"
+            "a bootstrap already in flight on the pairing connection must not \
+             answer for the sync pairing just asked for"
         );
-        assert!(gate.is_armed());
+        assert!(gate.is_armed(), "so the arm survives it");
+
+        assert!(
+            gate.settle(10, false),
+            "and the connection the forced 515 brings up can clear it"
+        );
+        assert!(
+            !gate.is_armed(),
+            "a pairing that outranked every connection would never clear, and the \
+             client would re-run the critical bootstrap forever"
+        );
+    }
+
+    /// The arm is a floor, never an assignment.
+    ///
+    /// `current_generation` is a sample, and the tag is shared with `settle`. An
+    /// unconditional store could lower a tag a newer connection had already set,
+    /// which is the one way arming could make the gate *easier* to clear than it
+    /// was. It also broke the rule `settle_bootstrap` leans on — that the tag
+    /// only ever moves forward — for one of the two writers.
+    #[test]
+    fn pairing_never_lowers_the_gate() {
+        let gate = BootstrapGate::new(false);
+        assert!(gate.settle(20, false));
+
+        // A `pair-success` carrying a sample from well before that.
+        gate.arm_for_pairing(3);
+
+        assert!(gate.is_armed(), "pairing always owes a bootstrap");
+        assert!(
+            !gate.settle(20, false),
+            "and connection 20 still cannot answer for it"
+        );
+        assert!(gate.settle(21, false), "only something newer can");
+        assert!(!gate.is_armed());
     }
 
     /// The flag survives the round trip through the tag, which is the only part
@@ -3887,5 +4186,646 @@ mod bootstrap_gate_tests {
         assert!(gate.is_armed());
         let gate = BootstrapGate::new(false);
         assert!(!gate.is_armed());
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_signal_tests {
+    use super::*;
+
+    /// The predicate app-state retries end on. It has to mean "finished", not
+    /// "not currently connected": a planned reconnect, or a direct-connect
+    /// client that never starts the supervision loop, must not look terminal or
+    /// the retries throw away work nothing else will redo.
+    #[tokio::test]
+    async fn only_a_finished_client_looks_terminal() {
+        let client = crate::test_utils::create_test_client_with_name("lifecycle-terminal").await;
+
+        // A direct-connect client never runs the supervision loop. Reading
+        // `is_running` here would call a perfectly healthy client stopped.
+        assert!(
+            !client.is_running.load(Ordering::Relaxed),
+            "the fixture models a client that never called run()"
+        );
+        assert!(!client.is_terminal(), "which is not the same as finished");
+
+        // A planned reconnect is not the end either.
+        client.expected_disconnect.store(true, Ordering::Relaxed);
+        assert!(
+            client.is_shutting_down(),
+            "the old predicate cannot tell this apart"
+        );
+        assert!(!client.is_terminal(), "the new one can");
+        client.expected_disconnect.store(false, Ordering::Relaxed);
+
+        // Turning auto-reconnect off is a preference an application may express
+        // on a healthy connection — "do not come back after this one ends" — and
+        // the run loop does not act on it until the socket exits. On its own it
+        // says nothing about the session being over, so the supervision loop has
+        // to be up for the scenario to be the one described.
+        client.is_running.store(true, Ordering::Relaxed);
+        client.enable_auto_reconnect.store(false, Ordering::Relaxed);
+        assert!(
+            !client.is_terminal(),
+            "a reconnect preference is not a verdict on the current session"
+        );
+
+        // The stream errors that really do end one — conflict, 516, an
+        // unrecoverable connect failure — set both, and the pair is what
+        // separates them from the preference above.
+        client.expected_disconnect.store(true, Ordering::Relaxed);
+        assert!(client.is_terminal());
+        client.expected_disconnect.store(false, Ordering::Relaxed);
+
+        // And the run loop's own exit: it stops by clearing `is_running` alone,
+        // without firing the notifier or setting `expected_disconnect`, so that
+        // pairing has to count too or retries wait for a connection that is
+        // never coming. `cleanup_connection_state` has already run by then, which
+        // is why the socket is down here.
+        client.is_running.store(false, Ordering::Relaxed);
+        client.set_connected_for_test(false);
+        assert!(
+            client.is_terminal(),
+            "the supervision loop ending with auto-reconnect off is terminal"
+        );
+
+        // But `is_running` is false for a direct-connect client too, which never
+        // had a loop to end. One of those with a live socket is not finished, and
+        // reading it as finished is what the first version of this predicate did.
+        client.set_connected_for_test(true);
+        assert!(
+            !client.is_terminal(),
+            "a live direct-connect client never started the loop that would have ended"
+        );
+        client.set_connected_for_test(false);
+
+        client.enable_auto_reconnect.store(true, Ordering::Relaxed);
+        client.is_running.store(true, Ordering::Relaxed);
+        assert!(!client.is_terminal());
+
+        // And an explicit shutdown, which reconnects deliberately leave alone.
+        client.signal_shutdown_sync();
+        assert!(client.is_terminal());
+    }
+}
+
+#[cfg(test)]
+mod connection_guard_tests {
+    use super::*;
+
+    /// The guards ask whether the client is finished and whether there is a
+    /// socket, rather than `is_shutting_down()`.
+    ///
+    /// The point is the reconnect: `is_shutting_down()` is true for a planned
+    /// one, so a task reading it stops for a connection that is coming back.
+    ///
+    /// Not a claim about direct-connect clients. `connect()` without `run()`
+    /// leaves `is_running` false, and `send_and_wait_iq` rejects every IQ in
+    /// that state (`request.rs`), so no such client can reach the server at all
+    /// — for app state or anything else. An earlier version of this test
+    /// asserted the sync errored and called that support; it errored one layer
+    /// down, for that reason, and proved nothing.
+    #[tokio::test]
+    async fn a_planned_reconnect_does_not_look_like_a_stop() {
+        let client = crate::test_utils::create_test_client_with_name("conn-guard").await;
+        client.is_running.store(true, Ordering::Relaxed);
+        client.set_connected_for_test(true);
+
+        assert!(!client.is_terminal() && client.is_connected());
+
+        // The state `reconnect_immediately()` leaves behind.
+        client.expected_disconnect.store(true, Ordering::Relaxed);
+        assert!(
+            client.is_shutting_down(),
+            "which the old guard could not tell from a stop"
+        );
+        assert!(
+            !client.is_terminal(),
+            "so work that outlives a connection stays alive"
+        );
+    }
+}
+
+#[cfg(test)]
+mod await_connection_tests {
+    use super::*;
+
+    /// A notification that does not leave a live connection must not end the
+    /// wait. The socket can be announced and gone again before the check reads
+    /// it, and treating that as an answer dropped the retry while the client was
+    /// still perfectly able to reconnect.
+    #[tokio::test]
+    async fn a_stale_notification_does_not_end_the_wait() {
+        let client = crate::test_utils::create_test_client_with_name("await-stale").await;
+        client.is_running.store(true, Ordering::Relaxed);
+
+        let waiter = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.await_connection().await })
+        };
+
+        crate::test_utils::poll_until("the waiter to park on the notifier", || {
+            client.socket_ready_notifier.total_listeners() >= 1
+        })
+        .await;
+
+        // Announced, but nothing is connected: the wait has to carry on.
+        client.socket_ready_notifier.notify(usize::MAX);
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !waiter.is_finished(),
+            "an event without a connection is not an answer"
+        );
+
+        // Nor is a socket on its own. `connect()` announces one before login, and
+        // an IQ sent in that gap is answered by nobody and retired by the
+        // `<success>` that follows.
+        client.set_connected_for_test(true);
+        client.socket_ready_notifier.notify(usize::MAX);
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !waiter.is_finished(),
+            "a socket without an authenticated session is not one either"
+        );
+
+        // Both stores that `handle_success` makes, in that order: the session,
+        // then the generation it is authenticated under. Only the pair is an
+        // answer — the marker alone would leave the wait on a socket that has
+        // not authenticated, which is the state above.
+        client.is_logged_in.store(true, Ordering::Relaxed);
+        client.authenticated_generation.store(
+            client.connection_generation.load(Ordering::SeqCst),
+            Ordering::SeqCst,
+        );
+        client.notify_session_state();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), waiter)
+                .await
+                .expect("a usable connection must end the wait")
+                .expect("the waiter should not panic"),
+            "and it reports that one arrived"
+        );
+    }
+
+    /// The wait has no duration bound, so the terminal state is the only thing
+    /// that ends it when no connection is coming. Every duration tried here was
+    /// wrong in one direction or the other.
+    ///
+    /// Shutdown alone has to end it. An earlier version of this test nudged
+    /// `socket_ready_notifier` afterwards and passed on that nudge, hiding a wait
+    /// that in production had nothing left to wake it — no socket is ever
+    /// announced again after a shutdown, and the parked task holds the
+    /// `Arc<Client>` whose drop would otherwise have been the way out.
+    #[tokio::test]
+    async fn a_finished_client_ends_the_wait() {
+        let client = crate::test_utils::create_test_client_with_name("await-terminal").await;
+        client.is_running.store(true, Ordering::Relaxed);
+
+        let waiter = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.await_connection().await })
+        };
+
+        crate::test_utils::poll_until("the waiter to park on the notifier", || {
+            client.socket_ready_notifier.total_listeners() >= 1
+        })
+        .await;
+
+        client.signal_shutdown_sync();
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(5), waiter)
+                .await
+                .expect("a finished client must end the wait, with nothing else nudging it")
+                .expect("the waiter should not panic"),
+            "and it reports that none arrived"
+        );
+    }
+
+    /// The run loop's own exit is the terminal transition with no signal of its
+    /// own: it fires no notifier and announces no socket, so a wait parked
+    /// through it is parked for good unless that branch says so itself.
+    #[tokio::test]
+    async fn the_run_loop_giving_up_ends_the_wait() {
+        let client = crate::test_utils::create_test_client_with_name("await-runloop").await;
+        client.is_running.store(true, Ordering::Relaxed);
+
+        let waiter = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.await_connection().await })
+        };
+
+        crate::test_utils::poll_until("the waiter to park on the notifier", || {
+            client.socket_ready_notifier.total_listeners() >= 1
+        })
+        .await;
+
+        // The branch itself, not a re-enactment of it: `run()` reads this flag
+        // and calls exactly this, and a version of the transition that forgets
+        // to announce itself fails here.
+        client.enable_auto_reconnect.store(false, Ordering::Relaxed);
+        client.stop_supervision_loop();
+
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(5), waiter)
+                .await
+                .expect("the supervision loop ending must end the wait")
+                .expect("the waiter should not panic"),
+            "and it reports that none arrived"
+        );
+    }
+
+    /// A direct-connect client is not finished — its connection is fine and its
+    /// application may still use it — but no `<success>` will ever arrive without
+    /// a reader, so waiting for one is waiting forever.
+    #[tokio::test]
+    async fn a_client_without_a_reader_is_not_worth_waiting_for() {
+        let client = crate::test_utils::create_test_client_with_name("await-direct").await;
+        client.set_connected_for_test(true);
+
+        assert!(
+            !client.is_terminal(),
+            "a live direct-connect client is fine"
+        );
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(5), client.await_connection())
+                .await
+                .expect("the wait must not park on a connection that cannot answer"),
+            "it just cannot carry the work"
+        );
+    }
+}
+
+#[cfg(test)]
+mod sync_outcome_tests {
+    use super::*;
+
+    /// Sets up a client that can reach the server, so a test can then take one
+    /// signal away and see what the guard makes of it.
+    async fn reachable_client(name: &str) -> Arc<Client> {
+        let client = crate::test_utils::create_test_client_with_name(name).await;
+        client.is_running.store(true, Ordering::Relaxed);
+        client.set_connected_for_test(true);
+        client.is_logged_in.store(true, Ordering::Relaxed);
+        client.authenticated_generation.store(
+            client.connection_generation.load(Ordering::SeqCst),
+            Ordering::SeqCst,
+        );
+        assert!(client.can_reach_server(), "the fixture itself is usable");
+        client
+    }
+
+    /// The case every lifecycle-flag proxy missed, because it is the one state
+    /// none of them modelled: rate-limited, still connected, still supervised,
+    /// no `expected_disconnect` and no generation change — and no session.
+    ///
+    /// `Ok(())` here read as a completed sync, and the caller returned. The
+    /// trigger was consumed by then and nothing asks a second time.
+    #[tokio::test]
+    async fn a_rate_limited_session_defers_rather_than_completes() {
+        let client = reachable_client("outcome-429").await;
+
+        // Exactly what `handle_stream_error` does for 429 and 503.
+        client.is_logged_in.store(false, Ordering::Relaxed);
+
+        assert!(
+            !client.is_terminal(),
+            "a rate limit is not the client being finished"
+        );
+        assert!(
+            !client.is_shutting_down(),
+            "nor is it anything the old proxy could see"
+        );
+        assert_eq!(
+            client
+                .process_app_state_sync_task(WAPatchName::Regular, true)
+                .await
+                .expect("skipping is not an error"),
+            SyncOutcome::Deferred,
+            "nothing was asked, so nothing was completed"
+        );
+    }
+
+    /// A planned reconnect reaches the same guard by a different route, and has
+    /// to answer the same way.
+    #[tokio::test]
+    async fn a_reconnect_defers_rather_than_completes() {
+        let client = reachable_client("outcome-reconnect").await;
+        client.set_connected_for_test(false);
+
+        assert_eq!(
+            client
+                .process_app_state_sync_task(WAPatchName::Regular, false)
+                .await
+                .expect("skipping is not an error"),
+            SyncOutcome::Deferred
+        );
+    }
+
+    /// Terminal and reachable are not mutually exclusive: the stream-error paths
+    /// set the terminal flags before they clear the session and close the
+    /// socket. Asking about reachability first hands out that window.
+    #[tokio::test]
+    async fn a_terminal_client_is_not_a_usable_one() {
+        let client = reachable_client("verdict-order").await;
+
+        // A conflict or 516: both flags set together, and the socket not yet
+        // torn down. This used to be a window where `is_terminal()` and
+        // `can_reach_server()` were both true, which is why the verdict checks
+        // terminal first.
+        client.enable_auto_reconnect.store(false, Ordering::Relaxed);
+        client.expected_disconnect.store(true, Ordering::Relaxed);
+
+        assert!(client.is_terminal());
+        assert_eq!(client.connection_wait_verdict(), Some(false));
+
+        // The window is now closed at the source rather than ordered around:
+        // `can_reach_server()` rejects a socket marked for retirement, and every
+        // route into `is_terminal()` marks one — `expected_disconnect` here,
+        // `is_running` cleared by shutdown, a dead socket for the run loop's
+        // exit. The ordering stays as belt and braces; this is what makes it
+        // moot, and what fails if the retirement check is dropped.
+        assert!(
+            !client.can_reach_server(),
+            "a finished client is never a reachable one"
+        );
+
+        client.expected_disconnect.store(false, Ordering::Relaxed);
+        client.signal_shutdown_sync();
+        assert!(client.is_terminal() && !client.can_reach_server());
+    }
+
+    /// `<success>` sets `is_logged_in` one step before it increments the
+    /// generation, because that store is the duplicate guard. A caller that
+    /// binds a scope in between binds a generation the next instruction retires,
+    /// and every attempt it then makes is rejected.
+    #[tokio::test]
+    async fn the_gap_inside_success_is_not_an_authenticated_connection() {
+        let client = crate::test_utils::create_test_client_with_name("auth-window").await;
+        client.is_running.store(true, Ordering::Relaxed);
+
+        client.set_connected_for_test(true);
+
+        // First half of the window: `handle_success` has set `is_logged_in` and
+        // has not yet incremented the generation. The marker here is whatever
+        // the constructor left, unretouched — and a marker that starts at a real
+        // generation equals the one a fresh client is on, so equality alone
+        // admits the window on the very first connection.
+        client.is_logged_in.store(true, Ordering::Relaxed);
+        assert!(
+            client.is_logged_in() && client.is_connected(),
+            "which is why the flags alone said yes"
+        );
+        assert!(
+            !client.can_reach_server(),
+            "this connection has not authenticated anything yet"
+        );
+
+        // Second half: generation incremented, marker not yet stored.
+        let current = client.connection_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        assert!(!client.can_reach_server());
+        assert_eq!(
+            client.connection_wait_verdict(),
+            None,
+            "the wait carries on"
+        );
+
+        // And once `<success>` finishes publishing, it is a real connection.
+        client
+            .authenticated_generation
+            .store(current, Ordering::SeqCst);
+        assert_eq!(client.connection_wait_verdict(), Some(true));
+    }
+}
+
+#[cfg(test)]
+mod sync_owed_tests {
+    use super::*;
+
+    /// Only a completed sync discharges the request.
+    ///
+    /// The first version of this seam listed the ways to fail and requeued for
+    /// those — which put the deferral next to an `Err` branch that still only
+    /// logged, so a connection lost while the collection IQ was in flight was
+    /// reported by `send_iq` as an error and dropped there. Every list of
+    /// failure modes written so far has been one short; this asks the other
+    /// question, which has one answer.
+    #[test]
+    fn everything_that_is_not_a_completed_sync_is_still_owed() {
+        assert!(!sync_still_owed(&Ok(SyncOutcome::Completed)));
+        assert!(sync_still_owed(&Ok(SyncOutcome::Deferred)));
+        assert!(sync_still_owed(&Err(anyhow::anyhow!(
+            "the socket died under the collection IQ"
+        ))));
+    }
+}
+
+#[cfg(test)]
+mod terminal_wake_tests {
+    use super::*;
+
+    /// A fatal stream error — conflict, 516, 401, 409 — makes the client
+    /// terminal by setting two flags and then firing only the per-connection
+    /// shutdown. Nothing else on that path announces anything.
+    ///
+    /// The wait must end there, not when the run loop eventually unwinds far
+    /// enough to notice. The invariant on `is_terminal` is that every transition
+    /// into it announces itself; "some other loop gets there first" is not that,
+    /// and if that loop is what is wedged, it never gets there at all.
+    #[tokio::test]
+    async fn a_fatal_stream_error_ends_the_wait() {
+        let client = crate::test_utils::create_test_client_with_name("await-fatal").await;
+        client.is_running.store(true, Ordering::Relaxed);
+
+        let waiter = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.await_connection().await })
+        };
+
+        crate::test_utils::poll_until("the waiter to park on the notifier", || {
+            client.socket_ready_notifier.total_listeners() >= 1
+        })
+        .await;
+
+        // Exactly what `handle_stream_error` does, in its order.
+        client.expected_disconnect.store(true, Ordering::Relaxed);
+        client.enable_auto_reconnect.store(false, Ordering::Relaxed);
+        client.notify_connection_shutdown();
+
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(5), waiter)
+                .await
+                .expect("a fatal stream error must end the wait where it happens")
+                .expect("the waiter should not panic"),
+            "and it reports that no connection arrived"
+        );
+    }
+}
+
+#[cfg(test)]
+mod reconnect_wake_tests {
+    use super::*;
+
+    /// A teardown that a reconnect follows wakes the wait and must not end it.
+    ///
+    /// The wake carries no verdict: it only says the state is worth re-reading.
+    /// A parked waiter is parked *because* `can_reach_server()` was false, and
+    /// nothing about a teardown makes it true — so the re-read parks it again.
+    ///
+    /// The reverse case cannot arise either. For the wake to release a waiter
+    /// onto a dying socket, the state would have to go unusable → usable while
+    /// it was parked; every transition that does that announces itself, and the
+    /// waiter would have left on that announcement, when the connection really
+    /// was usable.
+    #[tokio::test]
+    async fn a_planned_reconnect_teardown_does_not_end_the_wait() {
+        let client = crate::test_utils::create_test_client_with_name("await-replan").await;
+        client.is_running.store(true, Ordering::Relaxed);
+
+        let waiter = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.await_connection().await })
+        };
+
+        crate::test_utils::poll_until("the waiter to park on the notifier", || {
+            client.session_state_notifier.total_listeners() >= 1
+        })
+        .await;
+
+        // What `reconnect_immediately()` does: a planned teardown, auto-reconnect
+        // still on, so the client is not finished and a socket is coming back.
+        client.expected_disconnect.store(true, Ordering::Relaxed);
+        client.notify_connection_shutdown();
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !waiter.is_finished(),
+            "a teardown is not a connection, however loudly it is announced"
+        );
+
+        // And the replacement still ends it.
+        client.expected_disconnect.store(false, Ordering::Relaxed);
+        client.set_connected_for_test(true);
+        client.is_logged_in.store(true, Ordering::Relaxed);
+        client.authenticated_generation.store(
+            client.connection_generation.load(Ordering::SeqCst),
+            Ordering::SeqCst,
+        );
+        client.notify_session_state();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), waiter)
+                .await
+                .expect("the replacement connection must end the wait")
+                .expect("the waiter should not panic")
+        );
+    }
+}
+
+#[cfg(test)]
+mod retiring_socket_tests {
+    use super::*;
+
+    /// A socket already marked for retirement is not one work can be sent on.
+    ///
+    /// `reconnect_immediately()` sets `expected_disconnect` before its bounded
+    /// flushes and closes the transport only afterwards. Every other signal
+    /// still reads healthy through that window — socket up, session
+    /// authenticated, generation final — so a wait released there hands its IQ
+    /// to a connection the run loop has already decided to retire. The server
+    /// answers, `handle_success` on the replacement retires the scope, the
+    /// answer is dropped and the attempt is charged anyway.
+    #[tokio::test]
+    async fn a_socket_marked_for_reconnect_cannot_carry_work() {
+        let client = crate::test_utils::create_test_client_with_name("retiring").await;
+        client.is_running.store(true, Ordering::Relaxed);
+        client.set_connected_for_test(true);
+        client.is_logged_in.store(true, Ordering::Relaxed);
+        client.authenticated_generation.store(
+            client.connection_generation.load(Ordering::SeqCst),
+            Ordering::SeqCst,
+        );
+        assert!(client.can_reach_server(), "healthy to begin with");
+
+        // The first thing `reconnect_immediately()` does, before any teardown.
+        client.expected_disconnect.store(true, Ordering::Relaxed);
+
+        assert!(
+            client.is_connected() && client.is_logged_in(),
+            "and every other signal still says the socket is fine"
+        );
+        assert!(
+            !client.can_reach_server(),
+            "but it is going away, so nothing sent on it comes back"
+        );
+        assert!(
+            !client.is_terminal(),
+            "which is not the same as the client being finished"
+        );
+        assert_eq!(
+            client.connection_wait_verdict(),
+            None,
+            "so the wait carries on to the replacement"
+        );
+    }
+}
+
+#[cfg(test)]
+mod batched_attempt_tests {
+    use super::*;
+
+    /// Only a round that sent a collection IQ may spend an attempt.
+    ///
+    /// The first version of this asked the outcome buckets — "anything in
+    /// `synced`, `fatal` or `retryable` means the wire was reached" — and that
+    /// is false. `retryable` also collects the collections a scope loss or a
+    /// `ReservationSkip::WaitTimedOut` dropped *before* the send, and the
+    /// timeout is exactly the case this predicate exists for: a long patch send
+    /// holding the collection. The bucket test called that a real attempt and
+    /// burned the budget anyway.
+    ///
+    /// So the flag is recorded at the send and nowhere else. Buckets describe
+    /// what happened to each collection; only the send knows whether anything
+    /// was asked.
+    #[test]
+    fn only_a_sent_iq_counts_as_reaching_the_server() {
+        // What a batch whose every reservation timed out looks like. Under the
+        // bucket test this said true.
+        let timed_out = BatchedSyncOutcome {
+            retryable: vec![WAPatchName::Regular, WAPatchName::RegularHigh],
+            ..Default::default()
+        };
+        assert!(
+            !timed_out.reached_server(),
+            "a reservation timeout never reached the wire, whatever bucket it lands in"
+        );
+
+        // Nor does a scope lost before reserving, which lands in the same one.
+        let scope_lost = BatchedSyncOutcome {
+            retryable: vec![WAPatchName::Regular],
+            ..Default::default()
+        };
+        assert!(!scope_lost.reached_server());
+
+        // And an equivalent sync holding it, which lands in `skipped`.
+        let held = BatchedSyncOutcome {
+            skipped: vec![WAPatchName::Regular],
+            ..Default::default()
+        };
+        assert!(!held.reached_server());
+        assert!(!BatchedSyncOutcome::default().reached_server());
+
+        // The send is the only thing that sets it, and it survives whatever the
+        // response turns out to be — including an error, which spent the
+        // attempt just as much as an answer did.
+        let mut sent = BatchedSyncOutcome {
+            retryable: vec![WAPatchName::Regular],
+            ..Default::default()
+        };
+        sent.note_reached_server();
+        assert!(sent.reached_server());
     }
 }

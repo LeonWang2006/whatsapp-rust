@@ -957,6 +957,18 @@ impl Client {
             "Successfully authenticated with WhatsApp servers! (gen={})",
             current_generation
         );
+        // The generation this connection will be admitted under is now final.
+        // Published here, after the increment, and not by `is_logged_in` above —
+        // that one is the duplicate-`<success>` guard and has to be set first,
+        // which leaves a window where the client looks authenticated on a
+        // generation that is about to change. Work binding a scope in that
+        // window had every attempt rejected as retired.
+        self.authenticated_generation
+            .store(current_generation, Ordering::SeqCst);
+        // Only now is there something worth waking for: released here and not at
+        // `socket_ready_notifier`, which fires before login, so an IQ sent in
+        // that gap is answered by nobody.
+        self.notify_session_state();
         // Record the auth time but DON'T reset the backoff counter yet: WA Web
         // resets only after the connection has been stable for ~30s
         // (`resetDelay`). Resetting on <success> alone lets a server that
@@ -1886,7 +1898,6 @@ impl Client {
     )]
     pub(crate) async fn handle_connect_failure(&self, node: &wacore_binary::NodeRef<'_>) {
         self.expected_disconnect.store(true, Ordering::Relaxed);
-        self.notify_connection_shutdown();
 
         let failure = wacore::stanza::connect_failure::ConnectFailureStanza::parse(node);
         // A `<failure>` with no usable `reason` is not a failure we can classify:
@@ -1900,6 +1911,13 @@ impl Client {
         } else {
             self.enable_auto_reconnect.store(false, Ordering::Relaxed);
         }
+        // Announced after the classification, not before it. This notify is what
+        // wakes work parked in `await_connection`, and that work answers by
+        // reading the state — so announcing first offers it the state of a
+        // client that has not yet decided, and the decision that follows makes
+        // no sound of its own. Nothing awaits between the stores and here, so
+        // the pair is what a waiter observes.
+        self.notify_connection_shutdown();
 
         // Every branch below keeps the stanza on its event. The server states
         // things here exactly once — an account lock's one-time `appeal_token`,
