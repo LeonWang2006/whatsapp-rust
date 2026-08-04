@@ -82,6 +82,10 @@ async fn handle_ib_impl(client: Arc<Client>, node: &wacore_binary::NodeRef<'_>) 
                 );
 
                 let client_clone = client.clone();
+                // Opened before the wait below, so everything this task does is
+                // attributed to the connection that asked for the re-sync rather
+                // than to whichever one is live when it finishes.
+                let scope = client.sync_scope(None);
 
                 // Groups/newsletter_metadata: wait for offline sync per WAWebHandleDirtyBits.
                 client
@@ -93,29 +97,80 @@ async fn handle_ib_impl(client: Arc<Client>, node: &wacore_binary::NodeRef<'_>) 
                         if client_clone.is_shutting_down() {
                             return;
                         }
+                        // The wait above can outlast the connection that asked for
+                        // this, and the report is keyed to the scope opened
+                        // before it — so a task that ran on the replacement
+                        // socket would do the work only to have it thrown away,
+                        // taking the retry with it. Stop before doing any.
+                        if let Err(lost) = client_clone.admits(scope) {
+                            debug!(target: "Client/AppState", "Dirty-bit task cancelled after the offline wait: {lost:?}");
+                            return;
+                        }
                         if let Err(e) = client_clone.clean_dirty_bits(bit).await
                             && !client_clone.is_shutting_down()
                         {
                             warn!("Failed to send clean dirty bits IQ: {e:?}");
                         }
 
+                        // Rebound, not dropped. The server has already accepted
+                        // the dirty bit as clean, so it will not raise it again,
+                        // and an ordinary reconnect with a known push name runs
+                        // no app-state bootstrap — returning here would leave
+                        // these collections stale until something unrelated
+                        // asked. The work carries over to the live connection;
+                        // only the retired generation's outcome would not.
+                        let mut scope = scope;
+                        if scope.rebind(
+                            client_clone
+                                .connection_generation
+                                .load(std::sync::atomic::Ordering::SeqCst),
+                        ) {
+                            debug!(
+                                target: "Client/AppState",
+                                "Dirty-bit resync rebinding after the clean IQ"
+                            );
+                        }
+
                         if needs_resync && !client_clone.is_shutting_down() {
                             info!("syncd_app_state dirty -- re-syncing all app state collections");
-                            if let Err(e) = client_clone
-                                .sync_collections_batched(
-                                    vec![
-                                        WAPatchName::CriticalBlock,
-                                        WAPatchName::CriticalUnblockLow,
-                                        WAPatchName::RegularLow,
-                                        WAPatchName::RegularHigh,
-                                        WAPatchName::Regular,
-                                    ],
-                                    None,
-                                )
-                                .await
-                                && !client_clone.is_shutting_down()
-                            {
-                                warn!("App state re-sync after dirty notification failed: {e:?}");
+                            let requested = vec![
+                                WAPatchName::CriticalBlock,
+                                WAPatchName::CriticalUnblockLow,
+                                WAPatchName::RegularLow,
+                                WAPatchName::RegularHigh,
+                                WAPatchName::Regular,
+                            ];
+                            let result = client_clone
+                                .sync_collections_batched(requested.clone(), scope)
+                                .await;
+                            // Rebound again after the batch. The scope was
+                            // pinned before it, so a reconnect during the sync
+                            // would have `report_background_sync` discard the
+                            // outcome — and with it the retry — for collections
+                            // whose dirty bit the server already considers
+                            // clean. Reporting against the live connection keeps
+                            // the retry, and the outcome describes the
+                            // collections either way.
+                            let mut scope = scope;
+                            scope.rebind(
+                                client_clone
+                                    .connection_generation
+                                    .load(std::sync::atomic::Ordering::SeqCst),
+                            );
+                            // Reported unless the client is going away for
+                            // good. A planned reconnect used to drop this, which
+                            // took the retry with it — and the server already
+                            // considers the dirty bit clean, so nothing would
+                            // ask again. The scheduler rebinds once the
+                            // replacement is live.
+                            if !client_clone.is_stopping() {
+                                client_clone.report_background_sync(
+                                    "app state re-sync after dirty notification",
+                                    scope,
+                                    crate::client::SyncSettles::JustTheCollections,
+                                    &requested,
+                                    result,
+                                );
                             }
                         }
                     }))

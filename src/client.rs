@@ -1,6 +1,7 @@
 mod accessors;
 mod adapters;
 mod app_state;
+pub(crate) use app_state::SyncSettles;
 mod builder;
 mod context_impl;
 mod device_registry;
@@ -1090,7 +1091,7 @@ pub struct Client {
     /// the stability reset from erasing a deliberate penalty (WA Web `cancelReset`).
     pub(crate) backoff_reset_suppressed: Arc<AtomicBool>,
 
-    pub(crate) needs_initial_full_sync: Arc<AtomicBool>,
+    pub(crate) needs_initial_full_sync: Arc<app_state::BootstrapGate>,
 
     pub(crate) app_state_processor: Mutex<Option<Arc<AppStateProcessor>>>,
     pub(crate) app_state_key_requests: Arc<Mutex<HashMap<Vec<u8>, wacore::time::Instant>>>,
