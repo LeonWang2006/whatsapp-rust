@@ -217,12 +217,16 @@ pub struct SenderKeyState {
     /// `as_protobuf`. `None` only for a structurally invalid state.
     sender_chain: Option<SenderChainKey>,
     /// Parsed signing key with its XEdDSA cache pre-derived, memoized so the
-    /// per-send signature skips a basepoint multiplication (~18% of a warm
-    /// group send when re-derived from bytes every message). Clones carry the
-    /// warm value, and the record cache stores this object back after every
+    /// per-send signature skips a basepoint multiplication. Clones carry the
+    /// warm value, and a record cache stores this object back after every
     /// send, so the memo persists for the cache lifetime. Never persisted;
     /// rebuilt lazily after a cold load. If a signing-key setter is ever
     /// added, it must reset this memo.
+    ///
+    /// The payoff is the caller's to collect: a caller that discards the record
+    /// between operations, as one persisting through `into_components` does,
+    /// re-derives per message. `benches/sender_key_derivation_benchmark.rs` in
+    /// `wacore` measures both shapes.
     signing_key_memo: std::sync::OnceLock<PrivateKey>,
     /// Receive-side mirror of `signing_key_memo`: cached verifier whose
     /// Edwards derivations are reused across every incoming message under
