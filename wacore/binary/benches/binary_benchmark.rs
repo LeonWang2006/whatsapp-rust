@@ -22,10 +22,11 @@ fn create_small_node() -> Node {
         .build()
 }
 
-/// The shape the wire is mostly made of: a short ack whose `to` is a JID and
-/// whose `id` is hex, so decoding it goes through `read_jid_pair` and
-/// `read_packed`. `create_small_node` has neither, which left the two paths
-/// that dominate a small-stanza profile uncovered.
+/// The shape the wire is mostly made of: a short ack carrying a JID, a
+/// nibble-packed number and a hex-packed id at once. `create_small_node`
+/// already reaches `read_jid_pair` and the nibble half of `read_packed`, but
+/// nothing reached the hex half, since the large fixture's lowercase `abcdef`
+/// encodes as raw bytes rather than `HEX_8`.
 fn create_ack_node() -> Node {
     NodeBuilder::new("ack")
         .attr("to", "5511999990000@s.whatsapp.net")
@@ -34,7 +35,8 @@ fn create_ack_node() -> Node {
         .build()
 }
 
-/// A device fanout, where the same two paths repeat per child.
+/// A device fanout. Device-qualified JIDs encode as `AD_JID`, so what repeats
+/// per child is the packed decode and the AD path, not `read_jid_pair`.
 fn create_fanout_node() -> Node {
     let devices: Vec<Node> = (0..8)
         .map(|i| {
