@@ -366,8 +366,11 @@ impl<'a> Decoder<'a> {
             pos -= 1;
         }
 
-        // All output bytes are ASCII, so from_utf8 cannot fail.
-        let s = std::str::from_utf8(&buf[..pos]).expect("packed decode produced non-ASCII");
+        // Unlike `read_string`, which validates bytes that came off the wire,
+        // this validates bytes the tables above just wrote, so it can never
+        // fail. Keeping a check at all is cheap insurance against a future
+        // table edit; smoothutf8 is the same validator the wire path uses.
+        let s = smoothutf8::from_utf8(&buf[..pos]).expect("packed decode produced non-ASCII");
         Ok(CompactString::from(s))
     }
 
