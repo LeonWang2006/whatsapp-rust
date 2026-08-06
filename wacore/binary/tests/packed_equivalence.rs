@@ -28,17 +28,32 @@ fn packed_values_round_trip_across_the_simd_boundary() {
     }
 }
 
+/// Nibble 12, 13 and 14 encode nothing. Frames are built by hand, since the
+/// encoder would never emit one. Both lengths matter: one byte stays in the
+/// scalar remainder, while 20 bytes puts the bad nibble inside the first
+/// 16-byte chunk, which is where the SIMD build takes its validation
+/// fallback.
 #[test]
 fn an_invalid_nibble_is_still_rejected() {
-    // Nibble 12, 13 and 14 encode nothing. Build the frame by hand, since the
-    // encoder would never emit one.
     for bad in [0x0Cu8, 0x0D, 0x0E] {
-        // NIBBLE_8 tag, length 1, one byte whose low half is invalid.
-        let frame = [248u8, 2, 1, 255, 1, 0xF0 | bad];
-        let err = unmarshal_ref(&frame).unwrap_err();
+        // NIBBLE_8, length 1, one byte whose low half is invalid.
+        let short = [248u8, 2, 1, 255, 1, 0xF0 | bad];
+        let err = unmarshal_ref(&short).unwrap_err();
         assert!(
             format!("{err}").contains(&bad.to_string()),
-            "error must name the bad nibble {bad}: {err}"
+            "short frame must name the bad nibble {bad}: {err}"
+        );
+
+        // NIBBLE_8, length 20, with the bad nibble at byte 5 so it lands in
+        // the chunk rather than the remainder.
+        let mut long = vec![248u8, 2, 1, 255, 20];
+        for i in 0..20u8 {
+            long.push(if i == 5 { 0xF0 | bad } else { 0x12 });
+        }
+        let err = unmarshal_ref(&long).unwrap_err();
+        assert!(
+            format!("{err}").contains(&bad.to_string()),
+            "chunked frame must name the bad nibble {bad}: {err}"
         );
     }
 }
