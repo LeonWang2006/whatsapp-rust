@@ -41,7 +41,7 @@ pub enum BusinessHourMode {
 }
 
 fn node_text(node: &NodeRef<'_>) -> Option<String> {
-    match node.content.as_deref() {
+    match node.content.as_ref() {
         Some(NodeContentRef::String(s)) => Some(s.to_string()),
         Some(NodeContentRef::Bytes(b)) => std::str::from_utf8(b).ok().map(|s| s.to_string()),
         _ => None,

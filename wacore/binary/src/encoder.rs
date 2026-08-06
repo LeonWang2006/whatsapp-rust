@@ -188,7 +188,7 @@ impl EncodeNode for NodeRef<'_> {
     }
 
     fn encode_content<'a, W: ByteWriter>(&self, encoder: &mut Encoder<'a, W>) -> Result<()> {
-        if let Some(content) = self.content.as_deref() {
+        if let Some(content) = self.content.as_ref() {
             match content {
                 NodeContentRef::String(s) => encoder.write_string(s)?,
                 NodeContentRef::Bytes(b) => encoder.write_bytes_with_len(b)?,
@@ -505,7 +505,7 @@ fn node_ref_encoded_size_with_cache(node: &NodeRef<'_>, hints: &mut StringHintCa
         };
     }
 
-    size += match node.content.as_deref() {
+    size += match node.content.as_ref() {
         Some(NodeContentRef::String(s)) => string_encoded_size_with_cache(s, hints),
         Some(NodeContentRef::Bytes(b)) => bytes_with_len_encoded_size(b.len()),
         Some(NodeContentRef::Nodes(nodes)) => {

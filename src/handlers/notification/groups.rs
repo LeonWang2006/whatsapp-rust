@@ -370,7 +370,7 @@ pub(crate) fn handle_mex_notification(client: &Arc<Client>, node: &NodeRef<'_>) 
 
     // `from_str` skips the redundant UTF-8 validation `from_slice` would
     // do on a `&str`.
-    let parsed = match update_node.content.as_deref() {
+    let parsed = match update_node.content.as_ref() {
         Some(NodeContentRef::String(s)) => serde_json::from_str(s),
         Some(NodeContentRef::Bytes(b)) => serde_json::from_slice(b.as_ref()),
         _ => {

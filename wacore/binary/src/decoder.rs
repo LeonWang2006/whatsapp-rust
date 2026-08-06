@@ -578,7 +578,7 @@ impl<'a> Decoder<'a> {
 
         let attrs = self.read_attributes(attr_count)?;
         let content = if has_content {
-            self.read_content(depth)?.map(Box::new)
+            self.read_content(depth)?
         } else {
             None
         };
@@ -618,7 +618,7 @@ mod tests {
         assert_eq!(decoded.tag, "message");
         assert!(decoded.attrs.is_empty());
         match &decoded.content {
-            Some(content) => match &**content {
+            Some(content) => match content {
                 NodeContentRef::String(s) => assert_eq!(s, "receipt"),
                 _ => panic!("Expected string content"),
             },
@@ -648,7 +648,7 @@ mod tests {
         assert_eq!(decoded.tag, "test");
         assert!(decoded.attrs.is_empty());
         match &decoded.content {
-            Some(content) => match &**content {
+            Some(content) => match content {
                 NodeContentRef::String(s) => assert_eq!(s, test_str),
                 _ => panic!("Expected string content"),
             },

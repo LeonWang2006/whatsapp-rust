@@ -346,7 +346,7 @@ fn dropped_error_detail<'a>(error_node: &'a NodeRef<'_>) -> Option<DroppedErrorD
     let mut payload = None;
     // Not `children()`: it answers `None` for a byte or string payload, which is dropped just
     // the same.
-    match error_node.content.as_deref() {
+    match error_node.content.as_ref() {
         Some(NodeContentRef::Nodes(nodes)) => {
             children.extend(nodes.iter().map(|child| child.tag.as_ref()));
         }

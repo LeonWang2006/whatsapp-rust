@@ -647,7 +647,7 @@ pub struct Node {
 pub struct NodeRef<'a> {
     pub tag: NodeStr<'a>,
     pub attrs: AttrsRef<'a>,
-    pub content: Option<Box<NodeContentRef<'a>>>,
+    pub content: Option<NodeContentRef<'a>>,
 }
 
 impl Node {
@@ -685,7 +685,7 @@ impl Node {
                     (NodeStr::Borrowed(k.as_ref()), value_ref)
                 })
                 .collect(),
-            content: self.content.as_ref().map(|c| Box::new(c.as_content_ref())),
+            content: self.content.as_ref().map(|c| c.as_content_ref()),
         }
     }
 
@@ -767,7 +767,7 @@ impl<'a> NodeRef<'a> {
         Self {
             tag,
             attrs,
-            content: content.map(Box::new),
+            content,
         }
     }
 
@@ -776,7 +776,7 @@ impl<'a> NodeRef<'a> {
     }
 
     pub fn children(&self) -> Option<&[NodeRef<'a>]> {
-        match self.content.as_deref() {
+        match self.content.as_ref() {
             Some(NodeContentRef::Nodes(nodes)) => Some(nodes),
             _ => None,
         }
@@ -816,7 +816,7 @@ impl<'a> NodeRef<'a> {
 
     /// Extract text content, handling both String and Bytes (lossy UTF-8).
     pub fn content_as_string(&self) -> Option<CompactString> {
-        match self.content.as_deref() {
+        match self.content.as_ref() {
             Some(NodeContentRef::String(s)) => Some(s.to_compact_string()),
             Some(NodeContentRef::Bytes(b)) => Some(CompactString::from(
                 String::from_utf8_lossy(b.as_ref()).as_ref(),
@@ -827,7 +827,7 @@ impl<'a> NodeRef<'a> {
 
     /// Zero-copy byte content, if this node has Bytes content.
     pub fn content_bytes(&self) -> Option<&[u8]> {
-        match self.content.as_deref() {
+        match self.content.as_ref() {
             Some(NodeContentRef::Bytes(b)) => Some(b.as_ref()),
             _ => None,
         }
@@ -835,7 +835,7 @@ impl<'a> NodeRef<'a> {
 
     /// Zero-copy string content, if this node has String content.
     pub fn content_str(&self) -> Option<&str> {
-        match self.content.as_deref() {
+        match self.content.as_ref() {
             Some(NodeContentRef::String(s)) => Some(s.as_ref()),
             _ => None,
         }
@@ -862,7 +862,7 @@ impl<'a> NodeRef<'a> {
                     (intern_cow(k), value)
                 })
                 .collect::<Attrs>(),
-            content: self.content.as_deref().map(|c| match c {
+            content: self.content.as_ref().map(|c| match c {
                 NodeContentRef::Bytes(b) => NodeContent::Bytes(b.to_vec()),
                 NodeContentRef::String(s) => NodeContent::String(s.to_compact_string()),
                 NodeContentRef::Nodes(nodes) => {

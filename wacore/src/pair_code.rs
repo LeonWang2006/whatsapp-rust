@@ -493,7 +493,7 @@ impl PairCodeUtils {
     pub fn parse_companion_hello_response(node: &NodeRef<'_>) -> Option<Vec<u8>> {
         node.get_optional_child_by_tag(&["link_code_companion_reg"])
             .and_then(|n| n.get_optional_child_by_tag(&["link_code_pairing_ref"]))
-            .and_then(|n| match n.content.as_deref() {
+            .and_then(|n| match n.content.as_ref() {
                 Some(NodeContentRef::Bytes(b)) => Some(b.to_vec()),
                 _ => None,
             })

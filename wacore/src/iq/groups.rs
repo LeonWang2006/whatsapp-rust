@@ -1172,14 +1172,14 @@ impl ProtocolNode for GroupInfoResponse {
 
         let member_add_mode = node
             .get_optional_child_by_tag(&["member_add_mode"])
-            .and_then(|n| match n.content.as_deref() {
+            .and_then(|n| match n.content.as_ref() {
                 Some(NodeContentRef::String(s)) => MemberAddMode::try_from(s.as_ref()).ok(),
                 _ => None,
             });
 
         let member_link_mode = node
             .get_optional_child_by_tag(&["member_link_mode"])
-            .and_then(|n| match n.content.as_deref() {
+            .and_then(|n| match n.content.as_ref() {
                 Some(NodeContentRef::String(s)) => MemberLinkMode::try_from(s.as_ref()).ok(),
                 _ => None,
             });
@@ -1229,7 +1229,7 @@ impl ProtocolNode for GroupInfoResponse {
 
         let member_share_history_mode = node
             .get_optional_child_by_tag(&["member_share_group_history_mode"])
-            .and_then(|n| match n.content.as_deref() {
+            .and_then(|n| match n.content.as_ref() {
                 Some(NodeContentRef::String(s)) => {
                     MemberShareHistoryMode::try_from(s.as_ref()).ok()
                 }

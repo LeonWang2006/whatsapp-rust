@@ -169,7 +169,7 @@ fn should_auto_reserve_node_ref(node: &NodeRef<'_>) -> bool {
         return true;
     }
 
-    match node.content.as_deref() {
+    match node.content.as_ref() {
         Some(NodeContentRef::Bytes(bytes)) => bytes.len() >= AUTO_RESERVE_SCALAR_THRESHOLD,
         Some(NodeContentRef::String(text)) => text.len() >= AUTO_RESERVE_SCALAR_THRESHOLD,
         Some(NodeContentRef::Nodes(children)) => {
@@ -178,7 +178,7 @@ fn should_auto_reserve_node_ref(node: &NodeRef<'_>) -> bool {
             }
             // Check one level deeper for large nested lists (e.g., <iq> -> <list> -> 812 keys)
             children.iter().any(|child| {
-                matches!(child.content.as_deref(), Some(NodeContentRef::Nodes(gc)) if gc.len() >= AUTO_RESERVE_CHILDREN_THRESHOLD)
+                matches!(child.content.as_ref(), Some(NodeContentRef::Nodes(gc)) if gc.len() >= AUTO_RESERVE_CHILDREN_THRESHOLD)
             })
         }
         None => false,
@@ -227,7 +227,7 @@ fn estimate_capacity_node_ref(node: &NodeRef<'_>) -> usize {
     estimate += node.tag.len();
     estimate += node.attrs.len() * AUTO_ATTR_ESTIMATE;
 
-    match node.content.as_deref() {
+    match node.content.as_ref() {
         Some(NodeContentRef::Bytes(bytes)) => {
             estimate += bytes.len() + 8;
         }
@@ -238,7 +238,7 @@ fn estimate_capacity_node_ref(node: &NodeRef<'_>) -> usize {
             estimate += children.len() * AUTO_CHILD_ESTIMATE;
             for child in children.iter().take(AUTO_CHILD_SAMPLE_LIMIT) {
                 estimate += child.tag.len() + child.attrs.len() * AUTO_ATTR_ESTIMATE;
-                match child.content.as_deref() {
+                match child.content.as_ref() {
                     Some(NodeContentRef::Bytes(bytes)) => estimate += bytes.len() + 8,
                     Some(NodeContentRef::String(text)) => estimate += text.len() + 8,
                     Some(NodeContentRef::Nodes(grand_children)) => {

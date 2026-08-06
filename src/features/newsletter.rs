@@ -713,7 +713,7 @@ fn parse_newsletter_messages_response(
         let message =
             msg_node
                 .get_optional_child("plaintext")
-                .and_then(|pt| match pt.content.as_deref() {
+                .and_then(|pt| match pt.content.as_ref() {
                     Some(NodeContentRef::Bytes(bytes)) => {
                         waproto::codec::message_decode(bytes.as_ref()).ok()
                     }
