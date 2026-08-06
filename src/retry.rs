@@ -32,7 +32,7 @@ fn get_bytes_content(node: &Node) -> Option<&[u8]> {
 
 /// Helper to extract bytes content from a NodeRef.
 fn get_bytes_content_ref<'a>(node: &'a NodeRef<'_>) -> Option<&'a [u8]> {
-    match node.content.as_deref() {
+    match node.content.as_ref() {
         Some(NodeContentRef::Bytes(b)) => Some(b.as_ref()),
         _ => None,
     }

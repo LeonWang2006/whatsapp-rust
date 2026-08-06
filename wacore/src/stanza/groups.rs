@@ -548,7 +548,7 @@ fn parse_action(node: &NodeRef<'_>) -> Option<GroupNotificationAction> {
             GroupNotificationAction::RevokedMembershipRequests { participants }
         }
         T::MemberAddMode => {
-            let mode = match node.content.as_deref() {
+            let mode = match node.content.as_ref() {
                 Some(NodeContentRef::String(s)) => s.to_string(),
                 Some(NodeContentRef::Bytes(b)) => String::from_utf8_lossy(b.as_ref()).into_owned(),
                 _ => String::new(),

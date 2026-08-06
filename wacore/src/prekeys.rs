@@ -282,7 +282,7 @@ impl PreKeyUtils {
         use wacore_binary::NodeContentRef;
 
         fn extract_bytes_ref(node: Option<&NodeRef<'_>>) -> Result<Vec<u8>, anyhow::Error> {
-            match node.and_then(|n| n.content.as_deref()) {
+            match node.and_then(|n| n.content.as_ref()) {
                 Some(NodeContentRef::Bytes(b)) => Ok(b.to_vec()),
                 _ => Err(anyhow::anyhow!("Expected bytes in node content")),
             }
@@ -358,7 +358,7 @@ impl PreKeyUtils {
             let device_identity = node
                 .get_optional_child("device-identity")
                 .or_else(|| keys_node.get_optional_child("device-identity"))
-                .and_then(|n| match n.content.as_deref() {
+                .and_then(|n| match n.content.as_ref() {
                     Some(NodeContentRef::Bytes(b)) => Some(b),
                     _ => None,
                 });
@@ -392,7 +392,7 @@ impl PreKeyUtils {
 
         let id_content = node
             .get_optional_child("id")
-            .and_then(|n| n.content.as_deref());
+            .and_then(|n| n.content.as_ref());
 
         let id = match id_content {
             Some(NodeContentRef::Bytes(b)) if !b.is_empty() => {
@@ -419,7 +419,7 @@ impl PreKeyUtils {
 
         let value_bytes = node
             .get_optional_child("value")
-            .and_then(|n| n.content.as_deref())
+            .and_then(|n| n.content.as_ref())
             .and_then(|c| {
                 if let NodeContentRef::Bytes(b) = c {
                     Some(b.to_vec())
@@ -448,7 +448,7 @@ impl PreKeyUtils {
         };
         let signature_bytes = node
             .get_optional_child("signature")
-            .and_then(|n| n.content.as_deref())
+            .and_then(|n| n.content.as_ref())
             .and_then(|c| {
                 if let NodeContentRef::Bytes(b) = c {
                     Some(b.to_vec())

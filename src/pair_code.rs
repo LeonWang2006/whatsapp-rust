@@ -627,7 +627,7 @@ async fn handle_primary_hello(client: &Arc<Client>, reg_node: &NodeRef<'_>) -> b
     // Extract primary's wrapped ephemeral public key (80 bytes: salt + iv + encrypted key)
     let primary_wrapped_ephemeral = match reg_node
         .get_optional_child_by_tag(&["link_code_pairing_wrapped_primary_ephemeral_pub"])
-        .and_then(|n| match n.content.as_deref() {
+        .and_then(|n| match n.content.as_ref() {
             Some(NodeContentRef::Bytes(b)) if b.len() == 80 => Some(b.to_vec()),
             _ => None,
         }) {
@@ -644,7 +644,7 @@ async fn handle_primary_hello(client: &Arc<Client>, reg_node: &NodeRef<'_>) -> b
     // Extract primary's identity public key (32 bytes, unencrypted)
     let primary_identity_pub: [u8; 32] = match reg_node
         .get_optional_child_by_tag(&["primary_identity_pub"])
-        .and_then(|n| match n.content.as_deref() {
+        .and_then(|n| match n.content.as_ref() {
             Some(NodeContentRef::Bytes(b)) if b.len() == 32 => b.as_ref().try_into().ok(),
             _ => None,
         }) {
@@ -662,7 +662,7 @@ async fn handle_primary_hello(client: &Arc<Client>, reg_node: &NodeRef<'_>) -> b
     // primary_hello whose ref doesn't match the one from our companion_hello.
     let notif_ref = match reg_node
         .get_optional_child_by_tag(&["link_code_pairing_ref"])
-        .and_then(|n| match n.content.as_deref() {
+        .and_then(|n| match n.content.as_ref() {
             Some(NodeContentRef::Bytes(b)) => Some(b.to_vec()),
             _ => None,
         }) {
@@ -1044,7 +1044,7 @@ async fn replace_adv_secret_key(client: &Arc<Client>) {
 async fn handle_refresh_code(client: &Arc<Client>, reg_node: &NodeRef<'_>) -> bool {
     let notif_ref = match reg_node
         .get_optional_child_by_tag(&["link_code_pairing_ref"])
-        .and_then(|n| match n.content.as_deref() {
+        .and_then(|n| match n.content.as_ref() {
             Some(NodeContentRef::Bytes(b)) => Some(b.to_vec()),
             _ => None,
         }) {

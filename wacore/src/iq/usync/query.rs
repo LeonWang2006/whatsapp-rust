@@ -1386,7 +1386,7 @@ fn parse_key_index(node: &NodeRef<'_>) -> Result<UsyncKeyIndexResult, anyhow::Er
     let expected_timestamp = attrs.optional_unix_time(ATTR_EXPECTED_TIMESTAMP);
     attrs.finish()?;
 
-    let signed_key_index_bytes = match node.content.as_deref() {
+    let signed_key_index_bytes = match node.content.as_ref() {
         Some(NodeContentRef::Bytes(bytes)) => Some(bytes.to_vec()),
         None => None,
         Some(_) => {
