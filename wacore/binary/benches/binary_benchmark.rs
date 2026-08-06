@@ -22,6 +22,46 @@ fn create_small_node() -> Node {
         .build()
 }
 
+/// The shape the wire is mostly made of: a short ack carrying a JID, a
+/// nibble-packed number and a hex-packed id at once. `create_small_node`
+/// already reaches `read_jid_pair` and the nibble half of `read_packed`, but
+/// nothing reached the hex half, since the large fixture's lowercase `abcdef`
+/// encodes as raw bytes rather than `HEX_8`.
+fn create_ack_node() -> Node {
+    NodeBuilder::new("ack")
+        .attr("to", "5511999990000@s.whatsapp.net")
+        .attr("id", "3EB0A1B2C3D4E5F60718")
+        .attr("class", "message")
+        .build()
+}
+
+/// A device fanout. Device-qualified JIDs encode as `AD_JID`, so what repeats
+/// per child is the packed decode and the AD path, not `read_jid_pair`.
+fn create_fanout_node() -> Node {
+    let devices: Vec<Node> = (0..8)
+        .map(|i| {
+            NodeBuilder::new("to")
+                .attr("jid", format!("5511999990000:{i}@s.whatsapp.net"))
+                .children(vec![
+                    NodeBuilder::new("enc")
+                        .attr("v", "2")
+                        .attr("type", "msg")
+                        .bytes(vec![0xAB; 128])
+                        .build(),
+                ])
+                .build()
+        })
+        .collect();
+    NodeBuilder::new("message")
+        .attr("to", "5511999990000@g.us")
+        .attr("id", "3EB0A1B2C3D4E5F60718")
+        .attr("type", "text")
+        .children(vec![
+            NodeBuilder::new("participants").children(devices).build(),
+        ])
+        .build()
+}
+
 fn create_large_node() -> Node {
     NodeBuilder::new("iq")
         .attr("to", "server@s.whatsapp.net")
@@ -238,6 +278,32 @@ fn setup_large_marshaled() -> Vec<u8> {
 fn bench_unmarshal_small(bencher: divan::Bencher) {
     bencher
         .with_inputs(setup_small_marshaled)
+        .bench_refs(|marshaled| {
+            black_box(unmarshal_ref(black_box(&marshaled[1..])).unwrap());
+        });
+}
+
+fn setup_ack_marshaled() -> Vec<u8> {
+    marshal(&create_ack_node()).unwrap()
+}
+
+fn setup_fanout_marshaled() -> Vec<u8> {
+    marshal(&create_fanout_node()).unwrap()
+}
+
+#[divan::bench]
+fn bench_unmarshal_ack(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_ack_marshaled)
+        .bench_refs(|marshaled| {
+            black_box(unmarshal_ref(black_box(&marshaled[1..])).unwrap());
+        });
+}
+
+#[divan::bench]
+fn bench_unmarshal_fanout(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(setup_fanout_marshaled)
         .bench_refs(|marshaled| {
             black_box(unmarshal_ref(black_box(&marshaled[1..])).unwrap());
         });

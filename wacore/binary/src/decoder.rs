@@ -15,6 +15,44 @@ fn jid_ref_to_compact(j: &JidRef<'_>) -> CompactString {
     s
 }
 
+/// Each byte's two output characters, so unpacking is one load and one 2-byte
+/// store per input byte instead of two shifts, two lookups and two bounds
+/// checks. Packed values on the wire (a 13-digit phone number, a 20-character
+/// id) are shorter than the SIMD chunk above, so this is the path that runs.
+static HEX_PAIRS: [[u8; 2]; 256] = {
+    const HEX: [u8; 16] = *b"0123456789ABCDEF";
+    let mut table = [[0u8; 2]; 256];
+    let mut i = 0;
+    while i < 256 {
+        table[i] = [HEX[i >> 4], HEX[i & 0x0F]];
+        i += 1;
+    }
+    table
+};
+
+/// Nibble values 12, 13 and 14 encode nothing, so they are marked and the byte
+/// carrying one falls back to the scalar path, which reports which half was
+/// bad. `NIBBLE_INVALID` cannot collide with an output character.
+const NIBBLE_INVALID: u8 = 0xFF;
+static NIBBLE_PAIRS: [[u8; 2]; 256] = {
+    const fn glyph(nibble: usize) -> u8 {
+        match nibble {
+            0..=9 => b'0' + nibble as u8,
+            10 => b'-',
+            11 => b'.',
+            15 => 0,
+            _ => NIBBLE_INVALID,
+        }
+    }
+    let mut table = [[0u8; 2]; 256];
+    let mut i = 0;
+    while i < 256 {
+        table[i] = [glyph(i >> 4), glyph(i & 0x0F)];
+        i += 1;
+    }
+    table
+};
+
 /// Node-nesting cap rejecting deep-`LIST` frames that would overflow the stack via
 /// unbounded `read_node_ref` recursion (real WA trees are well under 20 levels).
 const MAX_NODE_DEPTH: usize = 128;
@@ -357,14 +395,14 @@ impl<'a> Decoder<'a> {
             remainder
         };
 
-        for &byte in packed_data {
-            let high = (byte & 0xF0) >> 4;
-            let low = byte & 0x0F;
-            out[*pos] = Self::unpack_hex(high);
-            *pos += 1;
-            out[*pos] = Self::unpack_hex(low);
-            *pos += 1;
+        let written = packed_data.len() * 2;
+        for (slot, &byte) in out[*pos..*pos + written]
+            .chunks_exact_mut(2)
+            .zip(packed_data)
+        {
+            slot.copy_from_slice(&HEX_PAIRS[byte as usize]);
         }
+        *pos += written;
     }
 
     #[inline]
@@ -415,14 +453,20 @@ impl<'a> Decoder<'a> {
             remainder
         };
 
-        for &byte in packed_data {
-            let high = (byte & 0xF0) >> 4;
-            let low = byte & 0x0F;
-            out[*pos] = Self::unpack_nibble(high)?;
-            *pos += 1;
-            out[*pos] = Self::unpack_nibble(low)?;
-            *pos += 1;
+        let written = packed_data.len() * 2;
+        for (slot, &byte) in out[*pos..*pos + written]
+            .chunks_exact_mut(2)
+            .zip(packed_data)
+        {
+            let pair = NIBBLE_PAIRS[byte as usize];
+            if pair[0] == NIBBLE_INVALID || pair[1] == NIBBLE_INVALID {
+                // Report the bad half in the order the byte carries it.
+                Self::unpack_nibble((byte & 0xF0) >> 4)?;
+                Self::unpack_nibble(byte & 0x0F)?;
+            }
+            slot.copy_from_slice(&pair);
         }
+        *pos += written;
 
         Ok(())
     }
@@ -435,15 +479,6 @@ impl<'a> Decoder<'a> {
             11 => Ok(b'.'),
             15 => Ok(0),
             _ => Err(BinaryError::InvalidToken(value)),
-        }
-    }
-
-    #[inline(always)]
-    fn unpack_hex(value: u8) -> u8 {
-        match value {
-            0..=9 => b'0' + value,
-            10..=15 => b'A' + value - 10,
-            _ => unreachable!("hex nibble validated by 4-bit mask"),
         }
     }
 
