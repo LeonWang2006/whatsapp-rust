@@ -1,0 +1,15 @@
+[Unit]
+Description=WhatsApp-Rust dependencies (PostgreSQL + Redis) via podman-compose
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=%h/repo/whatsapp-rust
+ExecStart=/usr/bin/podman-compose -f deploy/compose/docker-compose.yml up -d
+ExecStop=/usr/bin/podman-compose -f deploy/compose/docker-compose.yml down
+TimeoutStartSec=120
+
+[Install]
+WantedBy=default.target

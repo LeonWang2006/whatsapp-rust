@@ -74,6 +74,8 @@ pub mod api;
 
 pub mod bot;
 pub mod lid_pn_cache;
+#[cfg(feature = "postgres-storage")]
+pub mod server;
 pub mod spam_report;
 pub mod sync_task;
 pub mod version;

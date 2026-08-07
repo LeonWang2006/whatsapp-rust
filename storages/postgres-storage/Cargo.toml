@@ -1,0 +1,29 @@
+[package]
+name = "whatsapp-rust-postgres-storage"
+version = "0.5.0"
+edition = "2024"
+authors = ["João Lucas <jlucaso@hotmail.com>"]
+license = "MIT"
+repository = "https://github.com/jlucaso1/whatsapp-rust"
+description = "PostgreSQL storage backend for whatsapp-rust (multi-pod shared storage)"
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+bincode = { version = "2.0.1", features = ["serde"] }
+diesel = { version = "2.3.7", default-features = false, features = [
+    "postgres",
+    "r2d2",
+    "32-column-tables",
+] }
+diesel_migrations = { version = "2.3.1", default-features = false, features = [
+    "postgres",
+] }
+log = { workspace = true }
+serde_json = { workspace = true, features = ["std"] }
+tokio = { workspace = true, features = ["sync", "rt", "time", "macros"] }
+wacore = { workspace = true }
+wacore-binary = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["sync", "rt", "time", "macros", "rt-multi-thread"] }

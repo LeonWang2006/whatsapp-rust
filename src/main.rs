@@ -23,9 +23,13 @@ const REACTION_EMOJI: &str = "🏓";
 //   cargo run -- -p 15551234567 -c MYCODE12        # Short form
 
 fn main() {
+    // Load .env if present. Missing file is fine (e.g. production uses real env vars).
+    let _ = dotenvy::dotenv();
+
     let args: Vec<String> = std::env::args().collect();
     let phone_number = parse_arg(&args, "--phone", "-p");
     let custom_code = parse_arg(&args, "--code", "-c");
+    let server_mode = args.iter().any(|a| a == "--server") || std::env::var("REDIS_URL").is_ok();
 
     if let Some(ref phone) = phone_number {
         eprintln!("Phone number provided: {}", phone);
@@ -53,101 +57,176 @@ fn main() {
         .build()
         .expect("Failed to build tokio runtime");
 
-    rt.block_on(async {
-        let backend = match SqliteStore::new("whatsapp.db").await {
-            Ok(store) => Arc::new(store),
-            Err(e) => {
-                error!("Failed to create SQLite backend: {}", e);
-                return;
-            }
-        };
-        info!("SQLite backend initialized successfully.");
+    if server_mode {
+        rt.block_on(run_server());
+    } else {
+        rt.block_on(run_single(phone_number, custom_code));
+    }
+}
 
-        let transport_factory = TokioWebSocketTransportFactory::new();
-        let http_client = UreqHttpClient::new();
+#[cfg(feature = "postgres-storage")]
+async fn run_server() {
+    use log::error;
+    use std::sync::Arc;
+    use whatsapp_rust::server::Server;
+    use whatsapp_rust_postgres_storage::PostgresStorageFactory;
 
-        let mut builder = Bot::builder()
-            .with_backend(backend)
-            .with_transport_factory(transport_factory)
-            .with_http_client(http_client)
-            .with_runtime(TokioRuntime);
-
-        if let Some(phone) = phone_number {
-            builder = builder.with_pair_code(PairCodeOptions {
-                phone_number: phone,
-                custom_code,
-                ..Default::default()
-            });
+    let database_url = match std::env::var("DATABASE_URL") {
+        Ok(v) => v,
+        Err(_) => {
+            error!("DATABASE_URL is required in server mode");
+            return;
         }
+    };
+    let redis_url = match std::env::var("REDIS_URL") {
+        Ok(v) => v,
+        Err(_) => {
+            error!("REDIS_URL is required in server mode");
+            return;
+        }
+    };
+    let pod_id = std::env::var("POD_ID").unwrap_or_else(|_| format!("pod-{}", std::process::id()));
+    let max_sessions: usize = std::env::var("MAX_SESSIONS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
 
-        let mut bot = builder
-            .on_event(move |event, client| async move {
-                match event {
-                    Event::PairingQrCode { code, timeout } => {
-                        info!("----------------------------------------");
-                        info!(
-                            "QR code received (valid for {} seconds):",
-                            timeout.as_secs()
-                        );
-                        info!("\n{}\n", code);
-                        info!("----------------------------------------");
-                    }
-                    Event::PairingCode { code, timeout } => {
-                        info!("========================================");
-                        info!("PAIR CODE (valid for {} seconds):", timeout.as_secs());
-                        info!("Enter this code on your phone:");
-                        info!("WhatsApp > Linked Devices > Link a Device");
-                        info!("> Link with phone number instead");
-                        info!("");
-                        info!("    >>> {} <<<", code);
-                        info!("");
-                        info!("========================================");
-                    }
-                    Event::Message(msg, info) => {
-                        let ctx = MessageContext {
-                            message: msg,
-                            info,
-                            client,
-                        };
-                        handle_message(&ctx).await;
-                    }
-                    Event::Connected(_) => info!("✅ Bot connected successfully!"),
-                    Event::LoggedOut(_) => error!("❌ Bot was logged out!"),
-                    _ => {}
+    info!("pod_id={pod_id} starting in server mode (max_sessions={max_sessions})");
+
+    let factory = PostgresStorageFactory::new(database_url.clone());
+    if let Err(e) = factory.run_migrations().await {
+        error!("failed to run migrations: {e}");
+        return;
+    }
+
+    let redis_client = redis::Client::open(redis_url.as_str()).expect("invalid REDIS_URL");
+    let redis_conn = redis::aio::ConnectionManager::new(redis_client)
+        .await
+        .expect("failed to connect to Redis");
+
+    let server = Server::new(
+        Arc::new(factory) as Arc<dyn wacore::store::StorageFactory>,
+        redis_conn,
+        pod_id,
+    )
+    .with_max_sessions(max_sessions);
+
+    let shutdown = server.shutdown_token();
+    #[cfg(feature = "signal")]
+    {
+        tokio::select! {
+            _ = server.run() => info!("server exited"),
+            _ = tokio::signal::ctrl_c() => {
+                info!("received Ctrl+C, shutting down");
+                shutdown.cancel();
+            }
+        }
+    }
+    #[cfg(not(feature = "signal"))]
+    {
+        server.run().await;
+    }
+}
+
+#[cfg(not(feature = "postgres-storage"))]
+async fn run_server() {
+    log::error!("server mode requires the `postgres-storage` feature");
+}
+
+async fn run_single(phone_number: Option<String>, custom_code: Option<String>) {
+    let backend = match SqliteStore::new("whatsapp.db").await {
+        Ok(store) => Arc::new(store),
+        Err(e) => {
+            error!("Failed to create SQLite backend: {}", e);
+            return;
+        }
+    };
+    info!("SQLite backend initialized successfully.");
+
+    let transport_factory = TokioWebSocketTransportFactory::new();
+    let http_client = UreqHttpClient::new();
+
+    let mut builder = Bot::builder()
+        .with_backend(backend)
+        .with_transport_factory(transport_factory)
+        .with_http_client(http_client)
+        .with_runtime(TokioRuntime);
+
+    if let Some(phone) = phone_number {
+        builder = builder.with_pair_code(PairCodeOptions {
+            phone_number: phone,
+            custom_code,
+            ..Default::default()
+        });
+    }
+
+    let mut bot = builder
+        .on_event(move |event, client| async move {
+            match event {
+                Event::PairingQrCode { code, timeout } => {
+                    info!("----------------------------------------");
+                    info!(
+                        "QR code received (valid for {} seconds):",
+                        timeout.as_secs()
+                    );
+                    info!("\n{}\n", code);
+                    info!("----------------------------------------");
                 }
-            })
-            .build()
+                Event::PairingCode { code, timeout } => {
+                    info!("========================================");
+                    info!("PAIR CODE (valid for {} seconds):", timeout.as_secs());
+                    info!("Enter this code on your phone:");
+                    info!("WhatsApp > Linked Devices > Link a Device");
+                    info!("> Link with phone number instead");
+                    info!("");
+                    info!("    >>> {} <<<", code);
+                    info!("");
+                    info!("========================================");
+                }
+                Event::Message(msg, info) => {
+                    let ctx = MessageContext {
+                        message: msg,
+                        info,
+                        client,
+                    };
+                    handle_message(&ctx).await;
+                }
+                Event::Connected(_) => info!("✅ Bot connected successfully!"),
+                Event::LoggedOut(_) => error!("❌ Bot was logged out!"),
+                _ => {}
+            }
+        })
+        .build()
+        .await
+        .expect("Failed to build bot");
+
+    let client = bot.client();
+
+    let bot_handle = match bot.run().await {
+        Ok(handle) => handle,
+        Err(e) => {
+            error!("Bot failed to start: {}", e);
+            return;
+        }
+    };
+
+    #[cfg(feature = "signal")]
+    {
+        tokio::select! {
+            _ = bot_handle => {}
+            _ = tokio::signal::ctrl_c() => {
+                info!("Received Ctrl+C, shutting down...");
+                client.disconnect().await;
+            }
+        }
+    }
+
+    #[cfg(not(feature = "signal"))]
+    {
+        bot_handle
             .await
-            .expect("Failed to build bot");
-
-        let client = bot.client();
-
-        let bot_handle = match bot.run().await {
-            Ok(handle) => handle,
-            Err(e) => {
-                error!("Bot failed to start: {}", e);
-                return;
-            }
-        };
-
-        #[cfg(feature = "signal")]
-        {
-            tokio::select! {
-                _ = bot_handle => {}
-                _ = tokio::signal::ctrl_c() => {
-                    info!("Received Ctrl+C, shutting down...");
-                    client.disconnect().await;
-                }
-            }
-        }
-
-        #[cfg(not(feature = "signal"))]
-        {
-            bot_handle
-                .await
-                .expect("Bot task should complete without panicking");
-        }
-    });
+            .expect("Bot task should complete without panicking");
+    }
 }
 
 async fn handle_message(ctx: &MessageContext) {

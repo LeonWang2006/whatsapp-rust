@@ -1,6 +1,8 @@
 pub mod commands;
 pub mod error;
 pub mod persistence_manager;
+#[cfg(feature = "postgres-storage")]
+pub mod redis_registry;
 pub mod signal;
 pub mod signal_adapter;
 pub mod signal_cache;
@@ -10,9 +12,14 @@ pub mod traits;
 #[cfg(feature = "sqlite-storage")]
 pub use whatsapp_rust_sqlite_storage::SqliteStore;
 
+// Re-export from the postgres-storage crate when the feature is enabled
+#[cfg(feature = "postgres-storage")]
+pub use whatsapp_rust_postgres_storage::PostgresStore;
+
 pub use crate::store::traits::*;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
+pub use wacore::store::StorageFactory;
 
 #[derive(Clone)]
 pub struct Device {

@@ -1,8 +1,12 @@
 # --- Build stage ---
 FROM rust:slim AS builder
 
-# Install musl toolchain for fully static binary
-RUN apt-get update && apt-get install -y --no-install-recommends musl-tools && rm -rf /var/lib/apt/lists/*
+# Install musl toolchain for fully static binary, plus libpq for PG linking
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        musl-tools \
+        libpq-dev \
+        pkg-config \
+    && rm -rf /var/lib/apt/lists/*
 
 # Install the exact nightly from rust-toolchain.toml + musl target
 COPY rust-toolchain.toml .
@@ -51,7 +55,13 @@ RUN find . -name "*.rs" -path "*/src/*" -exec touch {} +
 RUN cargo build --release --target x86_64-unknown-linux-musl
 
 # --- Runtime stage ---
-FROM scratch
+# Using debian:slim instead of scratch because the postgres-storage feature
+# dynamically links libpq. When building with --no-default-features (SQLite only),
+# scratch is still viable; for the multi-pod PG build we need the shared lib.
+FROM debian:slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends libpq5 ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/whatsapp-rust /whatsapp-rust
 

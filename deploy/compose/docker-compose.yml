@@ -1,0 +1,48 @@
+# WhatsApp-Rust 依赖服务
+# 启动: podman-compose -f deploy/compose/docker-compose.yml up -d
+# 停止: podman-compose -f deploy/compose/docker-compose.yml down
+# 日志: podman-compose -f deploy/compose/docker-compose.yml logs -f
+
+version: "3.8"
+
+services:
+  postgres:
+    image: docker.io/library/postgres:16
+    container_name: wa-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: "123456"
+      POSTGRES_DB: mydb
+      # 调大连接数,多 pod 共享时默认 100 可能不够
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d mydb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  redis:
+    image: docker.io/library/redis:latest
+    container_name: wa-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "noeviction"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  pg_data:
+  redis_data:

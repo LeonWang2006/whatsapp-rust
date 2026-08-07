@@ -1,0 +1,15 @@
+DROP TABLE IF EXISTS sent_messages;
+DROP TABLE IF EXISTS tc_tokens;
+DROP TABLE IF EXISTS sender_key_devices;
+DROP TABLE IF EXISTS device_registry;
+DROP TABLE IF EXISTS base_keys;
+DROP TABLE IF EXISTS lid_pn_mapping;
+DROP TABLE IF EXISTS app_state_mutation_macs;
+DROP TABLE IF EXISTS app_state_versions;
+DROP TABLE IF EXISTS app_state_keys;
+DROP TABLE IF EXISTS sender_keys;
+DROP TABLE IF EXISTS signed_prekeys;
+DROP TABLE IF EXISTS prekeys;
+DROP TABLE IF EXISTS sessions;
+DROP TABLE IF EXISTS identities;
+DROP TABLE IF EXISTS device;

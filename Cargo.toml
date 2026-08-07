@@ -14,6 +14,7 @@ members = [
     ".",
     "http_clients/ureq-client",
     "storages/sqlite-storage",
+    "storages/postgres-storage",
     "tests/e2e",
     "transports/tokio-transport",
     "wacore",
@@ -28,6 +29,8 @@ default-members = [
     ".",
     "http_clients/ureq-client",
     "storages/sqlite-storage",
+    "storages/postgres-storage",
+    "tests/e2e",
     "transports/tokio-transport",
     "wacore",
     "wacore/appstate",
@@ -51,6 +54,7 @@ bytemuck = { version = "1.22", default-features = false }
 bytes = { version = "1.5", default-features = false, features = ["serde"] }
 chrono = { version = "0.4", default-features = false }
 ctr = { version = "0.9", default-features = false }
+dashmap = "6"
 event-listener = { version = "5", default-features = false }
 flate2 = { version = "1.1.5", default-features = false, features = ["zlib-rs"] }
 futures = { version = "0.3", default-features = false, features = ["alloc", "async-await"] }
@@ -63,6 +67,7 @@ log = "0.4"
 prost = { version = "0.14.3", default-features = false, features = ["std"] }
 prost-build = { version = "0.14.3", default-features = false }
 rand = "0.10"
+redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager"] }
 serde = { version = "1.0", features = ["derive"] }
 serde-big-array = "0.5"
 serde_json = { version = "1.0", default-features = false }
@@ -71,6 +76,7 @@ sha1 = { version = "0.10.6", default-features = false }
 sha2 = { version = "0.10.6", default-features = false }
 thiserror = "2.0.17"
 tokio = { version = "1.48.0", default-features = false }
+tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
 uuid = { version = "1", default-features = false }
 
 # Internal workspace crates
@@ -103,6 +109,7 @@ tokio-transport = ["dep:whatsapp-rust-tokio-transport"]
 tokio-runtime = ["dep:tokio"]
 signal = ["tokio-runtime", "tokio/signal"]
 sqlite-storage = ["whatsapp-rust-sqlite-storage"]
+postgres-storage = ["dep:whatsapp-rust-postgres-storage"]
 tokio-native = ["tokio-runtime", "tokio/rt-multi-thread"]
 
 [dependencies]
@@ -113,7 +120,9 @@ async-trait = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true, features = ["clock", "serde"] }
+dashmap = { workspace = true }
 env_logger = { version = "0.11", default-features = false }
+dotenvy = "0.15"
 event-listener = { workspace = true }
 futures = { workspace = true, features = ["std"] }
 hex = { workspace = true }
@@ -121,16 +130,19 @@ log = { workspace = true }
 moka = { version = "0.12.12", features = ["future"], optional = true }
 prost = { workspace = true }
 rand = { workspace = true }
+redis = { workspace = true }
 scopeguard = "1.2"
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["std"] }
 hyper = { workspace = true, features = ["full"] }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"], optional = true }
+tokio-util = { workspace = true }
 wacore = { workspace = true }
 wacore-binary = { workspace = true }
 waproto = { workspace = true }
 whatsapp-rust-sqlite-storage = { path = "./storages/sqlite-storage", version = "0.5.0", optional = true }
+whatsapp-rust-postgres-storage = { path = "./storages/postgres-storage", version = "0.5.0", optional = true }
 whatsapp-rust-tokio-transport = { path = "./transports/tokio-transport", version = "0.5.0", optional = true }
 whatsapp-rust-ureq-http-client = { path = "./http_clients/ureq-client", version = "0.5.0", optional = true }
 

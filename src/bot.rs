@@ -126,34 +126,34 @@ struct BotEventHandler {
 impl EventHandler for BotEventHandler {
     fn handle_event(&self, event: &Event) {
         // Handle pairing code request when QR code is generated (indicates server is ready for pairing)
-        if matches!(event, Event::PairingQrCode { .. }) && self.pair_code_options.is_some() {
-            if !self
+        if matches!(event, Event::PairingQrCode { .. })
+            && self.pair_code_options.is_some()
+            && !self
                 .pair_code_requested
                 .swap(true, atomic::Ordering::SeqCst)
-            {
-                let client_for_pair = self.client.clone();
-                let options = self.pair_code_options.clone().unwrap();
-                self.client.runtime.spawn(Box::pin(async move {
-                    // Small delay to ensure connection is fully stable
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        {
+            let client_for_pair = self.client.clone();
+            let options = self.pair_code_options.clone().unwrap();
+            self.client.runtime.spawn(Box::pin(async move {
+                // Small delay to ensure connection is fully stable
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-                    // Check if already logged in (paired via QR or existing session)
-                    if client_for_pair.is_logged_in() {
-                        info!(target: "Bot/PairCode", "Already logged in, skipping pair code request");
-                        return;
-                    }
+                // Check if already logged in (paired via QR or existing session)
+                if client_for_pair.is_logged_in() {
+                    info!(target: "Bot/PairCode", "Already logged in, skipping pair code request");
+                    return;
+                }
 
-                    // Request pair code
-                    match client_for_pair.pair_with_code(options).await {
-                        Ok(code) => {
-                            info!(target: "Bot/PairCode", "Pair code generated: {}", code);
-                        }
-                        Err(e) => {
-                            warn!(target: "Bot/PairCode", "Failed to request pair code: {}", e);
-                        }
+                // Request pair code
+                match client_for_pair.pair_with_code(options).await {
+                    Ok(code) => {
+                        info!(target: "Bot/PairCode", "Pair code generated: {}", code);
                     }
-                })).detach();
-            }
+                    Err(e) => {
+                        warn!(target: "Bot/PairCode", "Failed to request pair code: {}", e);
+                    }
+                }
+            })).detach();
         }
 
         // Call user event handler
