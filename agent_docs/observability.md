@@ -117,12 +117,31 @@ relay I/O) currently spawn directly on Tokio and are not instrumented.
 ## `Client::resource_report()` — out-of-client resource attribution (on demand)
 
 `memory_report()` accounts only for the **client's own** in-process
-collections (tens of KiB). Profiling a many-session process shows the real
-per-session ~1 MiB is dominated by memory that lives **outside** the `Client`:
-the storage backend's SQLite page cache (the single largest chunk), transport
-buffers + TLS/noise state, the HTTP pool, and transient heap. `resource_report()`
-(`ResourceReport`) composes all of these into one estimate. Same design rules:
-runtime/platform-agnostic, zero cost when unused (LTO drops it), no PII.
+collections (tens of KiB). The real per-session cost lives mostly **outside**
+the `Client`: the storage backend, transport buffers + TLS/noise state, the
+HTTP pool, and transient heap. `resource_report()` (`ResourceReport`) composes
+all of these into one estimate. Same design rules: runtime/platform-agnostic,
+zero cost when unused (LTO drops it), no PII.
+
+How big "per-session" is depends on the backend, and the two profiles differ
+enough that quoting one figure misleads (`memory_soak.rs` covers growth over
+time, `process_footprint.rs` below covers the marginal cost of one more
+client):
+
+| profile | marginal RSS per session |
+| --- | ---: |
+| `InMemoryBackend` | ~530 KiB |
+| `SqliteStore` (defaults) | ~530 KiB + ~512 KiB of storage |
+
+Those are gross RSS, which is the pessimistic number; read the next section for
+why the actionable part is `RssAnon` and how much smaller it is.
+
+So the SQLite page cache **is** the single largest chunk, but only on the
+SQLite profile, and it is roughly half the total rather than all of it. A
+process on a remote or in-memory backend still pays the other ~530 KiB, of
+which the largest named pieces are the HTTP idle pool (96 KiB), the prekey
+window the backend retains (~102 KiB for the default 812 keys), and the
+transport's WebSocket + TLS buffers (64 KiB).
 
 The pieces (each an `Option`-only struct in `wacore::stats`, filled only with
 what a component can introspect — absent means "not reported", not zero):
@@ -136,7 +155,9 @@ what a component can introspect — absent means "not reported", not zero):
   composable *and* non-breaking. SQLite reports `min(cache cap, db size)` (an
   upper bound on the page cache; Diesel doesn't expose the raw handle needed for
   `sqlite3_db_status`), plus the DB page count. Remote backends report
-  `memory_bytes: Some(0)`.
+  `memory_bytes: Some(0)`. `InMemoryBackend` sums its own maps (table
+  allocations plus the heap its keys and values own), which is exact rather
+  than a cap, because every byte it holds is this process's heap.
 - **Transport** — `Transport::resource_report() -> Option<TransportResourceReport>`,
   a defaulted method (clean here — `Transport` isn't blanket-impl'd). The Tokio
   WebSocket transport fills best-effort static estimates (tokio-websockets and
@@ -243,6 +264,32 @@ Two consequences for anything measured this way:
   of them scale with sessions. The lazily built codec tables under the `voip`
   features do: they are `OnceLock` heap, process-wide, and only materialize once
   a call is encoded.
+
+### Reading a heap profile next to it
+
+`--features dhat-heap` (in `tests/e2e`) attributes retained bytes to call
+sites, which the footprint numbers cannot. Three things about that profile are
+easy to read backwards:
+
+- **dhat sees only the Rust global allocator.** SQLite's page cache comes from
+  the amalgamation's own `malloc`, so it never appears in a heap profile at any
+  size, and a profile taken on SQLite looks the same as one taken in memory.
+  The storage report and `RssAnon` are the only places it shows up.
+- **Its end-of-run `curr_bytes` is a leak metric, not residency.** The profiler
+  outlives the clients it profiled, so that figure describes what survived
+  teardown. Residency is the peak-time figure, or a `resource_report()` taken
+  while the clients are still connected.
+- **The report cannot reach RSS, by construction.** Against a counting global
+  allocator, glibc's anonymous RSS runs ~1.1x live heap, so
+  `total_estimated_bytes()` is a lower bound on `RssAnon` before any component
+  under-reports at all. Closing that last tenth is not a goal.
+
+Not everything is expressible. The noise sender task's batch buffer grows to
+`MAX_BATCH_WIRE_BYTES` and lives as a local inside a spawned task, so nothing
+can read it without a channel built for the purpose; it stays unreported rather
+than guessed. The safety net for the parts that *are* reachable is
+`tests/report_coverage.rs`, which parses `Client`'s fields and fails when one
+whose type names a collection never reaches `memory_report()`.
 
 ## Relation to the `metrics`/`tracing` features
 

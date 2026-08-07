@@ -154,6 +154,25 @@ fn marginal_anon(baseline: Footprint, steps: &[Footprint]) -> i64 {
     tail[tail.len() / 2]
 }
 
+/// Logs how much of the marginal session a `resource_report()` can name.
+///
+/// The gap is the part no component introspects, so it is the list of things
+/// worth teaching to report before anyone optimises against a bare RSS figure.
+/// Logged rather than asserted: the report's own figures are pinned by unit
+/// tests, and a threshold here would only measure allocator noise.
+fn report_attribution(reported: &[u64], marginal_anon_kib: i64) {
+    let mut tail: Vec<u64> = reported.iter().copied().skip(2).collect();
+    if tail.is_empty() {
+        return;
+    }
+    tail.sort_unstable();
+    let attributed_kib = (tail[tail.len() / 2] / 1024) as i64;
+    info!(
+        "resource_report          attributed={attributed_kib:>+8} KiB of {marginal_anon_kib:>+8} KiB marginal anon ({} KiB unattributed)",
+        marginal_anon_kib - attributed_kib
+    );
+}
+
 /// What a `Client` costs before it has talked to anything.
 ///
 /// Needs no mock server: `build()` performs no I/O, so the transport factory
@@ -210,13 +229,19 @@ async fn session_footprint_fixed_vs_marginal() -> anyhow::Result<()> {
     let baseline = footprint();
     let mut clients = Vec::with_capacity(n);
     let mut steps = Vec::with_capacity(n);
+    let mut reported = Vec::with_capacity(n);
 
     for i in 0..n {
         clients.push(TestClient::connect(&format!("footprint_{i}")).await?);
         steps.push(footprint());
+        // Sampled after the footprint so the report's own transients land
+        // outside the step they would otherwise inflate.
+        let client = &clients[i].client;
+        reported.push(client.resource_report().await.total_estimated_bytes());
     }
 
     report("connected sessions", baseline, &steps);
+    report_attribution(&reported, marginal_anon(baseline, &steps));
 
     let marginal = marginal_anon(baseline, &steps);
     for client in clients {
