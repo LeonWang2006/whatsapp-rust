@@ -201,9 +201,9 @@ pub mod usync;
 
 pub mod features;
 pub use features::{
-    AppStateError, BUSINESS_PROFILE_MAX_WEBSITES, BatchGroupResult, Blocking, BlockingError,
-    BlocklistEntry, BotDefault, BotList, BotListEntry, BotListSection, BotListVersion,
-    BotSectionDisplayType, BotSectionType, BotTheme, BotThemeMode, Bots, Business,
+    AppStateError, AppStateSettings, BUSINESS_PROFILE_MAX_WEBSITES, BatchGroupResult, Blocking,
+    BlockingError, BlocklistEntry, BotDefault, BotList, BotListEntry, BotListSection,
+    BotListVersion, BotSectionDisplayType, BotSectionType, BotTheme, BotThemeMode, Bots, Business,
     BusinessCategory, BusinessError, BusinessHourMode, BusinessHours, BusinessHoursConfig,
     BusinessHoursUpdate, BusinessProfile, BusinessProfileUpdate, BusinessProfileUpdateError,
     CappingMvStatus, CappingOteStatus, CappingStatus, Catalog, CatalogOptions, ChatActions,
@@ -225,12 +225,12 @@ pub use features::{
     ParticipantChangeResponse, ParticipantType, PictureType, PollError, PollOptionResult,
     PollVoteCiphertext, Polls, Presence, PresenceError, PresenceStatus, PreviousDescription, Price,
     Product, ProductAvailability, ProductImage, ProductVideo, Profile, ProfileError,
-    ProfilePicture, ReachoutTimelock, RetryReason, RetryRequestError, RetryRequestOptions,
-    RetryRequestOutcome, SalePrice, SecretEncKind, SecretEncrypted, SetProfilePictureResponse,
-    Signal, SignalError, SignalSessionInfo, SignalSessionMigration, StanzaRejection,
-    StanzaResponseError, Status, StatusPrivacySetting, StatusSendOptions, SyncActionMessageRange,
-    TcToken, TcTokenError, UnlinkSubgroupsResult, UserInfo, UsyncSubprotocolError, VariantProperty,
-    VerifiedName, group_type, message_key, message_range,
+    ProfilePicture, QuickReplies, ReachoutTimelock, RetryReason, RetryRequestError,
+    RetryRequestOptions, RetryRequestOutcome, SalePrice, SecretEncKind, SecretEncrypted,
+    SetProfilePictureResponse, Signal, SignalError, SignalSessionInfo, SignalSessionMigration,
+    StanzaRejection, StanzaResponseError, Status, StatusPrivacySetting, StatusSendOptions,
+    SyncActionMessageRange, TcToken, TcTokenError, UnlinkSubgroupsResult, UserInfo,
+    UsyncSubprotocolError, VariantProperty, VerifiedName, group_type, message_key, message_range,
 };
 
 pub mod bot;
