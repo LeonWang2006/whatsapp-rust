@@ -1,6 +1,7 @@
 //! Small accessors, config setters, node waiters and sync-error helpers.
 
 use super::*;
+use crate::client::interceptor::{InterceptorHandle, Registration, StanzaInterceptor};
 
 /// Identity for span/error tagging. Named fields, not a tuple — LID/PN transposition would
 /// otherwise be a silent, unchecked bug at call sites.
@@ -58,6 +59,77 @@ impl Client {
 
     pub(crate) fn raw_node_forwarding_enabled(&self) -> bool {
         self.raw_node_forwarding.load(Ordering::Relaxed) != 0
+    }
+
+    /// Register an interceptor that sees each decoded stanza before the
+    /// built-in pipeline, and may take it.
+    ///
+    /// Interceptors run in registration order; the first to return
+    /// [`Interception::Handled`] wins and the rest are skipped.
+    ///
+    /// See [`crate::client::interceptor`] for what this is for and what it
+    /// costs.
+    ///
+    /// [`Interception::Handled`]: crate::client::interceptor::Interception::Handled
+    pub fn add_stanza_interceptor(
+        self: &Arc<Self>,
+        interceptor: Arc<dyn StanzaInterceptor>,
+    ) -> InterceptorHandle {
+        let id = self.next_interceptor_id.fetch_add(1, Ordering::Relaxed);
+        self.update_stanza_interceptors(|registered| {
+            registered.push(Registration { id, interceptor });
+        });
+        InterceptorHandle {
+            client: Arc::downgrade(self),
+            id,
+        }
+    }
+
+    pub(crate) fn remove_stanza_interceptor(&self, id: u64) {
+        self.update_stanza_interceptors(|registered| {
+            registered.retain(|entry| entry.id != id);
+        });
+    }
+
+    /// Whether any interceptor is registered.
+    ///
+    /// One relaxed load, so the read loop pays nothing while none are. Relaxed
+    /// is enough because the lock behind it does the synchronising: a reader
+    /// racing a registration either sees the count in time or does not, and a
+    /// stanza that arrived before the registration finished was never that
+    /// interceptor's to see.
+    pub(crate) fn has_stanza_interceptors(&self) -> bool {
+        self.stanza_interceptor_count.load(Ordering::Relaxed) != 0
+    }
+
+    /// The current interceptors.
+    ///
+    /// A refcount bump, not a copy — and the snapshot is released before any
+    /// interceptor runs, so one that registers another cannot deadlock.
+    pub(crate) fn stanza_interceptors(&self) -> Arc<Vec<Registration>> {
+        Arc::clone(
+            &self
+                .stanza_interceptors
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    /// Copy-on-write, as the event bus does it: a reader keeps whatever
+    /// snapshot it took, so registering never blocks the read loop for longer
+    /// than the swap.
+    fn update_stanza_interceptors(&self, edit: impl FnOnce(&mut Vec<Registration>)) {
+        let mut guard = self
+            .stanza_interceptors
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut next = guard.as_ref().clone();
+        edit(&mut next);
+        // Stored while the write lock is held, so a reader never sees a count
+        // promising more than the snapshot holds.
+        self.stanza_interceptor_count
+            .store(next.len(), Ordering::Relaxed);
+        *guard = Arc::new(next);
     }
 
     /// Enable or disable skipping of history sync notifications at runtime.
@@ -311,6 +383,7 @@ impl Client {
             ),
             chatstate_handlers,
             custom_enc_handlers: self.custom_enc_handlers.get().map_or(0, |m| m.len()),
+            stanza_interceptors: self.stanza_interceptors().len(),
         }
     }
 

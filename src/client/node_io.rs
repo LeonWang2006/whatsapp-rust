@@ -55,6 +55,36 @@ fn from_jid_matches(
 
 /// The wire shape the server uses for E2EE status updates, carrying the same
 /// payload as `<message from="status@broadcast">`.
+/// Stanzas that carry connection state, which an interceptor may not claim.
+///
+/// `success` and `failure` settle authentication, `stream:error` drives
+/// shutdown and reconnection, and `ack` resolves the waiters a send is blocked
+/// on. Letting a consumer take one would not extend the client — it would leave
+/// it authenticated-but-unaware, or never reconnecting, or waiting forever on a
+/// send that already completed.
+///
+/// `zapo` protects the same two auth tags from its stanza filters, for the same
+/// reason.
+fn is_connection_critical(node: &wacore_binary::NodeRef<'_>) -> bool {
+    matches!(
+        node.tag.as_ref(),
+        "success" | "failure" | "stream:error" | "ack"
+    ) || (node.tag.as_ref() == "iq" && is_ping_request(node))
+}
+
+/// A server-initiated ping, which this client owes a pong.
+///
+/// Type-agnostic on an absent type, like WA Web's `handleIq`, but never a
+/// `type="result"`/`"error"` ping — that is a response to our own ping, and
+/// ponging it back is wrong.
+fn is_ping_request(node: &wacore_binary::NodeRef<'_>) -> bool {
+    node.get_attr("type").is_none_or(|s| s.as_str() == "get")
+        && (node.get_optional_child("ping").is_some()
+            || node
+                .get_attr("xmlns")
+                .is_some_and(|s| s.as_str() == "urn:xmpp:ping"))
+}
+
 fn is_status_broadcast_stanza(node: &wacore_binary::NodeRef<'_>) -> bool {
     from_jid_matches(node, |jid| jid.is_status_broadcast())
 }
@@ -508,6 +538,40 @@ impl Client {
         let should_ack = self.should_ack(nr);
         let deferred_ack_node = should_ack.then(|| Arc::clone(&node));
 
+        // An interceptor runs before the built-in pipeline so a consumer can
+        // act on a stanza this version does not model, instead of watching it
+        // get nacked.
+        if self.has_stanza_interceptors()
+            && !is_connection_critical(nr)
+            && self.intercept_stanza(&node)
+        {
+            // A claim does not change what the server is owed. Where this
+            // client would have acked it still acks; where it would have nacked
+            // a tag it does not model, the claim turns that into an ack,
+            // because someone did handle it — and answering nothing would leave
+            // the stanza in the offline queue with the stream recycling.
+            //
+            // A tag the client models but answers some other way gets nothing
+            // here: a direct <message> draws a delivery <receipt>, an <iq>
+            // draws an <iq type="result">, and a generic <ack class="message">
+            // is neither. Inventing one is worse than silence — whoever claimed
+            // the stanza took on the reply. The tags `should_ack` covers are
+            // unaffected; they were already answered above.
+            //
+            // Same identity requirement as the nack path: without `id` and
+            // `from` there is nothing to address.
+            let ack = deferred_ack_node.or_else(|| {
+                (!self.stanza_router.models(nr.tag.as_ref())
+                    && nr.get_attr("id").is_some()
+                    && nr.get_attr("from").is_some())
+                .then(|| Arc::clone(&node))
+            });
+            if let Some(node) = ack {
+                self.maybe_deferred_ack(node).await;
+            }
+            return;
+        }
+
         // Bypass async_trait's boxed future for the hot built-in handlers while
         // retaining router registration for direct router callers.
         match nr.tag.as_ref() {
@@ -554,6 +618,25 @@ impl Client {
         if !cancelled && let Some(node) = deferred_ack_node {
             self.maybe_deferred_ack(node).await;
         }
+    }
+
+    /// Offer a stanza to the registered interceptors.
+    ///
+    /// Returns whether one took it. The first to claim the stanza wins, so an
+    /// interceptor registered earlier can shadow a later one — registration
+    /// order is the priority order.
+    fn intercept_stanza(self: &Arc<Self>, node: &Arc<wacore_binary::OwnedNodeRef>) -> bool {
+        for registration in self.stanza_interceptors().iter() {
+            if registration.interceptor.intercept(node).is_handled() {
+                debug!(
+                    target: "Client/Recv",
+                    "Stanza <{}> taken by an interceptor",
+                    node.tag()
+                );
+                return true;
+            }
+        }
+        false
     }
 
     /// Whether a decrypted node must stay on the read loop instead of moving to
@@ -1982,17 +2065,11 @@ impl Client {
         tracing::instrument(name = "wa.conn.iq_in", level = "debug", skip_all)
     )]
     pub(crate) async fn handle_iq(self: &Arc<Self>, node: &wacore_binary::NodeRef<'_>) -> bool {
-        // Pong a server-initiated ping (a request: type="get" or, like WA Web's
-        // type-agnostic handleIq, an absent type), but not a type="result"/"error"
-        // ping — that's a response to our own ping, and ponging it back is wrong.
-        // The previous gate required type=="get" exactly, dropping an absent-type
-        // ping and risking a keepalive timeout/disconnect.
-        let is_ping_request = node.get_attr("type").is_none_or(|s| s.as_str() == "get")
-            && (node.get_optional_child("ping").is_some()
-                || node
-                    .get_attr("xmlns")
-                    .is_some_and(|s| s.as_str() == "urn:xmpp:ping"));
-        if is_ping_request {
+        // Pong a server-initiated ping. The gate is shared with
+        // `is_connection_critical`, which never offers one to an interceptor:
+        // a claimed ping is a pong never sent, and the server drops the
+        // connection for it.
+        if is_ping_request(node) {
             debug!("Received ping, sending pong.");
             let mut parser = node.attrs();
             let from_jid = parser.jid("from");

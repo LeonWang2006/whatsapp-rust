@@ -8,6 +8,7 @@ mod device_registry;
 pub(crate) mod device_topology;
 #[cfg(feature = "client-lifecycle")]
 mod extension_lifecycle;
+pub mod interceptor;
 mod iq_ops;
 mod lid_pn;
 mod lifecycle;
@@ -342,6 +343,12 @@ pub struct MemoryReport {
     // -- Misc --
     pub chatstate_handlers: usize,
     pub custom_enc_handlers: usize,
+    /// Interceptors currently registered.
+    ///
+    /// A handle that outlives its interest leaves one registered, and a leak
+    /// here costs a walk on every stanza — which the count is what makes
+    /// visible.
+    pub stanza_interceptors: usize,
 }
 
 impl MemoryReport {
@@ -505,6 +512,7 @@ impl std::fmt::Display for MemoryReport {
         writeln!(f, "--- Misc ---")?;
         writeln!(f, "  chatstate_handlers:     {}", self.chatstate_handlers)?;
         writeln!(f, "  custom_enc_handlers:    {}", self.custom_enc_handlers)?;
+        writeln!(f, "  stanza_interceptors:    {}", self.stanza_interceptors)?;
         writeln!(
             f,
             "  total estimated:        {} B",
@@ -1412,6 +1420,15 @@ pub struct Client {
 
     /// Number of consumers currently requesting `Event::RawNode` forwarding.
     raw_node_forwarding: AtomicUsize,
+
+    /// Stanza interceptors, behind the same copy-on-write snapshot the event
+    /// bus uses: reading one costs a refcount bump, so the read loop allocates
+    /// nothing per stanza. Registering is the rare side, and pays the copy.
+    stanza_interceptors: std::sync::RwLock<Arc<Vec<interceptor::Registration>>>,
+    /// Kept alongside so the read loop can skip the lock entirely while none
+    /// are registered.
+    stanza_interceptor_count: AtomicUsize,
+    next_interceptor_id: AtomicU64,
 
     /// Active VoIP calls and their media-task abort handles. `abort_all` runs from the
     /// connection-cleanup path so a disconnect/reconnect tears down every in-flight call. Behind the
