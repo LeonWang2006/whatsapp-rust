@@ -71,28 +71,54 @@ pub(crate) struct EncPayload {
     pub ciphertext: bytes::Bytes,
     pub enc_type: EncType,
     pub padding_version: u8,
+    /// Position in the order [`message_enc_nodes_for_device`] yields, counting
+    /// from zero: direct `<enc>` children first, then this device's under
+    /// `<participants><to>`.
+    ///
+    /// Recorded during classification because nothing downstream can recover
+    /// it: payloads are split into per-kind buckets and encs that produce no
+    /// payload are skipped, so a position within a bucket is not a position in
+    /// the stanza.
+    pub enc_index: usize,
 }
 
 impl EncPayload {
-    fn from_parts(ciphertext: bytes::Bytes, enc_node: &NodeRef<'_>) -> Option<Self> {
+    fn from_parts(
+        ciphertext: bytes::Bytes,
+        enc_node: &NodeRef<'_>,
+        enc_index: usize,
+    ) -> Option<Self> {
         let enc_type = EncType::from_wire(enc_node.attrs().optional_string("type")?.as_ref())?;
         let padding_version = enc_node.attrs().optional_u64("v").unwrap_or(2) as u8;
         Some(Self {
             ciphertext,
             enc_type,
             padding_version,
+            enc_index,
         })
     }
 
     /// Zero-copy extraction from an OwnedNodeRef.
-    pub(crate) fn from_owned_node(owner: &OwnedNodeRef, enc_node: &NodeRef<'_>) -> Option<Self> {
-        Self::from_parts(owner.slice_bytes(enc_node.content_bytes()?), enc_node)
+    pub(crate) fn from_owned_node(
+        owner: &OwnedNodeRef,
+        enc_node: &NodeRef<'_>,
+        enc_index: usize,
+    ) -> Option<Self> {
+        Self::from_parts(
+            owner.slice_bytes(enc_node.content_bytes()?),
+            enc_node,
+            enc_index,
+        )
     }
 
     /// Copying extraction from a NodeRef (used in tests where there's no OwnedNodeRef).
     #[cfg(test)]
-    pub(crate) fn from_node_ref(node: &NodeRef<'_>) -> Option<Self> {
-        Self::from_parts(bytes::Bytes::copy_from_slice(node.content_bytes()?), node)
+    pub(crate) fn from_node_ref(node: &NodeRef<'_>, enc_index: usize) -> Option<Self> {
+        Self::from_parts(
+            bytes::Bytes::copy_from_slice(node.content_bytes()?),
+            node,
+            enc_index,
+        )
     }
 }
 
@@ -195,6 +221,9 @@ struct DeferredPlaintext {
     enc_type: &'static str,
     plaintext: Vec<u8>,
     padding_version: u8,
+    /// Which `<enc>` in the stanza produced this — [`EncPayload::enc_index`],
+    /// carried through because the buffer drains after the decrypt loop.
+    enc_index: usize,
 }
 
 fn should_process_skmsg_after_session(

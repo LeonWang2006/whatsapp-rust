@@ -335,7 +335,7 @@ async fn test_process_session_enc_batch_handles_session_not_found_gracefully() {
         .bytes(signal_message.serialized().to_vec())
         .build();
     let enc_node_ref = enc_node.as_node_ref();
-    let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_node_ref).unwrap()];
+    let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_node_ref, 0).unwrap()];
 
     let outcome = client
         .process_session_enc_batch(payloads, &info, &sender_jid, DecryptFailMode::Show)
@@ -402,8 +402,8 @@ async fn batch_accumulates_undecryptable_and_dispatches_once() {
     let enc1_ref = enc1.as_node_ref();
     let enc2_ref = enc2.as_node_ref();
     let payloads: Vec<EncPayload> = vec![
-        EncPayload::from_node_ref(&enc1_ref).unwrap(),
-        EncPayload::from_node_ref(&enc2_ref).unwrap(),
+        EncPayload::from_node_ref(&enc1_ref, 0).unwrap(),
+        EncPayload::from_node_ref(&enc2_ref, 1).unwrap(),
     ];
 
     let outcome = client
@@ -489,7 +489,7 @@ async fn test_empty_session_record_treated_as_session_not_found() {
         .bytes(signal_message.serialized().to_vec())
         .build();
     let enc_node_ref = enc_node.as_node_ref();
-    let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_node_ref).unwrap()];
+    let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_node_ref, 0).unwrap()];
 
     let outcome = client
         .clone()
@@ -835,7 +835,7 @@ async fn submit_and_check_session(
         .bytes(bytes)
         .build();
     let enc_ref = enc_node.as_node_ref();
-    let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_ref).unwrap()];
+    let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_ref, 0).unwrap()];
     let info = Arc::new(MessageInfo {
         source: crate::types::message::MessageSource {
             sender: peer_jid.clone(),
@@ -1100,7 +1100,7 @@ async fn test_badmac_preserves_session() {
         .bytes(bytes)
         .build();
     let enc_ref = enc_node.as_node_ref();
-    let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_ref).unwrap()];
+    let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_ref, 0).unwrap()];
     let info = Arc::new(MessageInfo {
         id: "BADMAC_TAMPER_MSG".to_string(),
         source: crate::types::message::MessageSource {
@@ -1260,7 +1260,7 @@ async fn test_prod_scenario_pkmsg_archives_old_session_after_badmac() {
         .bytes(bytes)
         .build();
     let enc_ref = enc_node.as_node_ref();
-    let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_ref).unwrap()];
+    let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_ref, 0).unwrap()];
     let info = Arc::new(MessageInfo {
         id: "PROD_LOOP_REPRO_STALE".to_string(),
         source: crate::types::message::MessageSource {
@@ -2231,7 +2231,7 @@ async fn test_untrusted_identity_error_is_caught_and_handled() {
         .build();
 
     let enc_node_ref = enc_node.as_node_ref();
-    let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_node_ref).unwrap()];
+    let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_node_ref, 0).unwrap()];
 
     // Call process_session_enc_batch
     // This should handle any errors gracefully without panicking
@@ -2314,7 +2314,8 @@ async fn test_untrusted_identity_does_not_break_batch_processing() {
 
     let payloads: Vec<EncPayload> = enc_nodes
         .iter()
-        .filter_map(|n| EncPayload::from_node_ref(&n.as_node_ref()))
+        .enumerate()
+        .filter_map(|(enc_index, n)| EncPayload::from_node_ref(&n.as_node_ref(), enc_index))
         .collect();
 
     // Process the batch
@@ -2385,7 +2386,7 @@ async fn test_untrusted_identity_in_group_context() {
         .build();
 
     let enc_node_ref = enc_node.as_node_ref();
-    let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_node_ref).unwrap()];
+    let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_node_ref, 0).unwrap()];
 
     // Process the message
     // Should handle errors gracefully in group context
@@ -5235,7 +5236,7 @@ async fn undecryptable_receive_branch_stays_silent_when_batch_dispatched() {
         .attr("type", "msg")
         .bytes(signal_message.serialized().to_vec())
         .build();
-    let payload = EncPayload::from_node_ref(&enc.as_node_ref()).expect("session payload");
+    let payload = EncPayload::from_node_ref(&enc.as_node_ref(), 0).expect("session payload");
 
     client
         .clone()
@@ -5309,7 +5310,7 @@ async fn undecryptable_receive_branch_announces_the_dispatch_it_performs() {
         .attr("type", "msg")
         .bytes(vec![0xFF, 0x00, 0x03])
         .build();
-    let payload = EncPayload::from_node_ref(&enc.as_node_ref()).expect("session payload");
+    let payload = EncPayload::from_node_ref(&enc.as_node_ref(), 0).expect("session payload");
 
     client
         .clone()
@@ -6853,6 +6854,7 @@ async fn pkmsg_parse_error_dispatches_parsing_error_nack() {
 
     // 1-byte ciphertext is a guaranteed parse failure.
     let bad_payload = EncPayload {
+        enc_index: 0,
         ciphertext: bytes::Bytes::from_static(&[0xFF]),
         enc_type: EncType::PreKeyMessage,
         padding_version: 2,
@@ -6896,6 +6898,7 @@ async fn signal_message_parse_error_dispatches_parsing_error_nack() {
     let sender_jid: Jid = info.source.sender.clone();
 
     let bad_payload = EncPayload {
+        enc_index: 0,
         ciphertext: bytes::Bytes::from_static(&[0xFF]),
         enc_type: EncType::Message,
         padding_version: 2,
@@ -7566,7 +7569,7 @@ async fn process_session_ct(
         .bytes(bytes)
         .build();
     let enc_ref = enc.as_node_ref();
-    let payload = EncPayload::from_node_ref(&enc_ref).unwrap();
+    let payload = EncPayload::from_node_ref(&enc_ref, 0).unwrap();
     let info = Arc::new(MessageInfo {
         id: id.to_string(),
         source: crate::types::message::MessageSource {
@@ -7603,7 +7606,7 @@ fn enc_payload_from_ciphertext(ct: &CiphertextMessage) -> EncPayload {
         .attr("type", enc_type)
         .bytes(bytes)
         .build();
-    EncPayload::from_node_ref(&enc.as_node_ref()).expect("ciphertext payload")
+    EncPayload::from_node_ref(&enc.as_node_ref(), 0).expect("ciphertext payload")
 }
 
 fn skmsg_payload_from_bytes(bytes: Vec<u8>) -> EncPayload {
@@ -7611,7 +7614,7 @@ fn skmsg_payload_from_bytes(bytes: Vec<u8>) -> EncPayload {
         .attr("type", "skmsg")
         .bytes(bytes)
         .build();
-    EncPayload::from_node_ref(&enc.as_node_ref()).expect("skmsg payload")
+    EncPayload::from_node_ref(&enc.as_node_ref(), 0).expect("skmsg payload")
 }
 
 fn msmsg_payload_from_bytes(bytes: Vec<u8>) -> EncPayload {
@@ -7619,7 +7622,7 @@ fn msmsg_payload_from_bytes(bytes: Vec<u8>) -> EncPayload {
         .attr("type", "msmsg")
         .bytes(bytes)
         .build();
-    EncPayload::from_node_ref(&enc.as_node_ref()).expect("msmsg payload")
+    EncPayload::from_node_ref(&enc.as_node_ref(), 0).expect("msmsg payload")
 }
 
 fn group_message_info(id: &str, group: &Jid, sender: &Jid, is_from_me: bool) -> Arc<MessageInfo> {
@@ -8577,7 +8580,7 @@ async fn duplicate_message_is_acked_with_delivery_receipt() {
     }
 
     // A real (padded) Message so the success path also emits its receipt.
-    let plaintext = wacore::messages::MessageUtils::encode_and_pad(&wa::Message {
+    let plaintext = MessageUtils::encode_and_pad(&wa::Message {
         conversation: Some("hi".to_string()),
         ..Default::default()
     });
@@ -8810,6 +8813,121 @@ async fn unavailable_message_is_transport_acked() {
     }
     let (to, _) = found.expect("unavailable message must get a transport ack");
     assert_eq!(to, "5511777776666@s.whatsapp.net");
+}
+
+#[tokio::test]
+async fn fan_out_encs_are_numbered_after_the_direct_ones() {
+    // A fan-out stanza carries a copy per device under `<participants>`, and
+    // only this device's is ours to decrypt. The client enumerates direct
+    // children first and those second, so the index is a position in that
+    // concatenation and not a child index — which is exactly what a consumer
+    // resolving it back to a node has to reproduce.
+    let (client, _transport) = capturing_client("enc_index_fanout").await;
+    let own = client.pn().expect("test client has a PN");
+
+    let node = NodeBuilder::new("message")
+        .attr("from", "5511777776666@g.us")
+        .attr("participant", "5511999998888@s.whatsapp.net")
+        .attr("id", "FANOUT1")
+        .attr("type", "text")
+        .children([
+            NodeBuilder::new("enc")
+                .attr("type", "skmsg")
+                .bytes(vec![1u8; 8])
+                .build(),
+            NodeBuilder::new("participants")
+                .children([
+                    NodeBuilder::new("to")
+                        .attr("jid", "5500000000000:1@s.whatsapp.net")
+                        .children([NodeBuilder::new("enc")
+                            .attr("type", "pkmsg")
+                            .bytes(vec![2u8; 8])
+                            .build()])
+                        .build(),
+                    NodeBuilder::new("to")
+                        .attr("jid", own.to_string())
+                        .children([NodeBuilder::new("enc")
+                            .attr("type", "pkmsg")
+                            .bytes(vec![3u8; 8])
+                            .build()])
+                        .build(),
+                ])
+                .build(),
+        ])
+        .build();
+    let classified = client
+        .classify_incoming_message(&node_to_arc(node))
+        .await
+        .expect("both buckets have a payload");
+
+    assert_eq!(
+        classified
+            .group_payloads
+            .iter()
+            .map(|payload| payload.enc_index)
+            .collect::<Vec<_>>(),
+        [0],
+        "the direct skmsg is enumerated first"
+    );
+    assert_eq!(
+        classified
+            .session_payloads
+            .iter()
+            .map(|payload| payload.enc_index)
+            .collect::<Vec<_>>(),
+        [1],
+        "ours under <participants> comes next — another device's is not counted"
+    );
+}
+
+#[tokio::test]
+async fn enc_index_is_the_position_in_the_stanza_not_in_its_bucket() {
+    // The common group shape: a pkmsg carrying the sender key, then the skmsg
+    // it unlocks. They land in different buckets, so anything that counted
+    // within a bucket would call both of them enc 0 — and a consumer
+    // correlating a forwarded payload back to its `<enc>` would attribute the
+    // wrong ciphertext. An enc that yields no payload at all still consumes its
+    // position, because the stanza's own numbering does not skip it.
+    let (client, _transport) = capturing_client("enc_index_buckets").await;
+    let node = NodeBuilder::new("message")
+        .attr("from", "5511777776666@g.us")
+        .attr("participant", "5511999998888@s.whatsapp.net")
+        .attr("id", "MULTIENC1")
+        .attr("type", "text")
+        .children([
+            NodeBuilder::new("enc")
+                .attr("type", "pkmsg")
+                .bytes(vec![1u8; 8])
+                .build(),
+            // Produces no payload, and still occupies slot 1.
+            NodeBuilder::new("enc")
+                .attr("type", "frskmsg")
+                .bytes(vec![2u8; 8])
+                .build(),
+            NodeBuilder::new("enc")
+                .attr("type", "skmsg")
+                .bytes(vec![3u8; 8])
+                .build(),
+        ])
+        .build();
+    let owned = node_to_arc(node);
+    let classified = client
+        .classify_incoming_message(&owned)
+        .await
+        .expect("a usable payload in each bucket");
+
+    let session: Vec<_> = classified
+        .session_payloads
+        .iter()
+        .map(|payload| payload.enc_index)
+        .collect();
+    let group: Vec<_> = classified
+        .group_payloads
+        .iter()
+        .map(|payload| payload.enc_index)
+        .collect();
+    assert_eq!(session, [0], "the pkmsg is the stanza's first enc");
+    assert_eq!(group, [2], "the skmsg is its third, not its first");
 }
 
 /// Unknown-only stanzas (e.g. msmsg) must be acked or they loop the queue.
@@ -9082,7 +9200,7 @@ async fn app_state_sync_key_share_honored_only_from_self() {
         create_test_message_info("5510000@s.whatsapp.net", "AKS1", "5510000@s.whatsapp.net");
     info.source.is_from_me = false;
     client
-        .handle_decrypted_plaintext("msg", padded.clone(), 2, &Arc::new(info))
+        .handle_decrypted_plaintext("msg", padded.clone(), 2, 0, &Arc::new(info))
         .await
         .unwrap();
     assert!(
@@ -9106,7 +9224,7 @@ async fn app_state_sync_key_share_honored_only_from_self() {
     );
     info.source.is_from_me = true;
     client
-        .handle_decrypted_plaintext("msg", padded, 2, &Arc::new(info))
+        .handle_decrypted_plaintext("msg", padded, 2, 0, &Arc::new(info))
         .await
         .unwrap();
     assert!(
@@ -9257,7 +9375,13 @@ async fn app_state_key_share_waits_outside_the_offline_message_lane() {
     let info = Arc::new(info);
     tokio::time::timeout(
         std::time::Duration::from_millis(100),
-        client.handle_decrypted_plaintext("msg", MessageUtils::encode_and_pad(&request), 2, &info),
+        client.handle_decrypted_plaintext(
+            "msg",
+            MessageUtils::encode_and_pad(&request),
+            2,
+            0,
+            &info,
+        ),
     )
     .await
     .expect("the inbound lane must not wait for offline sync")
@@ -9275,7 +9399,13 @@ async fn app_state_key_share_waits_outside_the_offline_message_lane() {
     );
     tokio::time::timeout(
         std::time::Duration::from_millis(100),
-        client.handle_decrypted_plaintext("msg", MessageUtils::encode_and_pad(&request), 2, &info),
+        client.handle_decrypted_plaintext(
+            "msg",
+            MessageUtils::encode_and_pad(&request),
+            2,
+            0,
+            &info,
+        ),
     )
     .await
     .expect("the redelivery must not wait for offline sync")
@@ -9581,7 +9711,7 @@ async fn lid_migration_mapping_sync_honored_only_from_self() {
         create_test_message_info("5510000@s.whatsapp.net", "LMS1", "5510000@s.whatsapp.net");
     info.source.is_from_me = false;
     client
-        .handle_decrypted_plaintext("msg", padded.clone(), 2, &Arc::new(info))
+        .handle_decrypted_plaintext("msg", padded.clone(), 2, 0, &Arc::new(info))
         .await
         .unwrap();
     assert!(
@@ -9597,7 +9727,7 @@ async fn lid_migration_mapping_sync_honored_only_from_self() {
     );
     info.source.is_from_me = true;
     client
-        .handle_decrypted_plaintext("msg", padded, 2, &Arc::new(info))
+        .handle_decrypted_plaintext("msg", padded, 2, 0, &Arc::new(info))
         .await
         .unwrap();
     assert_eq!(
@@ -11938,6 +12068,111 @@ async fn msmsg_outbound_put_and_inbound_get_match_for_lid_bot() {
     );
 }
 
+#[tokio::test]
+async fn a_bot_payload_is_forwarded_like_any_other_plaintext() {
+    // The bot-secret path opens its payload with AES-GCM instead of Signal and
+    // decodes it in its own function, so it is the one place a plaintext could
+    // reach `Message` without the event seeing it. The secret is single-use, so
+    // a payload it drops is as unrecoverable as a ratcheted one.
+    use crate::store::commands::DeviceCommand;
+    use wacore::bot_message::{BotMessageContext, encrypt_bot_message};
+    use wacore::types::events::{ChannelEventHandler, Event, EventInterest, EventKind};
+
+    let (client, _transport) = capturing_client("msmsg_forwarding").await;
+    client
+        .persistence_manager
+        .process_command(DeviceCommand::SetLid(Some(
+            "999888777666555:0@lid".parse().unwrap(),
+        )))
+        .await;
+    let (handler, events) = ChannelEventHandler::new();
+    client
+        .subscribe(EventInterest::of(&[EventKind::DecryptedPayload]), handler)
+        .detach();
+    let _lease = client.acquire_decrypted_payload_forwarding();
+
+    let bot_chat: Jid = "867051314767696@bot".parse().unwrap();
+    let outbound_id = "OUT_FWD";
+    let bot_reply_id = "REPLY_FWD";
+    let our_lid = "999888777666555@lid";
+    let secret = [0x71u8; 32];
+
+    let sender_identity = client
+        .dm_sender_identity_for(&bot_chat)
+        .await
+        .expect("LID seeded");
+    client
+        .persist_outbound_msg_secret(
+            &bot_chat,
+            &sender_identity,
+            outbound_id,
+            &secret,
+            wacore::msg_secret::RetentionClass::Bot,
+            crate::send::SendInstant::now(),
+        )
+        .await;
+
+    let plaintext_msg = wa::Message {
+        conversation: Some("from the bot".to_string()),
+        ..Default::default()
+    };
+    let pt_bytes = {
+        use buffa::Message as _;
+        let mut v = Vec::with_capacity(plaintext_msg.encoded_len() as usize);
+        plaintext_msg.encode(&mut v);
+        v
+    };
+    let ctx = BotMessageContext {
+        msg_id: bot_reply_id,
+        target_sender_user_jid: our_lid,
+        bot_user_jid: "867051314767696@bot",
+    };
+    let (cipher, iv) = encrypt_bot_message(&pt_bytes, &secret, &ctx).unwrap();
+
+    let node = NodeBuilder::new("message")
+        .attr("from", "867051314767696@bot")
+        .attr("id", bot_reply_id)
+        .attr("type", "text")
+        .children([
+            NodeBuilder::new("meta")
+                .attr("target_id", outbound_id)
+                .attr("target_sender_jid", our_lid)
+                .build(),
+            NodeBuilder::new("enc")
+                .attr("type", "msmsg")
+                .attr("v", "2")
+                .bytes(encode_message_secret_message(&iv, &cipher))
+                .build(),
+        ])
+        .build();
+    client
+        .clone()
+        .handle_incoming_message(node_to_arc(node))
+        .await;
+
+    let mut received = None;
+    crate::test_utils::poll_until("the bot payload to be forwarded", || {
+        received = events.try_recv().ok();
+        received.is_some()
+    })
+    .await;
+    let event = received.expect("forwarded");
+    let Event::DecryptedPayload(payload) = &*event else {
+        panic!("expected a DecryptedPayload");
+    };
+    assert_eq!(
+        payload.payload.as_ref(),
+        pt_bytes.as_slice(),
+        "the opened bot payload, before this build tried to decode it"
+    );
+    assert_eq!(payload.enc_type, "msmsg");
+    assert_eq!(
+        payload.enc_index, 0,
+        "the stanza's first <enc>, whatever precedes it among the children"
+    );
+    assert_eq!(payload.info.id, bot_reply_id);
+}
+
 /// Regression for the AD_JID encoder bug: a `from="USER:0@bot"` stanza must
 /// survive the marshal/unmarshal round-trip with `server=Bot`, so the
 /// secret lookup keys hit and the reply decrypts.
@@ -12369,7 +12604,7 @@ async fn bench_feed(
         .bytes(bytes)
         .build();
     let enc_ref = enc_node.as_node_ref();
-    let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_ref).unwrap()];
+    let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_ref, 0).unwrap()];
     let info = Arc::new(MessageInfo {
         source: crate::types::message::MessageSource {
             sender: peer.clone(),
@@ -12571,7 +12806,7 @@ async fn test_invalid_signed_prekey_id_sends_retry_receipt() {
         .bytes(bytes)
         .build();
     let enc_ref = enc_node.as_node_ref();
-    let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_ref).unwrap()];
+    let payloads: Vec<EncPayload> = vec![EncPayload::from_node_ref(&enc_ref, 0).unwrap()];
     let info = Arc::new(MessageInfo {
         id: "INVALID_SPK_ID_MSG".to_string(),
         source: crate::types::message::MessageSource {
@@ -12875,5 +13110,165 @@ async fn newsletter_status_stanza_is_nacked_once() {
     assert!(
         !extra_frame_appears(&transport, 1).await,
         "the nack replaces the ack; the server must not get both"
+    );
+}
+
+// --- decrypted-payload forwarding ------------------------------------------
+
+use wacore::messages::MessageUtils;
+
+/// A payload this build cannot decode, but which unpads cleanly.
+///
+/// Field 1 of `Message` is `conversation`, a string. Declaring it as a varint
+/// makes the decode fail on a wire-type mismatch — the shape a protobuf change
+/// takes — while the bytes stay perfectly good.
+fn undecodable_payload() -> Vec<u8> {
+    MessageUtils::pad_message_v2(vec![0x08, 0x01])
+}
+
+#[tokio::test]
+async fn decrypted_payloads_are_not_forwarded_without_a_lease() {
+    use wacore::types::events::{ChannelEventHandler, EventInterest, EventKind};
+    let client = create_test_client_for_retry_with_id("dp-off").await;
+    let (handler, events) = ChannelEventHandler::new();
+    client
+        .subscribe(EventInterest::of(&[EventKind::DecryptedPayload]), handler)
+        .detach();
+
+    let info = Arc::new(create_test_message_info(
+        "5510000@s.whatsapp.net",
+        "DP-1",
+        "5510000@s.whatsapp.net",
+    ));
+    let padded = MessageUtils::encode_and_pad(&wa::Message {
+        conversation: Some("hello".to_string()),
+        ..Default::default()
+    });
+    client
+        .handle_decrypted_plaintext("msg", padded, 2, 0, &info)
+        .await
+        .expect("decodes");
+
+    assert!(
+        events.try_recv().is_err(),
+        "nothing is emitted while no lease is held"
+    );
+}
+
+#[tokio::test]
+async fn a_lease_forwards_the_payload_before_it_is_decoded() {
+    use wacore::types::events::{ChannelEventHandler, Event, EventInterest, EventKind};
+    let client = create_test_client_for_retry_with_id("dp-on").await;
+    let (handler, events) = ChannelEventHandler::new();
+    client
+        .subscribe(EventInterest::of(&[EventKind::DecryptedPayload]), handler)
+        .detach();
+    let _lease = client.acquire_decrypted_payload_forwarding();
+
+    let message = wa::Message {
+        conversation: Some("hello".to_string()),
+        ..Default::default()
+    };
+    let unpadded = waproto::codec::message_to_vec(&message);
+    let info = Arc::new(create_test_message_info(
+        "5510000@s.whatsapp.net",
+        "DP-2",
+        "5510000@s.whatsapp.net",
+    ));
+
+    client
+        .handle_decrypted_plaintext("msg", MessageUtils::encode_and_pad(&message), 2, 3, &info)
+        .await
+        .expect("decodes");
+
+    let event = events.try_recv().expect("the payload was forwarded");
+    let Event::DecryptedPayload(payload) = &*event else {
+        panic!("expected a DecryptedPayload");
+    };
+    assert_eq!(
+        payload.payload.as_ref(),
+        unpadded.as_slice(),
+        "the bytes are the unpadded plaintext, exactly as decoding receives them"
+    );
+    assert_eq!(payload.enc_type, "msg");
+    assert_eq!(payload.enc_index, 3, "which <enc> produced it");
+    assert_eq!(payload.info.id, info.id);
+}
+
+#[tokio::test]
+async fn a_payload_that_fails_to_decode_is_still_forwarded() {
+    // The reason this event exists. A payload the client cannot decode is
+    // logged and dropped, and the ratchet has already advanced — so the same
+    // ciphertext will never decrypt again and those bytes are gone for good.
+    use wacore::types::events::{ChannelEventHandler, Event, EventInterest, EventKind};
+    let client = create_test_client_for_retry_with_id("dp-undecodable").await;
+    let (handler, events) = ChannelEventHandler::new();
+    client
+        .subscribe(EventInterest::of(&[EventKind::DecryptedPayload]), handler)
+        .detach();
+    let _lease = client.acquire_decrypted_payload_forwarding();
+
+    let info = Arc::new(create_test_message_info(
+        "5510000@s.whatsapp.net",
+        "DP-3",
+        "5510000@s.whatsapp.net",
+    ));
+    let outcome = client
+        .handle_decrypted_plaintext("msg", undecodable_payload(), 2, 0, &info)
+        .await;
+
+    assert!(outcome.is_err(), "the fixture must actually fail to decode");
+    let event = events.try_recv().expect("forwarded despite the failure");
+    let Event::DecryptedPayload(payload) = &*event else {
+        panic!("expected a DecryptedPayload");
+    };
+    assert_eq!(payload.payload.as_ref(), &[0x08, 0x01]);
+}
+
+#[tokio::test]
+async fn forwarding_stops_when_the_last_lease_drops() {
+    use wacore::types::events::{ChannelEventHandler, EventInterest, EventKind};
+    let client = create_test_client_for_retry_with_id("dp-lease").await;
+    let (handler, events) = ChannelEventHandler::new();
+    client
+        .subscribe(EventInterest::of(&[EventKind::DecryptedPayload]), handler)
+        .detach();
+
+    let info = Arc::new(create_test_message_info(
+        "5510000@s.whatsapp.net",
+        "DP-4",
+        "5510000@s.whatsapp.net",
+    ));
+    let payload = || {
+        MessageUtils::encode_and_pad(&wa::Message {
+            conversation: Some("x".to_string()),
+            ..Default::default()
+        })
+    };
+
+    let first = client.acquire_decrypted_payload_forwarding();
+    let second = client.acquire_decrypted_payload_forwarding();
+    client
+        .handle_decrypted_plaintext("msg", payload(), 2, 0, &info)
+        .await
+        .expect("decodes");
+    assert!(events.try_recv().is_ok());
+
+    // One lease left: still on.
+    drop(first);
+    client
+        .handle_decrypted_plaintext("msg", payload(), 2, 0, &info)
+        .await
+        .expect("decodes");
+    assert!(events.try_recv().is_ok(), "one lease still holds it open");
+
+    drop(second);
+    client
+        .handle_decrypted_plaintext("msg", payload(), 2, 0, &info)
+        .await
+        .expect("decodes");
+    assert!(
+        events.try_recv().is_err(),
+        "the last lease dropping turns it back off"
     );
 }

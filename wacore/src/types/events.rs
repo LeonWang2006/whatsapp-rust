@@ -275,6 +275,7 @@ pub enum EventKind {
     PairingQrCodesExhausted,
     PairingCodeError,
     AppStateSyncFailed,
+    DecryptedPayload,
     // When adding a variant, mind the 128-kind ceiling below (EventInterest packs
     // each discriminant as a bit in a u128) and keep the guard pointing at the
     // last variant.
@@ -288,7 +289,7 @@ impl EventKind {
 
 // Build-time tripwire: a new variant that would overflow EventInterest's bitmask
 // fails compilation instead of silently corrupting the mask at runtime.
-const _: () = assert!((EventKind::AppStateSyncFailed as u8) < EventKind::CAPACITY);
+const _: () = assert!((EventKind::DecryptedPayload as u8) < EventKind::CAPACITY);
 
 /// A set of [`EventKind`]s a handler wants delivered. Producers can query the
 /// aggregate interest before building expensive payloads, and dispatch avoids
@@ -981,6 +982,16 @@ pub enum Event {
     /// beside its relatives would renumber every variant after it and change how
     /// already-stored events decode.
     AppStateSyncFailed(AppStateSyncFailed),
+
+    /// One decrypted `<enc>` payload, emitted before it is decoded.
+    ///
+    /// Library extension — no WA Web equivalent. Gated by
+    /// `Client::acquire_decrypted_payload_forwarding()` so nothing is cloned
+    /// while unused.
+    ///
+    /// Last, like every new variant: a binary `Serialize` format writes the
+    /// variant index, so inserting in the middle renumbers everything after it.
+    DecryptedPayload(DecryptedPayload),
 }
 
 /// Payload for [`Event::PairPasskeyRequest`].
@@ -1083,6 +1094,7 @@ impl Event {
             Event::DisappearingModeChanged(_) => EventKind::DisappearingModeChanged,
             Event::NewsletterLiveUpdate(_) => EventKind::NewsletterLiveUpdate,
             Event::RawNode(_) => EventKind::RawNode,
+            Event::DecryptedPayload(_) => EventKind::DecryptedPayload,
             Event::MexNotification(_) => EventKind::MexNotification,
             Event::PairPasskeyRequest(_) => EventKind::PairPasskeyRequest,
             Event::PairPasskeyConfirmation(_) => EventKind::PairPasskeyConfirmation,
@@ -1627,6 +1639,53 @@ impl UnavailableType {
     pub fn is_unrecoverable_fanout(&self) -> bool {
         matches!(self, Self::ViewOnce | Self::Hosted | Self::Bot)
     }
+}
+
+/// Payload of [`Event::DecryptedPayload`]: what Signal produced for one
+/// `<enc>`, before this build tried to make sense of it.
+///
+/// The client decodes a plaintext into [`wa::Message`] and dispatches that. A
+/// payload it cannot decode — a field this build predates, a message type it
+/// does not model — is logged and dropped, and with it goes something that cost
+/// a real decryption and advanced the ratchet. Nothing can ask for it back:
+/// the ratchet has moved on, so the same ciphertext will never decrypt again.
+///
+/// This event is that payload, handed over before decoding is attempted. It
+/// arrives whether or not the decode goes on to succeed.
+///
+/// Reasons to want it: recording traffic for faithful replay (re-encoding a
+/// decoded `Message` does not reproduce the original bytes), decoding with a
+/// newer protobuf than this build carries, and looking at a payload that failed
+/// to decode instead of only reading that it did.
+///
+/// Gated by `Client::acquire_decrypted_payload_forwarding()`: nothing is
+/// emitted, and nothing is cloned, while no consumer holds a lease.
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct DecryptedPayload {
+    /// Which message this came from.
+    pub info: Arc<MessageInfo>,
+    /// Which `<enc>` of the stanza produced these bytes, counting from zero in
+    /// the order the client enumerates them.
+    ///
+    /// That order is the stanza's direct `<enc>` children first, then the ones
+    /// under `<participants><to>` addressed to this device — the fan-out shape,
+    /// where a single stanza carries a copy per device and only ours is ours to
+    /// decrypt. It is *not* a child index: a consumer resolving this back to a
+    /// node has to walk the same two groups in the same order.
+    pub enc_index: usize,
+    /// The `type` attribute the `<enc>` carried: `msg`, `pkmsg`, `skmsg`, …
+    pub enc_type: &'static str,
+    /// The plaintext, unpadded, exactly as decoding will receive it.
+    ///
+    /// A `Bytes`, so forwarding it costs a refcount bump rather than a copy.
+    ///
+    /// **Not serialized.** `Serialize` on an event is for diagnostics, and no
+    /// text format carries raw bytes without an encoding choice this type has
+    /// no business making. A consumer recording payloads has the `Bytes` in
+    /// hand and can frame them however its sink expects.
+    #[serde(skip)]
+    pub payload: Bytes,
 }
 
 #[derive(Debug, Clone, Serialize, bon::Builder)]
