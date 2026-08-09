@@ -1,4 +1,5 @@
 use crate::client::Client;
+use crate::types::events::EncDecryptFailureReason;
 use crate::types::events::Event;
 use crate::types::message::MessageInfo;
 use log::{debug, warn};
@@ -154,8 +155,16 @@ enum MigrationDecryptResult {
     Decrypted,
     /// Server redelivered an already-processed message.
     Duplicate,
-    /// Migration didn't apply or still failed; caller sends a retry receipt.
-    NotDecrypted,
+    /// Migration didn't apply, or applied and the retry still failed; the
+    /// caller sends a retry receipt either way.
+    ///
+    /// `Some` carries the terminal cause when a migration actually ran and its
+    /// retry decrypt failed. Without it the caller would report the error that
+    /// sent it here — typically `NoSession` — for a message whose session was
+    /// in fact found and whose retry then failed a MAC or a store read.
+    /// `None` means nothing was migrated, so the caller's own error still is
+    /// the terminal one.
+    NotDecrypted(Option<EncDecryptFailureReason>),
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -259,6 +268,85 @@ fn decrypt_fail_log_level(mode: crate::types::events::DecryptFailMode) -> log::L
     match mode {
         crate::types::events::DecryptFailMode::Hide => log::Level::Debug,
         crate::types::events::DecryptFailMode::Show => log::Level::Warn,
+    }
+}
+
+/// Errors libsignal raises while turning bytes into a message of their declared
+/// type: too short to hold the signature, a version this build predates or does
+/// not know, or a body that is not the protobuf it claims. No key material is
+/// used to reach any of them.
+///
+/// Shared by the session and group arms so one libsignal error cannot be
+/// reported as a malformed envelope on one path and an unclassified failure on
+/// the other. `UnrecognizedMessageVersion` is deliberately absent: it is the
+/// *state* mismatch `group_decrypt` raises after parsing, not a parse failure —
+/// `UnrecognizedCiphertextVersion` is that one.
+fn is_malformed_envelope_error(e: &SignalProtocolError) -> bool {
+    matches!(
+        e,
+        SignalProtocolError::CiphertextMessageTooShort(_)
+            | SignalProtocolError::LegacyCiphertextVersion(_)
+            | SignalProtocolError::UnrecognizedCiphertextVersion(_)
+            | SignalProtocolError::InvalidProtobufEncoding
+    )
+}
+
+/// Cause reported for a libsignal error the decrypt arms do not name themselves.
+///
+/// Shared by the session catch-all and the group arm so the same error cannot be
+/// classified two ways. `BackendError` is local storage failing to answer — the
+/// store adapter wraps every backend error in it — and not the ciphertext
+/// failing: reporting it as a cryptographic error would blame the peer for our
+/// own disk, and corrupt any per-peer health signal built on this event.
+fn signal_error_reason(e: &SignalProtocolError) -> EncDecryptFailureReason {
+    if is_malformed_envelope_error(e) {
+        EncDecryptFailureReason::MalformedCiphertext
+    } else if matches!(e, SignalProtocolError::BackendError(_, _)) {
+        EncDecryptFailureReason::StorageFailure
+    } else if matches!(e, SignalProtocolError::KeyAgreementFailed(_)) {
+        // "the active crypto provider failed the key agreement" — our provider,
+        // not the sender's bytes, which were never judged.
+        EncDecryptFailureReason::LocalCryptoFailure
+    } else if e.is_stored_session_corruption() {
+        // A stored `SessionRecord` that decoded and then would not yield usable
+        // state. The predicate lives in libsignal because the distinction is
+        // drawn on `InvalidSessionStructure`'s message, and only the crate that
+        // writes those messages can keep the two in step.
+        EncDecryptFailureReason::StorageFailure
+    } else if matches!(e, SignalProtocolError::InvalidSenderKeySession) {
+        // A sender-key record that loaded but does not hold usable state: no
+        // chain key, a signing key that will not parse, or a chain whose derived
+        // key/IV the cipher rejects. Every site `group_decrypt` can reach it
+        // from is reading our stored record, which is why libsignal's own log
+        // there says the state is corrupt. The peer's copy is judged by
+        // `SignatureValidationFailed` and `InvalidMessage` instead.
+        EncDecryptFailureReason::StorageFailure
+    } else if matches!(e, SignalProtocolError::UnrecognizedMessageVersion(_)) {
+        // The group arm reaches this one through `group_decrypt_retry_reason`
+        // and calls it an invalid message. Naming it here too keeps a session
+        // `<enc>` and an `skmsg` from reporting the same rejection differently.
+        EncDecryptFailureReason::InvalidMessage
+    } else {
+        EncDecryptFailureReason::SignalError
+    }
+}
+
+/// Cause for a terminal error on the 1:1 session path, matching what the arms
+/// of `process_session_enc_batch` report for the same libsignal errors.
+///
+/// Used where an error reaches a reporting site that has no arm of its own —
+/// the PN→LID migration's retry decrypt — so a migrated session that then fails
+/// a MAC is not reported under the error that opened the migration.
+fn session_error_reason(e: &SignalProtocolError) -> EncDecryptFailureReason {
+    match e {
+        SignalProtocolError::SessionNotFound(_) => EncDecryptFailureReason::NoSession,
+        SignalProtocolError::BadMac(_) => EncDecryptFailureReason::BadMac,
+        SignalProtocolError::InvalidMessage(_, _) => EncDecryptFailureReason::InvalidMessage,
+        SignalProtocolError::InvalidPreKeyId | SignalProtocolError::InvalidSignedPreKeyId => {
+            EncDecryptFailureReason::UnknownPreKey
+        }
+        SignalProtocolError::UntrustedIdentity(_) => EncDecryptFailureReason::UntrustedIdentity,
+        other => signal_error_reason(other),
     }
 }
 

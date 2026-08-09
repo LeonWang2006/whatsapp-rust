@@ -266,6 +266,12 @@ impl Client {
                 Some(t) => t,
                 None => {
                     log::warn!("Enc node missing 'type' attribute, skipping");
+                    self.report_raw_enc_decrypt_failure(
+                        &info,
+                        enc_index,
+                        None,
+                        EncDecryptFailureReason::MalformedNode,
+                    );
                     had_unknown_enc = true;
                     continue;
                 }
@@ -303,6 +309,12 @@ impl Client {
             // Either way the stanza needs the fallback ack or the server replays.
             if EncType::from_wire(enc_type.as_ref()).is_none() {
                 log::warn!("Enc node has unknown type: {enc_type}");
+                self.report_raw_enc_decrypt_failure(
+                    &info,
+                    enc_index,
+                    Some(enc_type.as_ref()),
+                    EncDecryptFailureReason::UnsupportedEncType,
+                );
                 had_unknown_enc = true;
                 continue;
             }
@@ -311,6 +323,12 @@ impl Client {
                 Some(p) => p,
                 None => {
                     log::warn!("Enc node {enc_type} has no content");
+                    self.report_raw_enc_decrypt_failure(
+                        &info,
+                        enc_index,
+                        Some(enc_type.as_ref()),
+                        EncDecryptFailureReason::MalformedNode,
+                    );
                     had_unknown_enc = true;
                     continue;
                 }
@@ -428,6 +446,25 @@ impl Client {
                 "Connection torn down while awaiting the processing permit; leaving message {} for redelivery",
                 info.id
             );
+            // Every `<enc>` still queued here is abandoned without being tried.
+            // Reported before the bail, because classification already reported
+            // any node it set aside: staying silent would leave a stanza whose
+            // malformed `<enc>` was reported and whose decryptable siblings
+            // were not, which is the one shape this event promises not to
+            // produce. The stanza is unacked and will come back, and the event
+            // repeats with it.
+            for payload in session_payloads
+                .iter()
+                .chain(&group_payloads)
+                .chain(&bot_payloads)
+            {
+                self.report_enc_decrypt_failure(
+                    &info,
+                    payload.enc_index,
+                    payload.enc_type.as_wire_str(),
+                    EncDecryptFailureReason::NotAttempted,
+                );
+            }
             return;
         }
 
@@ -459,6 +496,14 @@ impl Client {
                     session_payload_count,
                     sender_encryption_jid.observe()
                 );
+                for payload in &session_payloads {
+                    self.report_enc_decrypt_failure(
+                        &info,
+                        payload.enc_index,
+                        payload.enc_type.as_wire_str(),
+                        EncDecryptFailureReason::NotAttempted,
+                    );
+                }
             }
             SessionBatchOutcome::default()
         };
@@ -508,6 +553,24 @@ impl Client {
                     }
                 }
             } else {
+                // Reported outside the duplicate guard below, unlike the log.
+                // The duplicate rule that keeps redelivery out of this event does
+                // not reach here: `should_process_skmsg_after_session` already
+                // returns true for a batch whose session `<enc>` were duplicates
+                // and nothing else, so that stanza never takes this branch. What
+                // does take it with `session_had_duplicates` set is a batch that
+                // ALSO had a genuine failure — and that failure skipped this
+                // skmsg on the first delivery too, so it has produced no
+                // plaintext on any delivery and there is no earlier success for
+                // the redelivery to stand in for.
+                for payload in &group_payloads {
+                    self.report_enc_decrypt_failure(
+                        &info,
+                        payload.enc_index,
+                        payload.enc_type.as_wire_str(),
+                        EncDecryptFailureReason::NotAttempted,
+                    );
+                }
                 // Only show warning if session messages actually FAILED (not duplicates)
                 if !session_had_duplicates {
                     if info.is_expired_status() {
@@ -543,8 +606,12 @@ impl Client {
                     // tell the server we processed it, incrementing the offline counter.
                     // The transport <ack> is sufficient for acknowledgment.
                 }
-                // If session_had_duplicates is true, we silently skip (no warning, no event)
-                // because the message was already processed in a previous session
+                // If session_had_duplicates is true, we skip the warning and the
+                // UndecryptableMessage because the message was already processed
+                // in a previous session. The per-`<enc>` reports above are not
+                // skipped with them: they answer whether an index produced
+                // plaintext, and the skipped skmsg produced none on this
+                // delivery or the first.
             }
         } else if !session_decrypted_successfully
             && !session_had_duplicates
@@ -719,6 +786,12 @@ impl Client {
                     // |= so a later dedup'd return (false) can't clobber a true
                     // set by a prior iteration in this batch.
                     outcome.had_failure = true;
+                    self.report_enc_decrypt_failure(
+                        info,
+                        enc_index,
+                        enc_type_str,
+                        EncDecryptFailureReason::MalformedCiphertext,
+                    );
                     outcome.undecryptable |= self
                         .dispatch_undecryptable_event(
                             Arc::clone(info),
@@ -826,6 +899,12 @@ impl Client {
                                 wacore::types::jid::observe_protocol_address(address)
                             );
                             outcome.had_failure = true;
+                            self.report_enc_decrypt_failure(
+                                info,
+                                enc_index,
+                                enc_type,
+                                EncDecryptFailureReason::StorageFailure,
+                            );
                             continue;
                         }
                         // Flush immediately so the backend is updated BEFORE the retry decrypt below.
@@ -836,6 +915,12 @@ impl Client {
                                 wacore::types::jid::observe_protocol_address(address)
                             );
                             outcome.had_failure = true;
+                            self.report_enc_decrypt_failure(
+                                info,
+                                enc_index,
+                                enc_type,
+                                EncDecryptFailureReason::StorageFailure,
+                            );
                             continue;
                         }
                         log::info!(
@@ -933,7 +1018,7 @@ impl Client {
                                         MigrationDecryptResult::Duplicate => {
                                             outcome.duplicate = true;
                                         }
-                                        MigrationDecryptResult::NotDecrypted => {
+                                        MigrationDecryptResult::NotDecrypted(terminal) => {
                                             log::debug!(
                                                 "[msg:{}] InvalidPreKeyId after identity change for {}. \
                                                  Sending retry receipt with fresh keys.",
@@ -941,6 +1026,14 @@ impl Client {
                                                 address
                                             );
                                             outcome.had_failure = true;
+                                            self.report_enc_decrypt_failure(
+                                                info,
+                                                enc_index,
+                                                enc_type,
+                                                terminal.unwrap_or(
+                                                    EncDecryptFailureReason::UnknownPreKey,
+                                                ),
+                                            );
                                             outcome.undecryptable |= self
                                                 .handle_decrypt_failure(
                                                     info,
@@ -960,6 +1053,28 @@ impl Client {
                                     // Send retry receipt so the sender resends with a PreKeySignalMessage
                                     // to establish a new session with the new identity
                                     outcome.had_failure = true;
+                                    // The retry can fail for a reason that has
+                                    // nothing to do with the identity that sent
+                                    // it here — a MAC that would not verify, a
+                                    // store that would not answer, a signed
+                                    // pre-key we no longer hold. `session_error_reason`
+                                    // names those the way the sibling arms do.
+                                    // What it leaves unclassified keeps
+                                    // `UntrustedIdentity`, which on this path is
+                                    // the more specific of the two: the retry
+                                    // ran after the identity was cleared, and
+                                    // nothing else explains it failing.
+                                    self.report_enc_decrypt_failure(
+                                        info,
+                                        enc_index,
+                                        enc_type,
+                                        match session_error_reason(&retry_err) {
+                                            EncDecryptFailureReason::SignalError => {
+                                                EncDecryptFailureReason::UntrustedIdentity
+                                            }
+                                            reason => reason,
+                                        },
+                                    );
                                     outcome.undecryptable |= self
                                         .handle_decrypt_failure(
                                             info,
@@ -994,7 +1109,10 @@ impl Client {
                     }
                     // Try PN→LID session migration before sending retry receipt
                     if let SignalProtocolError::SessionNotFound(_) = e {
-                        match self
+                        // `Some` only when a migration ran and its retry decrypt
+                        // failed: then that failure is the terminal one, not the
+                        // error that opened the migration.
+                        let terminal = match self
                             .try_pn_to_lid_migration_decrypt(
                                 sender_encryption_jid,
                                 &signal_address,
@@ -1019,8 +1137,8 @@ impl Client {
                                 outcome.duplicate = true;
                                 continue;
                             }
-                            MigrationDecryptResult::NotDecrypted => {}
-                        }
+                            MigrationDecryptResult::NotDecrypted(reason) => reason,
+                        };
 
                         debug!(
                             "[msg:{}] No session found for {} message from {}. Sending retry receipt to request session establishment.",
@@ -1029,6 +1147,12 @@ impl Client {
                             info.source.sender.observe()
                         );
                         outcome.had_failure = true;
+                        self.report_enc_decrypt_failure(
+                            info,
+                            enc_index,
+                            enc_type,
+                            terminal.unwrap_or(EncDecryptFailureReason::NoSession),
+                        );
                         outcome.undecryptable |= self
                             .handle_decrypt_failure(info, RetryReason::NoSession, decrypt_fail_mode)
                             .await;
@@ -1039,7 +1163,10 @@ impl Client {
                     ) {
                         // whatsmeow migrates PN sessions before decrypt; a fresh
                         // LID record can otherwise shadow the sender's PN ratchet.
-                        match self
+                        // `Some` only when a migration ran and its retry decrypt
+                        // failed: then that failure is the terminal one, not the
+                        // error that opened the migration.
+                        let terminal = match self
                             .try_pn_to_lid_migration_decrypt(
                                 sender_encryption_jid,
                                 &signal_address,
@@ -1064,16 +1191,25 @@ impl Client {
                                 outcome.duplicate = true;
                                 continue;
                             }
-                            MigrationDecryptResult::NotDecrypted => {}
-                        }
+                            MigrationDecryptResult::NotDecrypted(reason) => reason,
+                        };
 
                         // WAWebMsgProcessingDecryptionHandler classifies both as
                         // SignalRetryable -> sendRetryReceipt only, with no delete.
-                        let (reason, label) = if matches!(e, SignalProtocolError::BadMac(_)) {
-                            (RetryReason::BadMac, "BadMac")
-                        } else {
-                            (RetryReason::InvalidMessage, "InvalidMessage")
-                        };
+                        let (reason, label, failure) =
+                            if matches!(e, SignalProtocolError::BadMac(_)) {
+                                (
+                                    RetryReason::BadMac,
+                                    "BadMac",
+                                    EncDecryptFailureReason::BadMac,
+                                )
+                            } else {
+                                (
+                                    RetryReason::InvalidMessage,
+                                    "InvalidMessage",
+                                    EncDecryptFailureReason::InvalidMessage,
+                                )
+                            };
                         log::log!(
                             decrypt_fail_log_level(decrypt_fail_mode),
                             "[msg:{}] Decryption failed for {} message from {} due to {label}. \
@@ -1084,6 +1220,12 @@ impl Client {
                         );
 
                         outcome.had_failure = true;
+                        self.report_enc_decrypt_failure(
+                            info,
+                            enc_index,
+                            enc_type,
+                            terminal.unwrap_or(failure),
+                        );
                         outcome.undecryptable |= self
                             .handle_decrypt_failure(info, reason, decrypt_fail_mode)
                             .await;
@@ -1093,7 +1235,10 @@ impl Client {
                         // session exists under a PN address (legacy migration).
                         // Migrating lets Signal use the existing ratchet state
                         // instead of looking up the consumed one-time prekey.
-                        match self
+                        // `Some` only when a migration ran and its retry decrypt
+                        // failed: then that failure is the terminal one, not the
+                        // error that opened the migration.
+                        let terminal = match self
                             .try_pn_to_lid_migration_decrypt(
                                 sender_encryption_jid,
                                 &signal_address,
@@ -1118,8 +1263,8 @@ impl Client {
                                 outcome.duplicate = true;
                                 continue;
                             }
-                            MigrationDecryptResult::NotDecrypted => {}
-                        }
+                            MigrationDecryptResult::NotDecrypted(reason) => reason,
+                        };
 
                         log::debug!(
                             "[msg:{}] Decryption failed for {} message from {} due to InvalidPreKeyId. \
@@ -1132,6 +1277,12 @@ impl Client {
 
                         // Send retry receipt with fresh prekeys
                         outcome.had_failure = true;
+                        self.report_enc_decrypt_failure(
+                            info,
+                            enc_index,
+                            enc_type,
+                            terminal.unwrap_or(EncDecryptFailureReason::UnknownPreKey),
+                        );
                         outcome.undecryptable |= self
                             .handle_decrypt_failure(
                                 info,
@@ -1153,6 +1304,12 @@ impl Client {
                         );
 
                         outcome.had_failure = true;
+                        self.report_enc_decrypt_failure(
+                            info,
+                            enc_index,
+                            enc_type,
+                            EncDecryptFailureReason::UnknownPreKey,
+                        );
                         outcome.undecryptable |= self
                             .handle_decrypt_failure(
                                 info,
@@ -1171,6 +1328,12 @@ impl Client {
                             e
                         );
                         outcome.had_failure = true;
+                        self.report_enc_decrypt_failure(
+                            info,
+                            enc_index,
+                            enc_type,
+                            signal_error_reason(&e),
+                        );
                         outcome.undecryptable |= self
                             .dispatch_undecryptable_event(
                                 Arc::clone(info),
@@ -1217,6 +1380,16 @@ impl Client {
                     );
                     outcome.plaintext_failed = true;
                     outcome.had_failure = true;
+                    // The one report that can follow a DecryptedPayload for the
+                    // same enc: the bytes existed, they just could not be made
+                    // into a message. Unpadding fails ahead of that event, so
+                    // there this is the only signal.
+                    self.report_enc_decrypt_failure(
+                        info,
+                        enc_index,
+                        enc_type,
+                        EncDecryptFailureReason::PlaintextUnusable,
+                    );
                     outcome.undecryptable |=
                         self.handle_plaintext_failure(info, decrypt_fail_mode).await;
                 }
@@ -1260,6 +1433,7 @@ impl Client {
             let ciphertext = &payload.ciphertext[..];
             let padding_version = payload.padding_version;
             let enc_index = payload.enc_index;
+            let enc_type = payload.enc_type.as_wire_str();
 
             log::debug!(
                 "Looking up sender key for group {} with sender address {} (from sender JID: {})",
@@ -1299,6 +1473,12 @@ impl Client {
                         .await
                     {
                         log::warn!("Failed processing group plaintext (batch): {e:?}");
+                        self.report_enc_decrypt_failure(
+                            info,
+                            enc_index,
+                            enc_type,
+                            EncDecryptFailureReason::PlaintextUnusable,
+                        );
                     }
                 }
                 Err(SignalProtocolError::DuplicatedMessage(iteration, counter)) => {
@@ -1318,6 +1498,14 @@ impl Client {
                     }
                 }
                 Err(SignalProtocolError::NoSenderKeyState(msg)) => {
+                    // Reported before the expired-status early return: the enc
+                    // failed either way, and only what happens next differs.
+                    self.report_enc_decrypt_failure(
+                        info,
+                        enc_index,
+                        enc_type,
+                        EncDecryptFailureReason::NoSenderKey,
+                    );
                     if info.is_expired_status() {
                         log::debug!(
                             "[msg:{}] Skipping retry for expired status from {}",
@@ -1349,6 +1537,23 @@ impl Client {
                         .await;
                 }
                 Err(e) => {
+                    // Envelope and storage failures are named by the shared
+                    // classifier; only what it leaves unnamed is refined by the
+                    // same predicate the retry decision uses, so the reported
+                    // cause and the recovery the client chose cannot disagree.
+                    self.report_enc_decrypt_failure(
+                        info,
+                        enc_index,
+                        enc_type,
+                        match signal_error_reason(&e) {
+                            EncDecryptFailureReason::SignalError
+                                if group_decrypt_retry_reason(&e).is_some() =>
+                            {
+                                EncDecryptFailureReason::InvalidMessage
+                            }
+                            reason => reason,
+                        },
+                    );
                     if info.is_expired_status() {
                         log::debug!(
                             "[msg:{}] Ignoring decrypt error for expired status from {}: {:?}",
@@ -1668,11 +1873,11 @@ impl Client {
         deferred: &mut Vec<DeferredPlaintext>,
     ) -> MigrationDecryptResult {
         if !parsed_message.is_available() || !sender_jid.is_lid() {
-            return MigrationDecryptResult::NotDecrypted;
+            return MigrationDecryptResult::NotDecrypted(None);
         }
 
         let Some(pn) = self.lid_pn_cache.get_phone_number(&sender_jid.user).await else {
-            return MigrationDecryptResult::NotDecrypted;
+            return MigrationDecryptResult::NotDecrypted(None);
         };
 
         // Release the address lock so the migration loop can acquire it for
@@ -1696,7 +1901,7 @@ impl Client {
                 info.id,
                 info.source.sender.observe()
             );
-            return MigrationDecryptResult::NotDecrypted;
+            return MigrationDecryptResult::NotDecrypted(None);
         }
 
         match decrypt_session_message(parsed_message, signal_address, adapter, rng).await {
@@ -1737,7 +1942,9 @@ impl Client {
                     "[msg:{}] Decryption still failed after PN→LID migration: {retry_err:?}",
                     info.id
                 );
-                MigrationDecryptResult::NotDecrypted
+                // A session was found and moved; whatever failed now is the
+                // terminal cause, not the error that opened the migration.
+                MigrationDecryptResult::NotDecrypted(Some(session_error_reason(&retry_err)))
             }
         }
     }

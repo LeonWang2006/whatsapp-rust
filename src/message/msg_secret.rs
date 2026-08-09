@@ -2,6 +2,29 @@
 
 use super::*;
 
+/// Map a bot-payload failure onto the cause reported for its `<enc>`.
+///
+/// The stage comes from [`BotMessageError::stage`] rather than from matching
+/// variants here, so a new variant upstream cannot quietly land in the wrong
+/// bucket. An envelope rejected on shape never reached the cipher, so calling
+/// it a MAC failure would make malformed wire data count as an authentication
+/// failure against the peer.
+///
+/// A `Secret` stage is `StorageFailure`, not `NoMessageSecret`: we found a row
+/// and it would not yield a key. `NoMessageSecret` is for the lookups that came
+/// back empty, which is the companion's state; a stored secret of the wrong
+/// length is ours.
+pub(super) fn msmsg_failure_reason(
+    error: &wacore::bot_message::BotMessageError,
+) -> EncDecryptFailureReason {
+    use wacore::bot_message::BotMessageFailure;
+    match error.stage() {
+        BotMessageFailure::Envelope => EncDecryptFailureReason::MalformedCiphertext,
+        BotMessageFailure::Secret => EncDecryptFailureReason::StorageFailure,
+        BotMessageFailure::Authentication => EncDecryptFailureReason::BadMac,
+    }
+}
+
 impl Client {
     /// Capture embedded `MessageContextInfo.message_secret` for add-on
     /// decrypts. Bot DMs keep the legacy LID key as a second entry.
@@ -485,6 +508,12 @@ impl Client {
                     "[msg:{}] failed to decode MessageSecretMessage: {e:?}",
                     info.id
                 );
+                self.report_enc_decrypt_failure(
+                    info,
+                    enc_index,
+                    enc_type,
+                    EncDecryptFailureReason::MalformedCiphertext,
+                );
                 self.spawn_nack(info, NackReason::ParsingError, None);
                 return;
             }
@@ -495,6 +524,12 @@ impl Client {
             log::warn!(
                 "[msg:{}] MessageSecretMessage missing enc_iv/enc_payload",
                 info.id
+            );
+            self.report_enc_decrypt_failure(
+                info,
+                enc_index,
+                enc_type,
+                EncDecryptFailureReason::MalformedCiphertext,
             );
             self.spawn_nack(info, NackReason::ParsingError, None);
             return;
@@ -507,6 +542,12 @@ impl Client {
             Some(j) => j,
             None => {
                 log::warn!("[msg:{}] msmsg: no target_sender resolvable", info.id);
+                self.report_enc_decrypt_failure(
+                    info,
+                    enc_index,
+                    enc_type,
+                    EncDecryptFailureReason::NoMessageSecret,
+                );
                 self.spawn_nack(info, NackReason::MissingMessageSecret, None);
                 return;
             }
@@ -533,6 +574,12 @@ impl Client {
                     "[msg:{}] msmsg: <meta> missing target_id; cannot look up secret",
                     info.id
                 );
+                self.report_enc_decrypt_failure(
+                    info,
+                    enc_index,
+                    enc_type,
+                    EncDecryptFailureReason::NoMessageSecret,
+                );
                 self.spawn_nack(info, NackReason::MissingMessageSecret, None);
                 return;
             }
@@ -547,6 +594,12 @@ impl Client {
         // Store lookup: primary, then the LID/PN alternate. A backend error is
         // logged and treated as a miss (not a hard nack) so the resolver still
         // gets a chance — mirrors the secret-encrypted edit path.
+        //
+        // Treated as a miss for control flow, but not for reporting: "the store
+        // would not answer" is ours and "no secret here" is the companion's,
+        // and by the time the cause is named nothing else remembers which of
+        // the two emptied the lookup.
+        let mut lookup_failed = false;
         let buffered = self
             .msg_secret_buffer
             .lookup(&chat_for_lookup, &target_sender_str, target_id)
@@ -570,6 +623,7 @@ impl Client {
                     Ok(found) => found,
                     Err(e) => {
                         log::warn!("[msg:{}] msmsg: alternate lookup failed: {e:?}", info.id);
+                        lookup_failed = true;
                         None
                     }
                 },
@@ -578,6 +632,7 @@ impl Client {
                         "[msg:{}] backend error reading message_secret: {e:?}",
                         info.id
                     );
+                    lookup_failed = true;
                     None
                 }
             },
@@ -585,12 +640,26 @@ impl Client {
         let secret = match store_secret {
             Some(s) => s,
             None => {
-                let alternate = self
+                let alternate = match self
                     .alternate_msg_secret_jid(&backend, &target_sender)
                     .await
-                    .ok()
-                    .flatten()
-                    .map(|j| j.to_non_ad_string());
+                {
+                    Ok(jid) => jid.map(|j| j.to_non_ad_string()),
+                    Err(e) => {
+                        // The resolver still gets its chance without the
+                        // alternate identity, so this stays a miss for control
+                        // flow. But it is a store that would not answer, and the
+                        // reported cause has to say so: without this the resolver
+                        // returning `None` would be named `NoMessageSecret`,
+                        // blaming the companion for our own mapping table.
+                        log::warn!(
+                            "[msg:{}] msmsg: alternate jid lookup failed: {e:?}",
+                            info.id
+                        );
+                        lookup_failed = true;
+                        None
+                    }
+                };
                 match self
                     .resolve_msg_secret_via_app(
                         &chat_for_lookup,
@@ -618,6 +687,16 @@ impl Client {
                             },
                             "[msg:{}] msmsg: no message_secret stored for target_id={target_id} (primary or alternate)",
                             info.id
+                        );
+                        self.report_enc_decrypt_failure(
+                            info,
+                            enc_index,
+                            enc_type,
+                            if lookup_failed {
+                                EncDecryptFailureReason::StorageFailure
+                            } else {
+                                EncDecryptFailureReason::NoMessageSecret
+                            },
                         );
                         self.spawn_nack(info, NackReason::MissingMessageSecret, None);
                         return;
@@ -681,6 +760,15 @@ impl Client {
                             "[msg:{}] msmsg AES-GCM open failed both attempts (primary={primary_err:?}, fallback={fallback_err:?})",
                             info.id
                         );
+                        // Both attempts see the same iv/payload, so a shape
+                        // rejection is identical on either and the primary
+                        // error decides.
+                        self.report_enc_decrypt_failure(
+                            info,
+                            enc_index,
+                            enc_type,
+                            msmsg_failure_reason(&primary_err),
+                        );
                         self.spawn_nack(info, NackReason::MissingMessageSecret, None);
                         return;
                     }
@@ -689,6 +777,12 @@ impl Client {
                     log::warn!(
                         "[msg:{}] msmsg AES-GCM open failed and no fallback msg_id: {primary_err:?}",
                         info.id
+                    );
+                    self.report_enc_decrypt_failure(
+                        info,
+                        enc_index,
+                        enc_type,
+                        msmsg_failure_reason(&primary_err),
                     );
                     self.spawn_nack(info, NackReason::MissingMessageSecret, None);
                     return;
@@ -718,6 +812,12 @@ impl Client {
                 log::warn!(
                     "[msg:{}] msmsg plaintext is not a Message proto: {e:?}",
                     info.id
+                );
+                self.report_enc_decrypt_failure(
+                    info,
+                    enc_index,
+                    enc_type,
+                    EncDecryptFailureReason::PlaintextUnusable,
                 );
                 self.spawn_nack(info, NackReason::ParsingError, None);
                 return;

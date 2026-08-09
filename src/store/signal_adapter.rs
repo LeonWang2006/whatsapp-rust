@@ -23,6 +23,18 @@ where
     move |e| SignalProtocolError::BackendError(context, e.into())
 }
 
+/// A row we stored that no longer converts back into a record.
+///
+/// Rebranded as a backend error rather than propagated as-is: the conversion
+/// reports `InvalidProtobufEncoding`, the same variant a peer's malformed
+/// envelope produces, and by the time it reaches the receive path nothing can
+/// tell the two apart. Only this boundary knows the bytes were ours, and
+/// calling it a malformed ciphertext would blame the peer for our own corrupt
+/// row. The receiving arm is unchanged either way — both land in its catch-all.
+fn record_read_err(e: SignalProtocolError) -> SignalProtocolError {
+    SignalProtocolError::BackendError("stored record", Box::new(e))
+}
+
 /// Boxed future with the exact shape `#[async_trait]` expects, so the hot
 /// methods below can be hand-desugared: a cache hit completes synchronously
 /// and boxes only a tiny `Ready` instead of the full async state machine.
@@ -378,13 +390,19 @@ impl IdentityKeyStore for IdentityAdapter {
 
 /// Decode the cache's raw 32-byte DJB public key bytes; empty/absent = no
 /// identity (mirrors the previous inline match in `get_identity`).
+///
+/// Every caller feeds this bytes we stored, so a decode failure is a corrupt
+/// row of ours — `record_read_err` says so rather than letting `BadKeyLength`
+/// reach the receive path, where it is indistinguishable from a peer sending a
+/// bad key and would be reported against them.
 fn parse_cached_identity(
     data: Option<Arc<[u8]>>,
 ) -> Result<Option<IdentityKey>, SignalProtocolError> {
     match data {
         Some(data) if !data.is_empty() => {
             let public_key =
-                wacore::libsignal::protocol::PublicKey::from_djb_public_key_bytes(&data)?;
+                wacore::libsignal::protocol::PublicKey::from_djb_public_key_bytes(&data)
+                    .map_err(|e| record_read_err(e.into()))?;
             Ok(Some(IdentityKey::new(public_key)))
         }
         _ => Ok(None),
@@ -400,7 +418,9 @@ impl PreKeyStore for PreKeyAdapter {
             .await
             .map_err(signal_err("backend"))?
             .ok_or(SignalProtocolError::InvalidPreKeyId)
-            .and_then(wacore_record::prekey_structure_to_record)
+            .and_then(|structure| {
+                wacore_record::prekey_structure_to_record(structure).map_err(record_read_err)
+            })
     }
     async fn save_pre_key(
         &mut self,
@@ -484,7 +504,9 @@ impl SignedPreKeyStore for SignedPreKeyAdapter {
                 );
                 SignalProtocolError::InvalidSignedPreKeyId
             })
-            .and_then(wacore_record::signed_prekey_structure_to_record)
+            .and_then(|structure| {
+                wacore_record::signed_prekey_structure_to_record(structure).map_err(record_read_err)
+            })
     }
     async fn save_signed_pre_key(
         &mut self,

@@ -34,8 +34,8 @@ use waproto::whatsapp::Message;
 use crate::Client;
 use crate::client::interceptor::{Interception, InterceptorHandle, StanzaInterceptor};
 use crate::client::{
-    ClientLifecycle, ConnectionScope, ConnectionScopeState, DecryptedPayloadLease, RawNodeLease,
-    SentFrameLease,
+    ClientLifecycle, ConnectionScope, ConnectionScopeState, DecryptedPayloadLease,
+    EncDecryptFailedLease, RawNodeLease, SentFrameLease,
 };
 use crate::request::IqError;
 use crate::send::{SendError, SendResult};
@@ -494,6 +494,7 @@ struct GatedForwarding {
     raw_node: Option<RawNodeLease>,
     decrypted_payload: Option<DecryptedPayloadLease>,
     sent_frame: Option<SentFrameLease>,
+    enc_decrypt_failed: Option<EncDecryptFailedLease>,
 }
 
 impl GatedForwarding {
@@ -505,6 +506,7 @@ impl GatedForwarding {
         (interest.wants(EventKind::RawNode) && self.raw_node.is_none())
             || (interest.wants(EventKind::DecryptedPayload) && self.decrypted_payload.is_none())
             || (interest.wants(EventKind::SentFrame) && self.sent_frame.is_none())
+            || (interest.wants(EventKind::EncDecryptFailed) && self.enc_decrypt_failed.is_none())
     }
 
     /// Acquire what `interest` needs and this does not hold yet.
@@ -520,6 +522,9 @@ impl GatedForwarding {
             .then(|| client.acquire_decrypted_payload_forwarding()),
             sent_frame: (interest.wants(EventKind::SentFrame) && self.sent_frame.is_none())
                 .then(|| client.acquire_sent_frame_forwarding()),
+            enc_decrypt_failed: (interest.wants(EventKind::EncDecryptFailed)
+                && self.enc_decrypt_failed.is_none())
+            .then(|| client.acquire_enc_decrypt_failed_forwarding()),
         }
     }
 
@@ -528,6 +533,10 @@ impl GatedForwarding {
         self.raw_node = self.raw_node.take().or(acquired.raw_node);
         self.decrypted_payload = self.decrypted_payload.take().or(acquired.decrypted_payload);
         self.sent_frame = self.sent_frame.take().or(acquired.sent_frame);
+        self.enc_decrypt_failed = self
+            .enc_decrypt_failed
+            .take()
+            .or(acquired.enc_decrypt_failed);
     }
 
     /// Give up what `interest` no longer asks for.
@@ -545,6 +554,9 @@ impl GatedForwarding {
                 .flatten(),
             sent_frame: (!interest.wants(EventKind::SentFrame))
                 .then(|| self.sent_frame.take())
+                .flatten(),
+            enc_decrypt_failed: (!interest.wants(EventKind::EncDecryptFailed))
+                .then(|| self.enc_decrypt_failed.take())
                 .flatten(),
         }
     }
@@ -6004,6 +6016,10 @@ mod tests {
             !client.raw_node_forwarding_enabled(),
             "the kind that is no longer wanted releases its own lease"
         );
+        assert!(
+            !client.enc_decrypt_failed_forwarding_enabled(),
+            "the success half of a decrypt must not turn on the failure half"
+        );
 
         // All at once, then each removed on its own.
         assert!(
@@ -6012,12 +6028,14 @@ mod tests {
                     EventKind::RawNode,
                     EventKind::DecryptedPayload,
                     EventKind::SentFrame,
+                    EventKind::EncDecryptFailed,
                 ]))
                 .expect("interest update")
         );
         assert!(client.raw_node_forwarding_enabled());
         assert!(client.decrypted_payload_forwarding_enabled());
         assert!(client.sent_frame_forwarding_enabled());
+        assert!(client.enc_decrypt_failed_forwarding_enabled());
 
         assert!(
             subscription
@@ -6027,6 +6045,7 @@ mod tests {
         assert!(client.raw_node_forwarding_enabled(), "kept");
         assert!(!client.decrypted_payload_forwarding_enabled(), "released");
         assert!(!client.sent_frame_forwarding_enabled(), "released");
+        assert!(!client.enc_decrypt_failed_forwarding_enabled(), "released");
 
         assert!(
             subscription
@@ -6036,10 +6055,23 @@ mod tests {
         assert!(client.sent_frame_forwarding_enabled());
         assert!(!client.raw_node_forwarding_enabled(), "released");
 
+        assert!(
+            subscription
+                .update_interest(EventInterest::of(&[EventKind::EncDecryptFailed]))
+                .expect("interest update")
+        );
+        assert!(client.enc_decrypt_failed_forwarding_enabled());
+        assert!(!client.sent_frame_forwarding_enabled(), "released");
+        assert!(
+            !client.decrypted_payload_forwarding_enabled(),
+            "and the failure half must not drag the success half back in"
+        );
+
         assert!(subscription.unsubscribe());
         assert!(!client.raw_node_forwarding_enabled());
         assert!(!client.decrypted_payload_forwarding_enabled());
         assert!(!client.sent_frame_forwarding_enabled());
+        assert!(!client.enc_decrypt_failed_forwarding_enabled());
     }
 
     #[tokio::test]

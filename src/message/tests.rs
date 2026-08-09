@@ -13273,3 +13273,1366 @@ async fn forwarding_stops_when_the_last_lease_drops() {
         "the last lease dropping turns it back off"
     );
 }
+
+// --- per-`<enc>` decrypt-failure reporting ----------------------------------
+
+use crate::message::msg_secret::msmsg_failure_reason;
+use wacore::types::events::{EncDecryptFailed, EncDecryptFailureReason};
+
+/// Every `EncDecryptFailed` a client emitted, in dispatch order, plus the
+/// `enc_index` of every `DecryptedPayload` so a test can assert that the two
+/// events number one stanza and not two.
+#[derive(Default)]
+struct EncOutcomeRecorder {
+    failures: std::sync::Mutex<Vec<EncDecryptFailed>>,
+    decrypted: std::sync::Mutex<Vec<(usize, &'static str)>>,
+}
+
+impl EventHandler for EncOutcomeRecorder {
+    fn handle_event(&self, event: Arc<Event>) {
+        match &*event {
+            Event::EncDecryptFailed(failed) => {
+                self.failures.lock().unwrap().push(failed.clone());
+            }
+            Event::DecryptedPayload(payload) => self
+                .decrypted
+                .lock()
+                .unwrap()
+                .push((payload.enc_index, payload.enc_type)),
+            _ => {}
+        }
+    }
+}
+
+impl EncOutcomeRecorder {
+    /// `(enc_index, enc_type, reason)` for each failure, in dispatch order.
+    fn failures(&self) -> Vec<(usize, Option<String>, EncDecryptFailureReason)> {
+        self.failures
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|f| {
+                (
+                    f.enc_index,
+                    f.enc_type.as_ref().map(|t| t.to_string()),
+                    f.reason,
+                )
+            })
+            .collect()
+    }
+
+    fn decrypted(&self) -> Vec<(usize, &'static str)> {
+        self.decrypted.lock().unwrap().clone()
+    }
+}
+
+/// Subscribe a recorder and hold both forwarding leases, so one test can watch
+/// a stanza's successes and failures together.
+fn watch_enc_outcomes(
+    client: &Arc<Client>,
+) -> (
+    Arc<EncOutcomeRecorder>,
+    (
+        crate::client::EncDecryptFailedLease,
+        crate::client::DecryptedPayloadLease,
+    ),
+) {
+    let recorder = Arc::new(EncOutcomeRecorder::default());
+    client.subscribe_handler(recorder.clone()).detach();
+    (
+        recorder,
+        (
+            client.acquire_enc_decrypt_failed_forwarding(),
+            client.acquire_decrypted_payload_forwarding(),
+        ),
+    )
+}
+
+fn enc_payload_at(enc_type: &str, bytes: Vec<u8>, enc_index: usize) -> EncPayload {
+    let enc = NodeBuilder::new("enc")
+        .attr("type", enc_type)
+        .bytes(bytes)
+        .build();
+    EncPayload::from_node_ref(&enc.as_node_ref(), enc_index).expect("payload")
+}
+
+fn dm_info(msg_id: &str, sender: &Jid) -> Arc<MessageInfo> {
+    Arc::new(MessageInfo {
+        id: msg_id.to_string(),
+        source: crate::types::message::MessageSource {
+            sender: sender.clone(),
+            chat: sender.clone(),
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+}
+
+/// Bytes that parse as neither a `SignalMessage` nor a `PreKeySignalMessage`:
+/// too short to hold a MAC, so the envelope is rejected before any key
+/// material is touched.
+const UNPARSEABLE_ENVELOPE: [u8; 3] = [0x33, 0x01, 0x02];
+
+async fn classified(client: &Arc<Client>, node: wacore_binary::Node) -> Option<ClassifiedMessage> {
+    client.classify_incoming_message(&node_to_arc(node)).await
+}
+
+/// The three ways an `<enc>` dies before any decryption: no `type`, a `type`
+/// this build does not implement, and a body that is not there. All three are
+/// reported, each against the position it occupied in the stanza, and all three
+/// say the client never reached a decryption attempt.
+#[tokio::test]
+async fn classification_reports_every_enc_it_sets_aside() {
+    let (client, _transport) = capturing_client("enc_fail_classify").await;
+    let (recorder, _leases) = watch_enc_outcomes(&client);
+
+    let node = NodeBuilder::new("message")
+        .attr("from", "5511777776666@s.whatsapp.net")
+        .attr("id", "ENCFAIL_CLASSIFY")
+        .attr("type", "text")
+        .children([
+            // 0: no `type` at all.
+            NodeBuilder::new("enc").bytes(vec![1u8; 8]).build(),
+            // 1: a type this build has no path for.
+            NodeBuilder::new("enc")
+                .attr("type", "frskmsg")
+                .bytes(vec![2u8; 8])
+                .build(),
+            // 2: a known type with nothing to decrypt.
+            NodeBuilder::new("enc").attr("type", "msg").build(),
+            // 3: usable, so classification does not bail before reporting.
+            NodeBuilder::new("enc")
+                .attr("type", "pkmsg")
+                .bytes(vec![4u8; 8])
+                .build(),
+        ])
+        .build();
+
+    let result = classified(&client, node).await.expect("one usable payload");
+    assert_eq!(
+        result
+            .session_payloads
+            .iter()
+            .map(|p| p.enc_index)
+            .collect::<Vec<_>>(),
+        [3],
+        "the usable enc keeps its stanza position",
+    );
+
+    assert_eq!(
+        recorder.failures(),
+        vec![
+            (0, None, EncDecryptFailureReason::MalformedNode),
+            (
+                1,
+                Some("frskmsg".to_string()),
+                EncDecryptFailureReason::UnsupportedEncType
+            ),
+            (
+                2,
+                Some("msg".to_string()),
+                EncDecryptFailureReason::MalformedNode
+            ),
+        ],
+    );
+    assert!(
+        recorder
+            .failures
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|f| !f.reason.decryption_was_attempted()),
+        "none of these reached a decryption; that is what separates them from a failed one",
+    );
+}
+
+/// A stanza whose every `<enc>` is unusable is transport-acked and classified
+/// away — and must still report each one. This is the path where nothing
+/// downstream ever sees the stanza again.
+#[tokio::test]
+async fn an_all_unusable_stanza_still_reports_each_enc() {
+    let (client, transport) = capturing_client("enc_fail_all_unknown").await;
+    let (recorder, _leases) = watch_enc_outcomes(&client);
+
+    let node = NodeBuilder::new("message")
+        .attr("from", "5511777776666@s.whatsapp.net")
+        .attr("id", "ENCFAIL_ALL_UNKNOWN")
+        .attr("type", "text")
+        .children([
+            NodeBuilder::new("enc")
+                .attr("type", "frskmsg")
+                .bytes(vec![1u8; 8])
+                .build(),
+            NodeBuilder::new("enc")
+                .attr("type", "frskmsg")
+                .bytes(vec![2u8; 8])
+                .build(),
+        ])
+        .build();
+
+    assert!(
+        classified(&client, node).await.is_none(),
+        "nothing usable, so the stanza is acked away"
+    );
+    assert_eq!(
+        recorder
+            .failures()
+            .iter()
+            .map(|(index, _, reason)| (*index, *reason))
+            .collect::<Vec<_>>(),
+        [
+            (0, EncDecryptFailureReason::UnsupportedEncType),
+            (1, EncDecryptFailureReason::UnsupportedEncType),
+        ],
+    );
+
+    // The ack is what makes this the terminal path: without it the server
+    // replays the stanza forever, and the two reports above would repeat with
+    // it. Assert the ack the doc claims, and that reporting did not also add a
+    // nack for a stanza the client chose to drop quietly.
+    crate::test_utils::poll_until("the unusable stanza to be transport-acked", || {
+        find_message_ack_for(&transport.sent(), "ENCFAIL_ALL_UNKNOWN").is_some()
+    })
+    .await;
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+    let frames = transport.sent();
+    assert_eq!(
+        message_acks_for(&frames, "ENCFAIL_ALL_UNKNOWN"),
+        1,
+        "exactly one transport ack",
+    );
+    assert_eq!(
+        find_message_nack_error(&frames, "ENCFAIL_ALL_UNKNOWN"),
+        None,
+        "observing the failures must not turn the drop into a nack",
+    );
+}
+
+/// An envelope that does not parse never reaches a cipher, and is reported as
+/// such — distinct from the ciphertext that parses and then fails.
+#[tokio::test]
+async fn a_session_envelope_that_does_not_parse_reports_malformed_ciphertext() {
+    let client = create_test_client_for_retry_with_id("enc_fail_envelope").await;
+    let (recorder, _leases) = watch_enc_outcomes(&client);
+
+    let sender: Jid = "5511900000001@s.whatsapp.net".parse().unwrap();
+    let info = dm_info("ENCFAIL_ENVELOPE", &sender);
+    client
+        .clone()
+        .process_session_enc_batch(
+            vec![enc_payload_at("msg", UNPARSEABLE_ENVELOPE.to_vec(), 4)],
+            &info,
+            &sender,
+            DecryptFailMode::Show,
+        )
+        .await;
+
+    assert_eq!(
+        recorder.failures(),
+        vec![(
+            4,
+            Some("msg".to_string()),
+            EncDecryptFailureReason::MalformedCiphertext
+        )],
+    );
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+}
+
+/// The common DM failure: a well-formed `SignalMessage` for a session this
+/// device has never had.
+#[tokio::test]
+async fn a_session_enc_with_no_session_reports_no_session() {
+    use wacore::libsignal::protocol::{IdentityKeyPair, KeyPair, SignalMessage};
+    let client = create_test_client_for_retry_with_id("enc_fail_nosession").await;
+    let (recorder, _leases) = watch_enc_outcomes(&client);
+
+    let sender: Jid = "5511900000002@s.whatsapp.net".parse().unwrap();
+    let info = dm_info("ENCFAIL_NOSESSION", &sender);
+    let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+    let signal_message = SignalMessage::new(
+        4,
+        &[0u8; 32],
+        KeyPair::generate(&mut rng).public_key,
+        0,
+        0,
+        b"test",
+        IdentityKeyPair::generate(&mut rng).identity_key(),
+        IdentityKeyPair::generate(&mut rng).identity_key(),
+    )
+    .expect("valid inputs");
+
+    client
+        .clone()
+        .process_session_enc_batch(
+            vec![enc_payload_at(
+                "msg",
+                signal_message.serialized().to_vec(),
+                2,
+            )],
+            &info,
+            &sender,
+            DecryptFailMode::Show,
+        )
+        .await;
+
+    assert_eq!(
+        recorder.failures(),
+        vec![(
+            2,
+            Some("msg".to_string()),
+            EncDecryptFailureReason::NoSession
+        )],
+    );
+    assert!(
+        recorder.failures.lock().unwrap()[0]
+            .reason
+            .decryption_was_attempted(),
+        "the client did run a decrypt for this one",
+    );
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+}
+
+/// A tampered MAC on a real session: parses, then fails to authenticate.
+#[tokio::test]
+async fn a_tampered_session_enc_reports_bad_mac() {
+    let client = crate::test_utils::create_test_client_with_name("enc_fail_badmac").await;
+    let (recorder, _leases) = watch_enc_outcomes(&client);
+
+    let mut alice = AlicePeer::new("1111111111112@s.whatsapp.net").await;
+    let (bob_bundle, _) = bobs_prekey_bundle(&client).await;
+    let bob_addr = {
+        let snapshot = client.persistence_manager.get_device_snapshot();
+        snapshot
+            .lid
+            .as_ref()
+            .or(snapshot.pn.as_ref())
+            .expect("own jid")
+            .to_protocol_address()
+    };
+    alice.install_bob_session(&bob_addr, &bob_bundle).await;
+    let pkmsg = alice.encrypt_text(&bob_addr, "hello").await;
+    let (established, _, _, _) = submit_and_check_session(&client, &alice.jid, &pkmsg).await;
+    assert!(
+        established,
+        "the session must exist before we tamper with it"
+    );
+
+    if let Some(record) = alice.sessions.0.get_mut(&bob_addr)
+        && let Some(state) = record.session_state_mut()
+    {
+        state.clear_unacknowledged_pre_key_message();
+    }
+    let mut bytes = match alice.encrypt_text(&bob_addr, "world").await {
+        CiphertextMessage::SignalMessage(m) => m.serialized().to_vec(),
+        _ => panic!("expected a SignalMessage"),
+    };
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xFF;
+
+    let info = dm_info("ENCFAIL_BADMAC", &alice.jid);
+    client
+        .clone()
+        .process_session_enc_batch(
+            vec![enc_payload_at("msg", bytes, 1)],
+            &info,
+            &alice.jid,
+            DecryptFailMode::Show,
+        )
+        .await;
+
+    assert_eq!(
+        recorder.failures(),
+        vec![(1, Some("msg".to_string()), EncDecryptFailureReason::BadMac)],
+    );
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+}
+
+/// Signal decrypts, and the bytes are not a message this build can read. The
+/// one case where an `<enc>` gets both events: the payload was real, so
+/// `DecryptedPayload` carries it, and it was unusable, so this reports why.
+#[tokio::test]
+async fn a_plaintext_that_will_not_decode_reports_plaintext_unusable() {
+    let client = crate::test_utils::create_test_client_with_name("enc_fail_plaintext").await;
+    let (recorder, _leases) = watch_enc_outcomes(&client);
+
+    let mut alice = AlicePeer::new("1111111111113@s.whatsapp.net").await;
+    let (bob_bundle, _) = bobs_prekey_bundle(&client).await;
+    let bob_addr = {
+        let snapshot = client.persistence_manager.get_device_snapshot();
+        snapshot
+            .lid
+            .as_ref()
+            .or(snapshot.pn.as_ref())
+            .expect("own jid")
+            .to_protocol_address()
+    };
+    alice.install_bob_session(&bob_addr, &bob_bundle).await;
+    // Field 1 of `Message` is a string; a varint there fails the decode while
+    // the padding stays valid, so the plaintext exists and cannot be used.
+    let undecodable = MessageUtils::pad_message_v2(vec![0x08, 0x01]);
+    let ciphertext = alice.encrypt(&bob_addr, &undecodable).await;
+
+    let info = dm_info("ENCFAIL_PLAINTEXT", &alice.jid);
+    let outcome = client
+        .clone()
+        .process_session_enc_batch(
+            vec![enc_payload_at("pkmsg", ciphertext.serialize().to_vec(), 6)],
+            &info,
+            &alice.jid,
+            DecryptFailMode::Show,
+        )
+        .await;
+    assert!(outcome.decrypted, "Signal itself succeeded");
+
+    assert_eq!(
+        recorder.failures(),
+        vec![(
+            6,
+            Some("pkmsg".to_string()),
+            EncDecryptFailureReason::PlaintextUnusable
+        )],
+    );
+    assert_eq!(
+        recorder.decrypted(),
+        [(6, "pkmsg")],
+        "the same enc also produced bytes, and both events point at it",
+    );
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+}
+
+/// A group `<enc>` for a chain this device holds no sender key for.
+#[tokio::test]
+async fn a_group_enc_without_a_sender_key_reports_no_sender_key() {
+    let client = create_test_client_for_retry_with_id("enc_fail_nosk").await;
+    let (recorder, _leases) = watch_enc_outcomes(&client);
+
+    let group: Jid = "120363000000000002@g.us".parse().unwrap();
+    let participant: Jid = "5511900000003:1@s.whatsapp.net".parse().unwrap();
+    let info = Arc::new(MessageInfo {
+        id: "ENCFAIL_NOSK".to_string(),
+        source: crate::types::message::MessageSource {
+            sender: participant,
+            chat: group.clone(),
+            is_group: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+
+    // Version 3 + protobuf + a 64-byte signature: parses as a SenderKeyMessage,
+    // so the lookup for the chain is what fails.
+    let mut skmsg = vec![0x33, 0x08, 0x01, 0x10, 0x01, 0x1A, 0x00];
+    skmsg.extend(vec![0u8; 64]);
+
+    client
+        .clone()
+        .process_classified_message(
+            ClassifiedMessage {
+                info,
+                sender_encryption_jid: group,
+                session_payloads: vec![],
+                group_payloads: vec![enc_payload_at("skmsg", skmsg, 5)],
+                bot_payloads: vec![],
+                max_sender_retry_count: 0,
+                decrypt_fail_mode: DecryptFailMode::Show,
+            },
+            client.connection_generation.load(Ordering::Acquire),
+        )
+        .await;
+
+    assert_eq!(
+        recorder.failures(),
+        vec![(
+            5,
+            Some("skmsg".to_string()),
+            EncDecryptFailureReason::NoSenderKey
+        )],
+    );
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+}
+
+/// The skmsg the client deliberately does not try, because the session `<enc>`
+/// carrying its sender key failed first. Reported as recognized-not-attempted,
+/// which is what separates it from a decryption that was run and lost.
+#[tokio::test]
+async fn a_skmsg_skipped_after_a_session_failure_reports_not_attempted() {
+    let client = create_test_client_for_retry_with_id("enc_fail_skipped").await;
+    let (recorder, _leases) = watch_enc_outcomes(&client);
+
+    let group: Jid = "120363000000000003@g.us".parse().unwrap();
+    let participant: Jid = "5511900000004@s.whatsapp.net".parse().unwrap();
+    let info = Arc::new(MessageInfo {
+        id: "ENCFAIL_SKIPPED".to_string(),
+        source: crate::types::message::MessageSource {
+            sender: participant.clone(),
+            chat: group,
+            is_group: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+
+    client
+        .clone()
+        .process_classified_message(
+            ClassifiedMessage {
+                info,
+                sender_encryption_jid: participant,
+                session_payloads: vec![enc_payload_at("pkmsg", UNPARSEABLE_ENVELOPE.to_vec(), 0)],
+                group_payloads: vec![enc_payload_at("skmsg", vec![0u8; 71], 1)],
+                bot_payloads: vec![],
+                max_sender_retry_count: 0,
+                decrypt_fail_mode: DecryptFailMode::Show,
+            },
+            client.connection_generation.load(Ordering::Acquire),
+        )
+        .await;
+
+    assert_eq!(
+        recorder.failures(),
+        vec![
+            (
+                0,
+                Some("pkmsg".to_string()),
+                EncDecryptFailureReason::MalformedCiphertext
+            ),
+            (
+                1,
+                Some("skmsg".to_string()),
+                EncDecryptFailureReason::NotAttempted
+            ),
+        ],
+        "the skmsg is never decrypted, and saying so is the point",
+    );
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+}
+
+/// A session `<enc>` on a stanza addressed from a group has no 1:1 session to
+/// use, so the client drops it without trying. Before this event that drop was
+/// a debug line and nothing else.
+#[tokio::test]
+async fn session_encs_from_a_group_sender_report_not_attempted() {
+    let client = create_test_client_for_retry_with_id("enc_fail_groupsender").await;
+    let (recorder, _leases) = watch_enc_outcomes(&client);
+
+    let group: Jid = "120363000000000004@g.us".parse().unwrap();
+    let participant: Jid = "5511900000005@s.whatsapp.net".parse().unwrap();
+    let info = Arc::new(MessageInfo {
+        id: "ENCFAIL_GROUPSENDER".to_string(),
+        source: crate::types::message::MessageSource {
+            sender: participant,
+            chat: group.clone(),
+            is_group: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+
+    client
+        .clone()
+        .process_classified_message(
+            ClassifiedMessage {
+                info,
+                sender_encryption_jid: group,
+                session_payloads: vec![enc_payload_at("msg", vec![0xFF, 0x00, 0x03], 0)],
+                group_payloads: vec![],
+                bot_payloads: vec![],
+                max_sender_retry_count: 0,
+                decrypt_fail_mode: DecryptFailMode::Show,
+            },
+            client.connection_generation.load(Ordering::Acquire),
+        )
+        .await;
+
+    assert_eq!(
+        recorder.failures(),
+        vec![(
+            0,
+            Some("msg".to_string()),
+            EncDecryptFailureReason::NotAttempted
+        )],
+    );
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+}
+
+/// A bot reply whose `messageSecret` this device does not hold.
+#[tokio::test]
+async fn a_bot_enc_without_its_secret_reports_no_message_secret() {
+    let (client, _transport) = capturing_client("enc_fail_msmsg").await;
+    let (recorder, _leases) = watch_enc_outcomes(&client);
+
+    let node = NodeBuilder::new("message")
+        .attr("from", "867051314767696@bot")
+        .attr("id", "ENCFAIL_MSMSG")
+        .attr("type", "text")
+        .children([
+            NodeBuilder::new("meta")
+                .attr("target_id", "OUT_MISSING")
+                .attr("target_sender_jid", "5511900000006@s.whatsapp.net")
+                .build(),
+            NodeBuilder::new("enc")
+                .attr("type", "msmsg")
+                .attr("v", "2")
+                .bytes(encode_message_secret_message(&[7u8; 12], &[9u8; 32]))
+                .build(),
+        ])
+        .build();
+    client
+        .clone()
+        .handle_incoming_message(node_to_arc(node))
+        .await;
+
+    assert_eq!(
+        recorder.failures(),
+        vec![(
+            0,
+            Some("msmsg".to_string()),
+            EncDecryptFailureReason::NoMessageSecret
+        )],
+    );
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+}
+
+/// Fan-out: one stanza, several `<enc>`, some decrypting and some not. Each
+/// event must name the node it belongs to, and the numbering must be the one
+/// `DecryptedPayload` uses — two numberings across this pair of events would be
+/// worse than having no failure event at all.
+#[tokio::test]
+async fn a_mixed_stanza_numbers_successes_and_failures_the_same_way() {
+    let client = crate::test_utils::create_test_client_with_name("enc_fail_fanout").await;
+    let (recorder, _leases) = watch_enc_outcomes(&client);
+
+    let mut alice = AlicePeer::new("1111111111114@s.whatsapp.net").await;
+    let (bob_bundle, _) = bobs_prekey_bundle(&client).await;
+    let bob_addr = {
+        let snapshot = client.persistence_manager.get_device_snapshot();
+        snapshot
+            .lid
+            .as_ref()
+            .or(snapshot.pn.as_ref())
+            .expect("own jid")
+            .to_protocol_address()
+    };
+    alice.install_bob_session(&bob_addr, &bob_bundle).await;
+    let good = alice.encrypt_text(&bob_addr, "the one that works").await;
+
+    let info = dm_info("ENCFAIL_FANOUT", &alice.jid);
+    // Positions 0 and 2 are unusable, 1 decrypts. Feeding them in one batch is
+    // the shape a fan-out stanza takes once classification has bucketed it.
+    let outcome = client
+        .clone()
+        .process_session_enc_batch(
+            vec![
+                enc_payload_at("msg", UNPARSEABLE_ENVELOPE.to_vec(), 0),
+                enc_payload_at("pkmsg", good.serialize().to_vec(), 1),
+                enc_payload_at("msg", UNPARSEABLE_ENVELOPE.to_vec(), 2),
+            ],
+            &info,
+            &alice.jid,
+            DecryptFailMode::Show,
+        )
+        .await;
+    assert!(outcome.decrypted, "the middle enc must actually decrypt");
+
+    assert_eq!(
+        recorder.failures(),
+        vec![
+            (
+                0,
+                Some("msg".to_string()),
+                EncDecryptFailureReason::MalformedCiphertext
+            ),
+            (
+                2,
+                Some("msg".to_string()),
+                EncDecryptFailureReason::MalformedCiphertext
+            ),
+        ],
+        "each failure names its own node, and the one that worked is not among them",
+    );
+    assert_eq!(
+        recorder.decrypted(),
+        [(1, "pkmsg")],
+        "the success carries the same numbering the failures do",
+    );
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+}
+
+/// The gap this event fills at the other end: `UndecryptableMessage` is
+/// single-flight per `(chat, id)`, so the second delivery of a stanza that
+/// keeps failing produces nothing. This one reports both deliveries.
+#[tokio::test]
+async fn a_redelivered_stanza_reports_its_failure_again() {
+    let client = create_test_client_for_retry_with_id("enc_fail_redeliver").await;
+    let (recorder, _leases) = watch_enc_outcomes(&client);
+    let undecryptable = Arc::new(EventRecorder::default());
+    client.subscribe_handler(undecryptable.clone()).detach();
+
+    let sender: Jid = "5511900000007@s.whatsapp.net".parse().unwrap();
+    let info = dm_info("ENCFAIL_REDELIVERED", &sender);
+
+    for _ in 0..2 {
+        client
+            .clone()
+            .process_session_enc_batch(
+                vec![enc_payload_at("msg", UNPARSEABLE_ENVELOPE.to_vec(), 0)],
+                &info,
+                &sender,
+                DecryptFailMode::Show,
+            )
+            .await;
+    }
+
+    assert_eq!(
+        recorder.failures(),
+        vec![
+            (
+                0,
+                Some("msg".to_string()),
+                EncDecryptFailureReason::MalformedCiphertext
+            ),
+            (
+                0,
+                Some("msg".to_string()),
+                EncDecryptFailureReason::MalformedCiphertext
+            ),
+        ],
+        "once per delivery",
+    );
+    assert_eq!(
+        undecryptable.undecryptable().len(),
+        1,
+        "the per-message event stays deduplicated; this test would be pointless otherwise",
+    );
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+}
+
+/// Nothing is built or dispatched while no consumer asks, and the last lease
+/// dropping turns it back off.
+#[tokio::test]
+async fn enc_failures_are_not_reported_without_a_lease() {
+    let client = create_test_client_for_retry_with_id("enc_fail_lease").await;
+    let recorder = Arc::new(EncOutcomeRecorder::default());
+    client.subscribe_handler(recorder.clone()).detach();
+
+    let sender: Jid = "5511900000008@s.whatsapp.net".parse().unwrap();
+    let info = dm_info("ENCFAIL_LEASE", &sender);
+    let run = || {
+        let client = client.clone();
+        let info = info.clone();
+        let sender = sender.clone();
+        async move {
+            client
+                .process_session_enc_batch(
+                    vec![enc_payload_at("msg", UNPARSEABLE_ENVELOPE.to_vec(), 0)],
+                    &info,
+                    &sender,
+                    DecryptFailMode::Show,
+                )
+                .await;
+        }
+    };
+
+    assert!(
+        !client.enc_decrypt_failed_forwarding_enabled(),
+        "no lease, no gate",
+    );
+    run().await;
+    assert!(
+        recorder.failures().is_empty(),
+        "nothing is emitted while no lease is held",
+    );
+
+    let first = client.acquire_enc_decrypt_failed_forwarding();
+    let second = client.acquire_enc_decrypt_failed_forwarding();
+    run().await;
+    assert_eq!(recorder.failures().len(), 1);
+
+    drop(first);
+    run().await;
+    assert_eq!(
+        recorder.failures().len(),
+        2,
+        "one lease still holds it open"
+    );
+
+    drop(second);
+    assert!(!client.enc_decrypt_failed_forwarding_enabled());
+    run().await;
+    assert_eq!(
+        recorder.failures().len(),
+        2,
+        "the last lease dropping turns it back off",
+    );
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+}
+
+/// A `DecryptedPayload` lease alone must not switch failure reporting on: the
+/// two are counted apart so neither consumer pays for the other's event.
+#[tokio::test]
+async fn the_two_forwarding_gates_are_independent() {
+    let client = create_test_client_for_retry_with_id("enc_fail_gates").await;
+    let payload_lease = client.acquire_decrypted_payload_forwarding();
+    assert!(client.decrypted_payload_forwarding_enabled());
+    assert!(
+        !client.enc_decrypt_failed_forwarding_enabled(),
+        "asking for successes must not turn on failures",
+    );
+
+    let failure_lease = client.acquire_enc_decrypt_failed_forwarding();
+    drop(payload_lease);
+    assert!(
+        !client.decrypted_payload_forwarding_enabled(),
+        "and dropping one must not keep the other's gate open",
+    );
+    assert!(client.enc_decrypt_failed_forwarding_enabled());
+    drop(failure_lease);
+}
+
+/// A group envelope libsignal could not even parse never reached a cipher.
+/// Reporting it as an unclassified Signal error would put a malformed-wire
+/// event in the same bucket as a real cryptographic failure.
+#[tokio::test]
+async fn a_group_envelope_that_does_not_parse_reports_malformed_ciphertext() {
+    let client = create_test_client_for_retry_with_id("enc_fail_skmsg_parse").await;
+    let (recorder, _leases) = watch_enc_outcomes(&client);
+
+    let group: Jid = "120363000000000005@g.us".parse().unwrap();
+    let participant: Jid = "5511900000009@s.whatsapp.net".parse().unwrap();
+    let info = Arc::new(MessageInfo {
+        id: "ENCFAIL_SKMSG_PARSE".to_string(),
+        source: crate::types::message::MessageSource {
+            sender: participant,
+            chat: group.clone(),
+            is_group: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+
+    client
+        .clone()
+        .process_classified_message(
+            ClassifiedMessage {
+                info,
+                sender_encryption_jid: group,
+                session_payloads: vec![],
+                // Too short to hold the trailing signature, so
+                // `SenderKeyMessage::try_from` rejects it before the chain is
+                // ever looked up.
+                group_payloads: vec![enc_payload_at("skmsg", vec![0x33, 0x01], 0)],
+                bot_payloads: vec![],
+                max_sender_retry_count: 0,
+                decrypt_fail_mode: DecryptFailMode::Show,
+            },
+            client.connection_generation.load(Ordering::Acquire),
+        )
+        .await;
+
+    assert_eq!(
+        recorder.failures(),
+        vec![(
+            0,
+            Some("skmsg".to_string()),
+            EncDecryptFailureReason::MalformedCiphertext
+        )],
+    );
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+}
+
+/// A bot payload too short to hold its GCM tag is rejected on shape, before any
+/// key is derived. It must not be reported as a failed authentication — that
+/// would let malformed wire data count against the peer's session health.
+#[tokio::test]
+async fn a_bot_envelope_too_short_for_its_tag_is_not_reported_as_bad_mac() {
+    use crate::store::commands::DeviceCommand;
+    let (client, _transport) = capturing_client("enc_fail_msmsg_short").await;
+    client
+        .persistence_manager
+        .process_command(DeviceCommand::SetLid(Some(
+            "999888777666554:0@lid".parse().unwrap(),
+        )))
+        .await;
+    let (recorder, _leases) = watch_enc_outcomes(&client);
+
+    let bot_chat: Jid = "867051314767696@bot".parse().unwrap();
+    let sender_identity = client
+        .dm_sender_identity_for(&bot_chat)
+        .await
+        .expect("LID seeded");
+    client
+        .persist_outbound_msg_secret(
+            &bot_chat,
+            &sender_identity,
+            "OUT_SHORT",
+            &[0x5Au8; 32],
+            wacore::msg_secret::RetentionClass::Bot,
+            crate::send::SendInstant::now(),
+        )
+        .await;
+
+    let node = NodeBuilder::new("message")
+        .attr("from", "867051314767696@bot")
+        .attr("id", "ENCFAIL_MSMSG_SHORT")
+        .attr("type", "text")
+        .children([
+            NodeBuilder::new("meta")
+                .attr("target_id", "OUT_SHORT")
+                .attr("target_sender_jid", "999888777666554@lid")
+                .build(),
+            NodeBuilder::new("enc")
+                .attr("type", "msmsg")
+                .attr("v", "2")
+                // A valid 12-byte IV, and four bytes where a 16-byte tag has to
+                // be: the secret is found, and there is nothing to authenticate.
+                .bytes(encode_message_secret_message(&[3u8; 12], &[9u8; 4]))
+                .build(),
+        ])
+        .build();
+    client
+        .clone()
+        .handle_incoming_message(node_to_arc(node))
+        .await;
+
+    assert_eq!(
+        recorder.failures(),
+        vec![(
+            0,
+            Some("msmsg".to_string()),
+            EncDecryptFailureReason::MalformedCiphertext
+        )],
+    );
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+}
+
+/// A signed pre-key we no longer hold, reported as such. The identity-change
+/// retry reaches the same libsignal error by a different route and now names
+/// the same cause, so a consumer keying a resync off `UnknownPreKey` sees both.
+#[tokio::test]
+async fn a_rotated_out_signed_prekey_reports_unknown_prekey() {
+    let client = crate::test_utils::create_test_client_with_name("enc_fail_spk").await;
+    let (recorder, _leases) = watch_enc_outcomes(&client);
+
+    let (bundle, bob_jid) = bobs_prekey_bundle_with_spk_id(&client, 4243).await;
+    let bob_addr = bob_jid.to_protocol_address();
+    let mut alice = AlicePeer::new("15550002003@s.whatsapp.net").await;
+    alice.install_bob_session(&bob_addr, &bundle).await;
+    let pkmsg = alice.encrypt_text(&bob_addr, "rotated out").await;
+    let bytes = match &pkmsg {
+        CiphertextMessage::PreKeySignalMessage(m) => m.serialized().to_vec(),
+        _ => panic!("must be a pkmsg so decrypt looks up the signed prekey"),
+    };
+
+    let info = dm_info("ENCFAIL_SPK", &alice.jid);
+    let outcome = client
+        .clone()
+        .process_session_enc_batch(
+            vec![enc_payload_at("pkmsg", bytes, 2)],
+            &info,
+            &alice.jid,
+            DecryptFailMode::Show,
+        )
+        .await;
+    assert!(!outcome.decrypted, "the signed prekey is missing");
+
+    assert_eq!(
+        recorder.failures(),
+        vec![(
+            2,
+            Some("pkmsg".to_string()),
+            EncDecryptFailureReason::UnknownPreKey
+        )],
+    );
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+}
+
+/// A stanza abandoned by a teardown reports every `<enc>` it never tried.
+///
+/// The bail happens after classification, so its failures are already out. If
+/// the queued payloads stayed silent, a mixed stanza would report the malformed
+/// index and nothing for the decryptable siblings — the one shape the event
+/// promises not to produce. The stanza is unacked and comes back; the event
+/// repeats with it.
+#[tokio::test]
+async fn a_stanza_abandoned_by_a_teardown_reports_what_it_never_tried() {
+    let client = crate::test_utils::create_test_client_with_name("enc_fail_teardown").await;
+    let (recorder, _leases) = watch_enc_outcomes(&client);
+
+    let sender: Jid = "15550002005@s.whatsapp.net".parse().unwrap();
+    let info = dm_info("ENCFAIL_TEARDOWN", &sender);
+
+    // The generation this stanza was classified under, before teardown bumps it.
+    let stale_generation = client.connection_generation.load(Ordering::Acquire);
+    client.connection_generation.fetch_add(1, Ordering::AcqRel);
+
+    client
+        .clone()
+        .process_classified_message(
+            ClassifiedMessage {
+                info,
+                sender_encryption_jid: sender.clone(),
+                session_payloads: vec![enc_payload_at("msg", vec![1u8; 40], 1)],
+                group_payloads: vec![enc_payload_at("skmsg", vec![2u8; 40], 2)],
+                bot_payloads: vec![],
+                max_sender_retry_count: 0,
+                decrypt_fail_mode: DecryptFailMode::Show,
+            },
+            stale_generation,
+        )
+        .await;
+
+    assert_eq!(
+        recorder.failures(),
+        vec![
+            (
+                1,
+                Some("msg".to_string()),
+                EncDecryptFailureReason::NotAttempted
+            ),
+            (
+                2,
+                Some("skmsg".to_string()),
+                EncDecryptFailureReason::NotAttempted
+            ),
+        ],
+        "every queued index is reported as never tried, none is decrypted",
+    );
+    assert!(
+        recorder.decrypted().is_empty(),
+        "the teardown bailed before any decrypt could run",
+    );
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+}
+
+/// A duplicate alongside a genuine failure does not buy the `skmsg` its silence.
+///
+/// `should_process_skmsg_after_session` already lets a batch through when its
+/// session `<enc>` were duplicates and nothing else, so the only way a duplicate
+/// reaches the skip branch is beside an `<enc>` that really failed — and that
+/// failure skipped this `skmsg` on the first delivery too. There is no earlier
+/// success for the redelivery to stand in for, so the skipped index is reported
+/// and the duplicate itself still is not.
+#[tokio::test]
+async fn a_skmsg_skipped_beside_a_duplicate_is_still_reported() {
+    let client = crate::test_utils::create_test_client_with_name("enc_fail_dup_skip").await;
+
+    let mut alice = AlicePeer::new("15550002004@s.whatsapp.net").await;
+    let (bundle, bob_jid) = bobs_prekey_bundle(&client).await;
+    let bob_addr = bob_jid.to_protocol_address();
+    alice.install_bob_session(&bob_addr, &bundle).await;
+    let pkmsg = alice.encrypt_text(&bob_addr, "establish").await;
+    let (established, _, _, _) = submit_and_check_session(&client, &alice.jid, &pkmsg).await;
+    assert!(established, "the session must exist first");
+
+    // Force a plain SignalMessage, whose replay libsignal answers with
+    // `DuplicatedMessage` off the message-key cache.
+    if let Some(record) = alice.sessions.0.get_mut(&bob_addr)
+        && let Some(state) = record.session_state_mut()
+    {
+        state.clear_unacknowledged_pre_key_message();
+    }
+    let bytes = match alice.encrypt_text(&bob_addr, "first delivery").await {
+        CiphertextMessage::SignalMessage(m) => m.serialized().to_vec(),
+        _ => panic!("expected a SignalMessage"),
+    };
+
+    let first = dm_info("ENCFAIL_DUP_FIRST", &alice.jid);
+    let outcome = client
+        .clone()
+        .process_session_enc_batch(
+            vec![enc_payload_at("msg", bytes.clone(), 0)],
+            &first,
+            &alice.jid,
+            DecryptFailMode::Show,
+        )
+        .await;
+    assert!(outcome.decrypted, "the first delivery must decrypt");
+
+    // Only now start watching, so the first delivery's events are not counted.
+    let (recorder, _leases) = watch_enc_outcomes(&client);
+
+    // The redelivery: the same ciphertext (a duplicate) alongside one that
+    // genuinely fails, which is what drives `should_process_skmsg_after_session`
+    // to skip the group payload.
+    let group: Jid = "120363000000000006@g.us".parse().unwrap();
+    let redelivered = Arc::new(MessageInfo {
+        id: "ENCFAIL_DUP_REDELIVERED".to_string(),
+        source: crate::types::message::MessageSource {
+            sender: alice.jid.clone(),
+            chat: group,
+            is_group: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    client
+        .clone()
+        .process_classified_message(
+            ClassifiedMessage {
+                info: redelivered,
+                sender_encryption_jid: alice.jid.clone(),
+                session_payloads: vec![
+                    enc_payload_at("msg", bytes, 0),
+                    enc_payload_at("msg", UNPARSEABLE_ENVELOPE.to_vec(), 1),
+                ],
+                group_payloads: vec![enc_payload_at("skmsg", vec![0u8; 71], 2)],
+                bot_payloads: vec![],
+                max_sender_retry_count: 0,
+                decrypt_fail_mode: DecryptFailMode::Show,
+            },
+            client.connection_generation.load(Ordering::Acquire),
+        )
+        .await;
+
+    assert_eq!(
+        recorder.failures(),
+        vec![
+            (
+                1,
+                Some("msg".to_string()),
+                EncDecryptFailureReason::MalformedCiphertext
+            ),
+            (
+                2,
+                Some("skmsg".to_string()),
+                EncDecryptFailureReason::NotAttempted
+            ),
+        ],
+        "the duplicate reports nothing, the enc that really failed does, and so \
+         does the skmsg that failure skipped",
+    );
+    crate::test_utils::wait_for_outbound_tasks(&client).await;
+}
+
+/// The shared classifier for libsignal errors the decrypt arms do not name
+/// themselves. A store that could not answer is local, not cryptographic:
+/// reporting it as `SignalError` would blame the peer for our own disk, and
+/// both the session catch-all and the group arm read this one function so they
+/// cannot drift apart.
+#[test]
+fn a_backend_error_is_storage_not_a_signal_failure() {
+    use wacore::libsignal::protocol::SignalProtocolError;
+
+    #[derive(Debug)]
+    struct StoreDown;
+    impl std::fmt::Display for StoreDown {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("store down")
+        }
+    }
+    impl std::error::Error for StoreDown {}
+
+    assert_eq!(
+        signal_error_reason(&SignalProtocolError::BackendError(
+            "backend",
+            Box::new(StoreDown)
+        )),
+        EncDecryptFailureReason::StorageFailure,
+    );
+    assert_eq!(
+        signal_error_reason(&SignalProtocolError::CiphertextMessageTooShort(3)),
+        EncDecryptFailureReason::MalformedCiphertext,
+        "an envelope that would not parse stays malformed",
+    );
+    assert_eq!(
+        signal_error_reason(&SignalProtocolError::InvalidSenderKeySession),
+        EncDecryptFailureReason::StorageFailure,
+        "a sender-key record that loaded without usable state is our row, not the \
+         peer's ciphertext — libsignal only raises this while reading it",
+    );
+    assert_eq!(
+        signal_error_reason(&SignalProtocolError::InvalidSessionStructure(
+            "cannot decrypt without remote identity key"
+        )),
+        EncDecryptFailureReason::StorageFailure,
+        "a session record that decoded without usable state is our row too",
+    );
+    assert_eq!(
+        signal_error_reason(&SignalProtocolError::InvalidSessionStructure(
+            "receiver chain is closed"
+        )),
+        EncDecryptFailureReason::SignalError,
+        "but a chain we closed is a fact about the message — libsignal's \
+         `is_stored_session_corruption` draws that line and this must honour it",
+    );
+    assert_eq!(
+        signal_error_reason(&SignalProtocolError::SignatureValidationFailed),
+        EncDecryptFailureReason::SignalError,
+        "and anything this build does not classify stays in the named catch-all",
+    );
+}
+
+/// A row we stored that no longer converts back into a record must not be
+/// reported as a malformed ciphertext. The conversion raises
+/// `InvalidProtobufEncoding` — the same variant a peer's malformed envelope
+/// raises — so the store boundary is the only place that still knows the bytes
+/// were ours.
+#[tokio::test]
+async fn a_corrupt_stored_prekey_is_not_blamed_on_the_peer() {
+    use wacore::libsignal::protocol::{PreKeyStore, SignalProtocolError};
+    use wacore::libsignal::store::PreKeyStore as WacorePreKeyStore;
+
+    let client = crate::test_utils::create_test_client_with_name("enc_fail_corrupt_row").await;
+    let device = client.persistence_manager.get_device_arc().await;
+
+    // A stored structure with no key material: what a truncated or partially
+    // written row deserializes into.
+    let corrupt = waproto::whatsapp::PreKeyRecordStructure {
+        id: Some(7),
+        public_key: None,
+        private_key: None,
+    };
+    {
+        let guard = device.read().await;
+        WacorePreKeyStore::store_prekey(&*guard, 7, corrupt, false)
+            .await
+            .expect("stored");
+    }
+    drop(device);
+
+    let adapter = client.signal_adapter();
+    let err = adapter
+        .pre_key_store
+        .get_pre_key(7u32.into())
+        .await
+        .expect_err("a keyless row cannot become a record");
+
+    assert!(
+        matches!(err, SignalProtocolError::BackendError(context, _) if context == "stored record"),
+        "the boundary must mark it as ours, got {err:?}",
+    );
+    assert_eq!(
+        signal_error_reason(&err),
+        EncDecryptFailureReason::StorageFailure,
+        "and so the receive path reports storage, not a malformed ciphertext",
+    );
+}
+
+/// The same libsignal rejection must not carry two names depending on which
+/// `<enc>` type reached it. `UnrecognizedMessageVersion` arrives at the group
+/// arm through `group_decrypt_retry_reason` as an invalid message; the session
+/// catch-all has to agree.
+#[test]
+fn a_version_mismatch_is_an_invalid_message_on_both_paths() {
+    use wacore::libsignal::protocol::SignalProtocolError;
+
+    let mismatch = SignalProtocolError::UnrecognizedMessageVersion(9);
+    assert_eq!(
+        signal_error_reason(&mismatch),
+        EncDecryptFailureReason::InvalidMessage,
+    );
+    assert!(
+        group_decrypt_retry_reason(&mismatch).is_some(),
+        "the group arm still recognizes it, so both now say the same thing",
+    );
+}
+
+/// A PN→LID migration that finds a session and then fails the retry must report
+/// what the retry failed on, not the error that opened the migration. Reporting
+/// `NoSession` for a session that was found and then failed its MAC is the kind
+/// of miscount this event exists to avoid.
+#[test]
+fn a_migrated_session_reports_the_retry_failure_not_the_one_that_opened_it() {
+    use wacore::libsignal::protocol::{CiphertextMessageType, SignalProtocolError};
+
+    assert_eq!(
+        session_error_reason(&SignalProtocolError::BadMac(CiphertextMessageType::Whisper)),
+        EncDecryptFailureReason::BadMac,
+    );
+    assert_eq!(
+        session_error_reason(&SignalProtocolError::InvalidMessage(
+            CiphertextMessageType::Whisper,
+            "bad"
+        )),
+        EncDecryptFailureReason::InvalidMessage,
+    );
+    assert_eq!(
+        session_error_reason(&SignalProtocolError::InvalidSignedPreKeyId),
+        EncDecryptFailureReason::UnknownPreKey,
+    );
+    let address: Jid = "12025550101@s.whatsapp.net".parse().unwrap();
+    assert_eq!(
+        session_error_reason(&SignalProtocolError::SessionNotFound(
+            address.to_protocol_address()
+        )),
+        EncDecryptFailureReason::NoSession,
+        "and the error that opened the migration still maps to itself",
+    );
+}
+
+/// A stored identity row whose key is the wrong length is our corruption, not
+/// the peer's. `from_djb_public_key_bytes` reports `BadKeyLength` either way, so
+/// like the pre-key row it has to be marked at the store boundary.
+#[tokio::test]
+async fn a_corrupt_stored_identity_is_not_blamed_on_the_peer() {
+    use wacore::libsignal::protocol::{IdentityKeyStore, SignalProtocolError};
+
+    let client = crate::test_utils::create_test_client_with_name("enc_fail_corrupt_ident").await;
+    let peer: Jid = "12025550102@s.whatsapp.net".parse().unwrap();
+    let address = peer.to_protocol_address();
+
+    // Half a key: what a truncated write leaves behind.
+    client
+        .signal_cache
+        .put_identity(&address, &[0x11u8; 16])
+        .await;
+
+    let adapter = client.signal_adapter();
+    let err = adapter
+        .identity_store
+        .get_identity(&address)
+        .await
+        .expect_err("a 16-byte key cannot become an identity");
+
+    assert!(
+        matches!(err, SignalProtocolError::BackendError(context, _) if context == "stored record"),
+        "the boundary must mark it as ours, got {err:?}",
+    );
+    assert_eq!(
+        signal_error_reason(&err),
+        EncDecryptFailureReason::StorageFailure,
+    );
+}
+
+/// A bot secret we stored that will not produce a key is our corrupt row, not a
+/// companion that never had one. `NoMessageSecret` is reserved for the lookups
+/// that came back empty; anything the store answered with and we could not use
+/// is storage.
+#[test]
+fn a_stored_bot_secret_that_will_not_derive_is_storage_not_a_missing_secret() {
+    use wacore::bot_message::BotMessageError;
+
+    assert_eq!(
+        msmsg_failure_reason(&BotMessageError::InvalidSecretLength {
+            expected: 32,
+            got: 20
+        }),
+        EncDecryptFailureReason::StorageFailure,
+    );
+    assert_eq!(
+        msmsg_failure_reason(&BotMessageError::AuthenticationFailed),
+        EncDecryptFailureReason::BadMac,
+        "and a real tag failure is still the peer's",
+    );
+    assert_eq!(
+        msmsg_failure_reason(&BotMessageError::PayloadTooShort { need: 16, got: 4 }),
+        EncDecryptFailureReason::MalformedCiphertext,
+        "and a body too short for its tag is still malformed wire",
+    );
+}
+
+/// `KeyAgreementFailed` is libsignal saying our active crypto provider failed,
+/// not a verdict on the sender's bytes — which were never judged. Counting it
+/// against the peer is the same mistake as counting a failed disk read.
+#[test]
+fn a_local_key_agreement_failure_is_not_the_peers() {
+    use wacore::libsignal::crypto::CryptoProviderError;
+    use wacore::libsignal::protocol::SignalProtocolError;
+
+    assert_eq!(
+        signal_error_reason(&SignalProtocolError::KeyAgreementFailed(
+            CryptoProviderError::BackendFailed
+        )),
+        EncDecryptFailureReason::LocalCryptoFailure,
+    );
+}
