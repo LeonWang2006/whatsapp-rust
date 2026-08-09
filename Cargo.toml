@@ -48,7 +48,7 @@ default-members = [
 ]
 
 # Minimum supported Rust version. Floor is the stable release CI's
-# "Test Stable (no-simd)" job pins; raise both together (that job's
+# "Test Stable (MSRV)" job pins; raise both together (that job's
 # `toolchain:` and this value) when a dependency or language feature needs it.
 [workspace.package]
 rust-version = "1.94"
@@ -161,7 +161,6 @@ tracing-pii = ["wacore/tracing-pii", "wacore-binary/tracing-pii"]
 danger-skip-tls-verify = ["whatsapp-rust-tokio-transport?/danger-skip-tls-verify"]
 danger-skip-cert-chain-verify = ["wacore/danger-skip-cert-chain-verify"]
 default = [
-    "simd",
     "sqlite-storage",
     "tokio-transport",
     "tokio-runtime",
@@ -169,7 +168,6 @@ default = [
     "tokio-native",
     "signal",
 ]
-simd = ["wacore/simd"]
 ureq-client = ["dep:whatsapp-rust-ureq-http-client"]
 tokio-transport = ["dep:whatsapp-rust-tokio-transport"]
 tokio-runtime = ["dep:tokio"]

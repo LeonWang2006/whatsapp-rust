@@ -11,10 +11,6 @@ description = "Appstate for WhatsApp protocol"
 [lib]
 crate-type = ["rlib"]
 
-[features]
-default = ["simd"]
-simd = ["wacore-binary/simd"]
-
 [dependencies]
 anyhow = { workspace = true }
 buffa = { workspace = true }
