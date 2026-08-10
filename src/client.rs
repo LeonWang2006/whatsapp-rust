@@ -840,6 +840,10 @@ pub enum ConnectError {
     /// rather than reconnecting this one.
     #[error("client has been shut down")]
     Shutdown,
+    /// [`Client::pause`] is in effect. Unlike [`Self::Shutdown`] this is not
+    /// final: [`Client::resume`] lifts it and connecting works again.
+    #[error("client is paused")]
+    Paused,
     /// A step of the connect flow ran out of time.
     #[error("{stage} timed out after {timeout:?}")]
     Timeout {
@@ -904,6 +908,7 @@ impl ConnectError {
             ConnectError::AlreadyConnected
             | ConnectError::NotActivated
             | ConnectError::Shutdown
+            | ConnectError::Paused
             | ConnectError::Version(_)
             | ConnectError::Transport(_) => false,
         }
@@ -1282,6 +1287,33 @@ pub struct Client {
     pub(crate) undecryptable_dispatched: Cache<ChatMessageId, ()>,
 
     pub enable_auto_reconnect: Arc<AtomicBool>,
+    /// Set by [`Client::pause`] and cleared by [`Client::resume`]: the run loop
+    /// parks instead of connecting for as long as it holds.
+    ///
+    /// Deliberately not part of `is_terminal`: a paused client is between
+    /// connections, not finished, and the application means to come back.
+    pub(crate) paused: AtomicBool,
+    /// Fired by [`Client::pause`] and [`Client::resume`], and by nothing else,
+    /// so the run loop's reconnect backoff can watch it without the spurious
+    /// wakes that would collapse the delay it exists to serve.
+    pub(crate) pause_state_notifier: Arc<event_listener::Event>,
+    /// Set by [`Client::pause`] for the connection it tears down, consumed by
+    /// the run loop's post-connection branch. A one-shot fact rather than a
+    /// re-read of `paused`, because a [`Client::resume`] can land between the
+    /// two and the backoff a pause does not owe must not turn on that timing.
+    pub(crate) pause_teardown_pending: AtomicBool,
+    /// Bumped by every [`Client::pause`]. A connection attempt reads it once at
+    /// the start and is refused if it has moved, so an attempt that spanned a
+    /// pause is never published — even when a [`Client::resume`] landed while it
+    /// was still handshaking and left the flag reading `false` throughout.
+    pub(crate) pause_generation: AtomicU64,
+    /// Held across the connect graph's final refusal-check-and-publish and
+    /// across [`Client::pause`]'s capture of what it is tearing down, so a pause
+    /// cannot read "no connection" from an attempt one statement short of
+    /// publishing one. Deliberately covers flag and slot writes only — never
+    /// network I/O — so it cannot become the kind of wait that parks a caller
+    /// behind an unresponsive socket.
+    pub(crate) connection_publish: Mutex<()>,
     /// Consecutive reconnect failures, drives the Fibonacci backoff. Exposed
     /// read-only via [`StatsSnapshot::reconnect_errors`](wacore::stats::StatsSnapshot).
     pub(crate) auto_reconnect_errors: Arc<AtomicU32>,
