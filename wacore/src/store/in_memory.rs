@@ -320,6 +320,38 @@ impl SignalStore for InMemoryBackend {
 
     async fn store_prekeys_batch(&self, keys: &[(u32, Bytes)], _uploaded: bool) -> Result<()> {
         let mut state = self.state.lock().await;
+        // Growing one insert at a time allocates and copies a whole table per
+        // rehash, and a connect-sized batch arriving at an empty map crosses
+        // the load factor eight times. The batch length is known, so the table
+        // can reach its final size in one allocation instead.
+        //
+        // Two things stop that reservation from over-growing a table, because a
+        // table grown for rows that were never added does not shrink back and
+        // this is meant to cost no retained bytes:
+        //
+        // 1. Subtract the rows already stored. A batch may legally overwrite
+        //    ids, and no batch can overwrite more rows than exist, so
+        //    `keys.len() - len()` is the floor on how many ids must be new.
+        // 2. Only reserve at all when the batch is strictly ascending, which
+        //    proves its ids are distinct. Without that, 812 entries sharing one
+        //    id would reserve a 1024-bucket table to hold a single row. Testing
+        //    the order costs one pass of integer compares and no allocation;
+        //    deduplicating properly would need a set, whose own allocation and
+        //    812 hashes cost more than the eight allocations being saved.
+        //
+        // Both are one-sided: they can only under-reserve and fall back to
+        // incremental growth, never inflate the resident table. The connect path
+        // satisfies both — the map is empty and `upload_pre_keys_pass` emits
+        // `gen_start + i`, so the whole batch is reserved and gets the full win.
+        //
+        // This does NOT shrink the table that stays resident: the final
+        // capacity is the same either way, so it buys allocator traffic and
+        // in-call headroom, not retained bytes.
+        let ascending = keys.windows(2).all(|pair| pair[0].0 < pair[1].0);
+        if ascending {
+            let at_least_new = keys.len().saturating_sub(state.prekeys.len());
+            state.prekeys.reserve(at_least_new);
+        }
         for (id, record) in keys {
             state.prekeys.insert(
                 *id,
@@ -1240,6 +1272,139 @@ mod tests {
         assert_eq!(
             backend.get_session(&second).await.unwrap().unwrap(),
             Bytes::from_static(b"second")
+        );
+    }
+
+    /// A connect-sized batch: every id must be readable back, and a later batch
+    /// repeating an id must overwrite it rather than duplicate or drop it. This
+    /// is what pins `store_prekeys_batch` idempotent per id across the reserve.
+    #[tokio::test]
+    async fn store_prekeys_batch_stores_every_key() {
+        const COUNT: u32 = 812;
+        let backend = InMemoryBackend::new();
+
+        let batch: Vec<(u32, Bytes)> = (1..=COUNT)
+            .map(|id| (id, Bytes::from(format!("record-{id}"))))
+            .collect();
+        backend.store_prekeys_batch(&batch, false).await.unwrap();
+
+        for id in 1..=COUNT {
+            assert_eq!(
+                backend.load_prekey(id).await.unwrap(),
+                Some(Bytes::from(format!("record-{id}"))),
+                "prekey {id} must survive the batch write"
+            );
+        }
+        assert_eq!(backend.get_max_prekey_id().await.unwrap(), COUNT);
+
+        backend
+            .store_prekeys_batch(&[(7, Bytes::from_static(b"rewritten"))], true)
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.load_prekey(7).await.unwrap(),
+            Some(Bytes::from_static(b"rewritten"))
+        );
+        assert_eq!(
+            backend.state.lock().await.prekeys.len(),
+            COUNT as usize,
+            "re-storing an existing id must not add a row"
+        );
+    }
+
+    /// Reserving for the batch length must leave the table exactly the size the
+    /// row count alone demands — the point of the reserve is to reach that size
+    /// in one allocation, not to reach a bigger one. The control map is grown
+    /// one insert at a time, which is the un-reserved shape; hashbrown sizes a
+    /// table from the element count alone, so the two must agree. The second
+    /// pass covers the reserve landing on an already-populated map, where
+    /// reserving the full batch length on top of the existing rows would be
+    /// visible as a doubled table.
+    #[tokio::test]
+    async fn store_prekeys_batch_reserve_does_not_over_grow_the_table() {
+        const COUNT: u32 = 812;
+        let backend = InMemoryBackend::new();
+        let mut control: HashMap<u32, ()> = HashMap::new();
+
+        for pass in 0..2u32 {
+            let first = pass * COUNT + 1;
+            let batch: Vec<(u32, Bytes)> = (first..first + COUNT)
+                .map(|id| (id, Bytes::from_static(b"record")))
+                .collect();
+            backend.store_prekeys_batch(&batch, false).await.unwrap();
+            for id in first..first + COUNT {
+                control.insert(id, ());
+            }
+
+            let state = backend.state.lock().await;
+            assert_eq!(state.prekeys.len(), control.len());
+            assert_eq!(
+                state.prekeys.capacity(),
+                control.capacity(),
+                "pass {pass}: the reserved table must match an incrementally grown one"
+            );
+        }
+    }
+
+    /// Replaying a stored window must not grow the table by one bucket. The
+    /// trait permits a batch to overwrite ids, and a table grown for rows that
+    /// were only overwritten never shrinks back — so a reservation taken on the
+    /// bare batch length would retain an extra table forever, which is exactly
+    /// the residency this change claims not to touch.
+    #[tokio::test]
+    async fn replaying_a_stored_batch_does_not_grow_the_table() {
+        const COUNT: u32 = 812;
+        let backend = InMemoryBackend::new();
+        let batch: Vec<(u32, Bytes)> = (1..=COUNT)
+            .map(|id| (id, Bytes::from_static(b"record")))
+            .collect();
+
+        backend.store_prekeys_batch(&batch, false).await.unwrap();
+        let settled = backend.state.lock().await.prekeys.capacity();
+
+        // Same ids twice more: every row is an overwrite, so nothing is added.
+        backend.store_prekeys_batch(&batch, true).await.unwrap();
+        backend.store_prekeys_batch(&batch, true).await.unwrap();
+
+        let state = backend.state.lock().await;
+        assert_eq!(state.prekeys.len(), COUNT as usize, "no rows were added");
+        assert_eq!(
+            state.prekeys.capacity(),
+            settled,
+            "an all-overwrite batch must not enlarge the table"
+        );
+    }
+
+    /// A batch whose ids repeat stores one row per distinct id, so sizing the
+    /// table from the batch length would leave it holding a table for rows that
+    /// never existed. The reservation is skipped unless the batch is strictly
+    /// ascending, which is what makes its ids provably distinct.
+    #[tokio::test]
+    async fn a_batch_of_repeated_ids_does_not_reserve_for_them() {
+        const COUNT: usize = 812;
+        let backend = InMemoryBackend::new();
+        let batch: Vec<(u32, Bytes)> = (0..COUNT)
+            .map(|i| (7, Bytes::from(format!("record-{i}"))))
+            .collect();
+
+        backend.store_prekeys_batch(&batch, false).await.unwrap();
+
+        // One row survives — the last write for id 7 — so the table must be
+        // sized for one row, not for the 812 entries that were handed over.
+        let mut control: HashMap<u32, ()> = HashMap::new();
+        control.insert(7, ());
+
+        let state = backend.state.lock().await;
+        assert_eq!(state.prekeys.len(), 1, "last write wins per id");
+        assert_eq!(
+            state.prekeys.capacity(),
+            control.capacity(),
+            "a repeated-id batch must not size the table by its length"
+        );
+        drop(state);
+        assert_eq!(
+            backend.load_prekey(7).await.unwrap(),
+            Some(Bytes::from(format!("record-{}", COUNT - 1)))
         );
     }
 
