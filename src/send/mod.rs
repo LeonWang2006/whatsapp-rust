@@ -1323,7 +1323,7 @@ impl Client {
     /// Atomic get-or-init: if another task invalidated the cache during our
     /// DB read, get_or_init's single-flight guarantee means the stale data
     /// won't be inserted — the invalidation wins and the next caller re-inits.
-    async fn skdm_device_map(
+    pub(crate) async fn skdm_device_map(
         &self,
         group_jid: &str,
     ) -> std::sync::Arc<crate::sender_key_device_cache::SenderKeyDeviceMap> {
@@ -1464,7 +1464,7 @@ impl Client {
     /// comes from the per-group memo (`resolve_group_devices_memoized`), so a
     /// warm repeat send skips the per-member registry fan-out entirely.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.resolve_skdm_targets_memoized", level = "debug", skip_all, fields(group = %group_jid)))]
-    async fn resolve_skdm_targets_memoized(
+    pub(crate) async fn resolve_skdm_targets_memoized(
         &self,
         group: &Jid,
         group_jid: &str,
@@ -3002,6 +3002,44 @@ mod tests {
             }
         }
 
+        /// Give our own account a companion device and a pairwise session for
+        /// it, and return its JID.
+        ///
+        /// The default fixture has only our primary, which `filter_skdm_targets`
+        /// excludes as the sender — so without this the warm steady state has
+        /// nothing to distribute and the own-device half of the partition is
+        /// never exercised. Production almost always has one (the phone plus
+        /// this linked client), and WA Web never marks own devices warm, so a
+        /// warm send re-targets it every time.
+        async fn add_own_companion(&self, device_id: u16) -> Jid {
+            use wacore::store::traits::{DeviceInfo, DeviceListRecord};
+
+            let own = self
+                .client
+                .persistence_manager
+                .get_device_snapshot()
+                .pn
+                .clone()
+                .expect("own pn");
+            let record = DeviceListRecord {
+                user: own.user.as_str().into(),
+                devices: vec![
+                    DeviceInfo::new(0, None),
+                    DeviceInfo::new(u32::from(device_id), None),
+                ],
+                timestamp: wacore::time::now_secs(),
+                phash: None,
+                raw_id: None,
+            };
+            self.client
+                .device_registry_cache
+                .raw_insert_for_tests(own.user.to_string(), Arc::new(record))
+                .await;
+            let companion = own.with_device(device_id);
+            crate::test_utils::seed_peer_session(&self.client, &companion).await;
+            companion
+        }
+
         async fn send_text(&self, text: &str) {
             self.client
                 .send_message(self.group.clone(), wa::Message::text(text))
@@ -3077,6 +3115,113 @@ mod tests {
         assert!(
             fixture.frame_len(1) < fixture.frame_len(0),
             "a revoke that distributes nothing must be smaller than the cold send"
+        );
+    }
+
+    /// Whether the next send would take the memoized path: the entry exists and
+    /// all four of `resolve_skdm_targets_memoized`'s validity conditions still
+    /// hold. Re-derived here rather than counted inside the production path,
+    /// which would mean adding a hit counter to a hot function just to observe
+    /// it.
+    async fn skdm_memo_would_hit(client: &Arc<Client>, group: &Jid) -> Option<Vec<Jid>> {
+        let cached_map = client.skdm_device_map(&group.to_string()).await;
+        let group_info = client
+            .get_group_cache()
+            .get(group)
+            .await
+            .expect("group metadata must be cached");
+        let own = client
+            .persistence_manager
+            .get_device_snapshot()
+            .pn
+            .clone()
+            .expect("own pn");
+        let Ok(devices) = client
+            .resolve_group_devices_memoized(group, &group_info, &own)
+            .await
+        else {
+            return None;
+        };
+        let generation = cached_map.generation();
+        let (dw, cw, memo_gen, memo_sender, memo_needs) = client.skdm_warm_memo.get(group).await?;
+        (std::ptr::eq(dw.as_ptr(), Arc::as_ptr(&devices))
+            && std::ptr::eq(cw.as_ptr(), Arc::as_ptr(&cached_map))
+            && memo_gen == generation
+            && memo_sender == own)
+            .then_some(memo_needs)
+    }
+
+    /// The premise of every "the warm group send is flat in group size" claim:
+    /// once the group is warm, `resolve_skdm_targets_memoized` really does take
+    /// the memo and skip `filter_skdm_targets`. If it did not, each send would
+    /// pay one hash lookup per device — measured at 649 instructions per member
+    /// by `skdm_target_resolution_memo_cold`, which is the exact shape an
+    /// external profile attributed to this path.
+    ///
+    /// Repeat sends are what has to hold, not just the second one, and the
+    /// memoized `needs` must stay NON-EMPTY: our own companions are never
+    /// marked warm (WA Web `!isMeDevice`), so a warm send re-targets them every
+    /// time and the memo has to survive being re-inserted carrying them. An
+    /// own companion is seeded here for exactly that reason — with only our
+    /// primary device (which the filter excludes as the sender) every send
+    /// would memoize an empty list, and a regression that stopped retaining the
+    /// own-companion memo would still pass.
+    #[tokio::test]
+    async fn skdm_warm_memo_hits_on_every_repeat_send() {
+        let fixture = GroupSendFixture::new().await;
+        let companion = fixture.add_own_companion(1).await;
+
+        // The first send is cold: it distributes to every device, so there is
+        // nothing warm to memoize against yet.
+        fixture.send_text("cold send").await;
+        for round in 0..4 {
+            fixture.send_text("warm send").await;
+            let needs = skdm_memo_would_hit(&fixture.client, &fixture.group)
+                .await
+                .unwrap_or_else(|| {
+                    panic!(
+                        "the warm memo must be live after warm send {round}; a miss here \
+                         puts filter_skdm_targets back on every send"
+                    )
+                });
+            assert_eq!(
+                needs,
+                vec![companion.clone()],
+                "the steady state re-targets our own companion, so the memoized \
+                 targets must carry it (round {round})"
+            );
+        }
+    }
+
+    /// The counterpart: a forgotten device (a retry receipt's
+    /// `markForgetSenderKey`) flips the map in place, which keeps the `Arc` but
+    /// advances the generation — the one signal pointer identity cannot carry.
+    /// The memo must miss, or the send would skip a distribution the peer is
+    /// asking for. This is why the generation is part of the key, and why an
+    /// optimization must not drop it.
+    #[tokio::test]
+    async fn skdm_warm_memo_misses_after_a_device_is_forgotten() {
+        let fixture = GroupSendFixture::new().await;
+        fixture.send_text("cold send").await;
+        fixture.send_text("warm send").await;
+        assert!(
+            skdm_memo_would_hit(&fixture.client, &fixture.group)
+                .await
+                .is_some()
+        );
+
+        let forgotten = fixture.member.with_device(0);
+        fixture
+            .client
+            .sender_key_device_cache
+            .mark_forgotten(&fixture.group.to_string(), std::iter::once(&forgotten))
+            .await;
+
+        assert!(
+            skdm_memo_would_hit(&fixture.client, &fixture.group)
+                .await
+                .is_none(),
+            "an in-place cold flip must invalidate the memo through the generation"
         );
     }
 
