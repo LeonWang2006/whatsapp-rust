@@ -357,6 +357,108 @@ reliable signal and `freed`/`net` drift for buffers that outlive their poll.
 file-backed pages — useful for a process holding many small per-session DBs. WAL
 caveat: mmap covers reads of the main DB file; writes still go through the WAL.
 
+## Per-message allocation on the group stanza build
+
+**Read the scope before the numbers.** These come from
+`wacore/benches/send_receive_benchmark.rs`, whose `run_group_send` calls
+`prepare_group_stanza` and marshals the resulting node — and nothing else. The
+client send path around it (group lookup, retry caching, sender-key cache
+access, `resolve_skdm_targets_memoized`, persistence-adapter construction, the
+send itself; `src/send/mod.rs`) is not in the measured region. A whole-client
+per-message profile is a strictly larger quantity and these figures cannot be
+subtracted from one or compared against one.
+
+Measured with `divan::AllocProfiler` installed as the global allocator
+(temporarily — see below), 50 samples per bench, pinned to one core. Divan
+tallies only the benchmarked closure, so the fixtures' setup is excluded; the
+identical counts across group sizes confirm that.
+
+| stanza build | allocations | bytes |
+| --- | ---: | ---: |
+| `bench_dm_send` | 157 | 27.9 KB |
+| `bench_group_send_10` (no distribution) | **22** | **3.58 KB** |
+| `bench_group_send_50` (no distribution) | **22** | **3.58 KB** |
+| `bench_group_send_256` (no distribution) | **22** | **3.58 KB** |
+| `bench_group_send_skdm_256` (distributing, first message) | 6,816 | 675.1 KB |
+
+**The result that holds regardless of scope: a group send that distributes no
+sender key is flat in group size.** 22 allocations and 3.58 KB whether the group
+has 10 members or 256, because the stanza carries one `<enc type="skmsg">` for
+everyone and nothing per recipient (pinned by
+`warm_group_send_encoding_scale` in `wacore/src/send/tests.rs`). The DM figure
+is higher because a DM pairwise-encrypts once per recipient device; the group
+path is cheaper per message precisely because sender keys exist.
+
+**What the distributing row is, precisely.** It is *not* X3DH:
+`setup_group_send` calls `establish_session` for every member before forcing
+distribution, so `ensure_sessions_for_devices` finds each session present and
+never reaches the prekey-fetch branch. A cold fixture with genuinely missing
+sessions would cost more, and nothing here measures that.
+
+It is also not the shape a *later* redistribution takes. `establish_session`
+runs `process_prekey_bundle` alone — unlike `establish_bidirectional`, it never
+completes the round trip — so every session still carries its `pending_pre_key`
+and each SKDM encryption emits a `pkmsg`, with first-message prekey wrapping and
+device-identity serialization attached. So 6,816 is the **first-message fan-out
+at 256 targets**, ~26.6 allocations each. A forced rotation or reset over
+acknowledged sessions emits plain `SignalMessage`s and is cheaper; that number
+is unmeasured here.
+
+Note "targets", not members: `setup_group_send(n)` creates exactly one device
+per member, while SKDM fan-out scales with *resolved devices*. A real group
+resolves to more devices than members, so member counts cannot be substituted
+into these figures without that topology.
+
+### What this does not settle
+
+An external profile of a client reported 387 allocations per group message at
+128 members. These numbers neither reproduce nor refute it, and the earlier
+revision of this section was wrong to present them as doing so:
+
+- **Different scope.** 387 came from a full client send; 22 is stanza build plus
+  marshal. The missing work is real and unmeasured.
+- **Different configuration.** The no-distribution fixture has no own companion
+  device. On a linked account, own devices are *never* memoized warm — see the
+  comment at `src/send/mod.rs` in the `initial_targets` match, which spells out
+  that own-only SKDM needs **is** the warm steady state. Such a send carries a
+  nonempty `distribution_list` on every message and *does* call
+  `ensure_sessions_for_devices`. So the 22 figure is specifically the
+  zero-own-target case, and "a warm send never touches session setup" is false
+  for the ordinary multi-device account.
+- **The amortization arithmetic does not land on 387 either.** Scaling the
+  measured row down to 128 *targets* gives ~3.4K; one of those plus nine
+  22-allocation sends averages ~360, not 387. And the external figure is quoted
+  in group *members*, whose device count is not stated — a 128-member group
+  resolves to more than 128 targets. The shape is suggestive; the decomposition
+  is not claimable from here.
+
+`send::encrypt::ensure_sessions_for_devices` is worth naming because a profile
+points at it: it is reached only through the `distribution_list` branch, so a
+send with no SKDM targets skips it entirely — but as above, an account with a
+companion device has targets on every send.
+
+One correction to make in passing, because the earlier revision got it backwards:
+`resolve_skdm_targets_memoized` does **not** govern how often sender keys are
+redistributed. It memoizes device-set *resolution*, skipping the per-member
+registry fan-out on a repeat send. Which devices still need the key is decided by
+`filter_skdm_targets` against the `SenderKeyDeviceMap`
+(`device_and_primary_warm`). That map is the state to look at for redistribution
+frequency; the memo is a lookup cache in front of a different question.
+
+To re-measure, add the allocator to the bench temporarily rather than
+committing it:
+
+```rust
+#[global_allocator]
+static ALLOC: divan::AllocProfiler = divan::AllocProfiler::system();
+```
+
+It is deliberately *not* checked in for `send_receive_benchmark`. Swapping the
+global allocator changes the timing of every bench in that file, which would
+put a one-time step through each of their CodSpeed series for a number that is
+only wanted occasionally. `voip_benchmark.rs` and `prekey_store_benchmark.rs`
+do carry it, because there the allocation churn is the thing under test.
+
 ## Fixed process cost vs per-session cost
 
 A process that runs one session pays far more than a process that runs ten
