@@ -67,6 +67,43 @@ their own `whatsapp-rust` dependency, and Cargo feature unification activates it
 for the consumer. See [`agent_docs/plugin_architecture.md`](agent_docs/plugin_architecture.md)
 for the host contract and type-safe API example.
 
+### Codegen flags
+
+The crate sets no `target-feature`, because a published library cannot know
+which CPU it will run on and such a flag has no runtime fallback. A binary built
+with one dies with `SIGILL` on hardware that lacks the feature — and not
+necessarily at startup: `-C target-feature` emits no GNU ISA-needed property, so
+this configuration gives you no guaranteed load-time check, and it traps
+whenever execution first reaches an emitted instruction, which can be well into
+serving traffic. A clean startup is not a compatibility check.
+
+An application that *does* control its deployment target can take about a fifth
+of the per-message instruction count on the Signal paths by setting it itself:
+
+```toml
+# <your app>/.cargo/config.toml
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-Ctarget-feature=+bmi2,+avx2"]   # append to what this key holds
+```
+
+Cargo takes rustflags from exactly one source — `CARGO_ENCODED_RUSTFLAGS`, then
+`RUSTFLAGS`, then `target.<triple>.rustflags`, then `build.rustflags` — and they
+never combine, so setting `RUSTFLAGS` for any reason discards the entry above.
+
+Confirm every deployment target reports both features first, by feature check
+rather than by the CPU's year or its product name: the Silvermont, Goldmont,
+Jaguar and Puma cores have neither (Goldmont and Puma are outright later than
+Haswell), while other parts sold under the same Atom/Celeron/Pentium names do
+have both. Use an OS-filtered report such as `/proc/cpuinfo` — AVX2 also needs
+the OS to have enabled YMM state, which a raw CPUID feature bit does not tell
+you. The build machine needs both features too unless you pass an explicit
+`--target`, since without one cargo applies these flags to build scripts and
+proc macros as well.
+
+Measurements per flag, the CPU floor each one raises, why `+adx` and
+`-Ctarget-cpu=native` are not worth taking, and the `wasm32` equivalent are in
+[`agent_docs/build_flags.md`](agent_docs/build_flags.md).
+
 ### One dependency is enough
 
 `whatsapp-rust` re-exports the whole stack, so you never need to declare the sibling crates (`wacore`, `wacore-binary`, `waproto`, `whatsapp-rust-tokio-transport`, `whatsapp-rust-ureq-http-client`, `whatsapp-rust-sqlite-storage`) yourself, including when pinning a git revision:
