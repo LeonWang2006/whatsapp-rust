@@ -21,7 +21,7 @@ must follow.
 - **No PII.** Snapshots and reports carry numbers only, never JIDs/phone
   numbers, matching the `wacore::telemetry` label rules.
 
-## The three surfaces
+## The four surfaces
 
 ### 1. `Client::stats()` — wire I/O counters (always on)
 
@@ -104,7 +104,61 @@ resource teardown panics, publication failures, and queue drops mark only the
 responsible plugin as degraded. Concurrent snapshots are intentionally
 approximate, and carry no message content, JIDs, or phone numbers.
 
-### 3. `BotBuilder::with_task_instrument` — CPU / custom attribution (opt-in)
+### 3. `Client::device_memo_stats()` — group-path memo outcomes (always on)
+
+`DeviceMemoStats`: per-term hit/miss counts for the two device-list memos a
+group send depends on, `resolve_group_devices_memoized` and
+`resolve_skdm_targets_memoized`. Cumulative for the client's lifetime;
+`DeviceMemoStats::since` subtracts an earlier snapshot to scope a workload.
+
+The reason it is per-term rather than a hit/miss pair: the group memo has three
+validity terms (entry present, `GroupInfo` `Arc` identity, topology generation
+— with a scoped re-stamp between the last two) and the SKDM memo has four stale
+terms (device `Arc`, sender-key-map `Arc`, map generation, sending identity)
+plus the entry-absent condition, which is why it reports five miss counters. An
+aggregate "N misses" cannot separate an in-place cold flip from a metadata
+refresh from a memo that was never stored, and those have different fixes. It
+also cannot separate cause from consequence: the SKDM memo compares the `Arc`
+that the group memo returned, so **a group-memo recompute forces
+`skdm_targets.miss_devices` no matter what**. Read the group half first.
+
+Two counters do not fit the "one per call" shape and are documented as such:
+`restamps` (served like a hit, but paid the `unchanged_for` scan first) and
+`not_stored` (a resolution whose target set was neither empty nor
+own-devices-only, so nothing was memoized). `not_stored` guarantees the next
+call **cannot hit** — not that it reports `miss_absent`. A stale entry that was
+already there is deliberately left in place, because it can never become valid
+again (the sender-key map generation only moves forward, the map `Arc` is
+replaced wholesale on a rebuild, and the device-set `Weak` keeps the old
+allocation alive so no `ptr::eq` can spuriously match), so the next call
+reports whichever term is still failing. Reading a run of `not_stored` as
+eviction pressure is therefore the wrong conclusion: it means the group is not
+settling into the warm steady state at all.
+
+Every other SKDM outcome is exactly one per call, including `resolve_failed`,
+which covers the calls that never reached a memo term because the device
+resolution they depend on errored. Without it `hit_rate()` would look healthy
+over a denominator that quietly shrank as sends started failing.
+
+Why always-on rather than `#[cfg(test)]` like `dm_devices_memo_recomputes`: a
+test counter answers the question in a fixture, and the question here is what a
+*deployed* client gets — an embedder whose registry writes are noisier than any
+fixture's would have no way to see its own hit rate. It costs one indexed
+relaxed `fetch_add` per resolver call, twice per group send. Measured against
+the tightest thing the counters sit inside (SKDM target resolution on the
+memo-hit path, callgrind, min of 3, K=10001 so the fixture's setup jitter
+divides away): **+16 Ir per resolve at 8 members, +25 at 512**, against 4,419
+and 4,408 without them. At whole-send scale it is under the fixture's own
+run-to-run spread.
+
+Record the outcome **on the branch that decided it**. An earlier revision
+classified into an enum and then matched on it again to act; that second
+dispatch, plus moving the SKDM memo entry (a five-field tuple carrying a `Jid`
+and a `Vec<Jid>`) into a temporary to classify it, cost 126 Ir per resolve
+instead of 16. A counter meant to be free on the hit path has to be written
+that way.
+
+### 4. `BotBuilder::with_task_instrument` — CPU / custom attribution (opt-in)
 
 `wacore::stats::TaskInstrument` is an object-safe enter/exit hook called
 around every poll of the client's internal tasks and around its blocking
