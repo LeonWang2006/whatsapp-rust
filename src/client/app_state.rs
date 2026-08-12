@@ -404,6 +404,81 @@ impl BatchedSyncOutcome {
     pub(crate) fn all_synced(&self) -> bool {
         self.unsynced().next().is_none()
     }
+
+    /// Everything the batch asked for, reported as retryable.
+    ///
+    /// Deliberately imprecise: a batch can fail after a collection was already
+    /// applied, and the `?` on the inner call takes the partial outcome with it,
+    /// so nothing downstream can tell which of them landed. Over-reporting costs
+    /// an incremental re-sync that resumes from the persisted version, which is
+    /// what the retry scheduler already spends on a global failure. Silence
+    /// costs more, because next to a `Connected` it reads as a clean startup on
+    /// a session that may have no push name.
+    pub(crate) fn all_retryable(requested: &[WAPatchName]) -> Self {
+        Self {
+            retryable: requested.to_vec(),
+            ..Default::default()
+        }
+    }
+}
+
+/// What the critical bootstrap does with the answer its batched sync produced.
+///
+/// Pure, and deliberately apart from the I/O that carries it out: the decision
+/// used to live inside a detached post-login task with a socket behind it, which
+/// is why nothing tested it and why two of its four branches left an
+/// authenticated, no-longer-passive connection announced to nobody.
+///
+/// Every answer announces. A connection that has left passive mode is already
+/// delivering stanzas, so withholding [`Event::Connected`] hides a working
+/// session rather than protecting anyone from it; what did not sync is reported
+/// and retried instead.
+#[derive(Debug)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
+pub(crate) struct CriticalSyncPlan {
+    /// Collections to hand to the background sync that follows the bootstrap.
+    pub(crate) retry: Vec<WAPatchName>,
+    /// Something the bootstrap owes is not in `retry` and never will be, so a
+    /// later clean round must not stand the gate down on its behalf.
+    pub(crate) stranded: bool,
+}
+
+impl CriticalSyncPlan {
+    /// The plan for a batch that ran to an outcome.
+    pub(crate) fn from_outcome(outcome: &BatchedSyncOutcome) -> Self {
+        // Destructured rather than read field by field: a bucket added to
+        // `BatchedSyncOutcome` breaks this line, which is the only place that
+        // decides what a bucket costs the bootstrap.
+        //
+        // `reached_server` is read and deliberately changes nothing. How far the
+        // attempt got is already reflected in which bucket each collection
+        // landed in, and a round that sent no IQ leaves those collections in
+        // `retry` exactly like one that did.
+        let BatchedSyncOutcome {
+            synced: _,
+            fatal,
+            retryable,
+            skipped,
+            reached_server: _,
+        } = outcome;
+        // A refusal is not retried, since the same request gets the same
+        // answer, but the batch's other misses are no less recoverable for it
+        // having happened, and the watchdog is no longer there to ask again.
+        let retry: Vec<WAPatchName> = retryable.iter().chain(skipped).copied().collect();
+        Self {
+            retry,
+            stranded: !fatal.is_empty(),
+        }
+    }
+
+    /// Whether the bootstrap still owes work, which is also what makes the
+    /// outcome worth publishing: a consumer needs to hear about a sync that left
+    /// a gap, and about nothing else.
+    ///
+    /// Derived rather than stored so the two can never disagree.
+    pub(crate) fn outstanding(&self) -> bool {
+        self.stranded || !self.retry.is_empty()
+    }
 }
 
 /// In-flight dedup registry for app-state collection syncs.
@@ -1207,6 +1282,77 @@ impl Client {
         } else {
             debug!(target: "Client/AppState", "Initial App State Sync completed.");
         }
+    }
+
+    /// Whether `scope`'s connection is still the live one, ignoring its deadline.
+    ///
+    /// Distinct from [`admits`](Self::admits), which the bootstrap cannot use
+    /// past the sync itself: the critical scope carries the watchdog's deadline,
+    /// and running out of it is not a reason to withhold what the connection has
+    /// already earned.
+    fn scope_is_current(&self, scope: SyncScope) -> bool {
+        self.admits(scope) != Err(ScopeLost::Retired)
+    }
+
+    /// Announce a connection whose critical bootstrap has an answer, and report
+    /// what the answer left unsynced.
+    ///
+    /// Returns whether the generation survived, which is not the same question as
+    /// whether `Connected` went out: [`dispatch_connected`](Self::dispatch_connected)
+    /// also declines for a paused or lifecycle-cancelled connection, and this
+    /// still returns true for those. Deliberately, because the caller uses the
+    /// answer to decide whether to hand the leftovers to the background sync, and
+    /// a pause is precisely when that work must survive: the sync parks until the
+    /// client resumes rather than being dropped. The report stays honest either
+    /// way, since its `connected` flag is read from `is_ready`, which only the
+    /// publication sets.
+    pub(crate) async fn finish_critical_bootstrap(
+        self: &Arc<Self>,
+        scope: SyncScope,
+        plan: &CriticalSyncPlan,
+        outcome: &BatchedSyncOutcome,
+    ) -> bool {
+        // Armed first, before anything a consumer handler can interrupt.
+        // Everything below (resubscribe, `Connected`, the failure report) can
+        // retire this generation and take the decision with it, leaving the gate
+        // clear with the push name already populated so the replacement connection
+        // skips what it still owes. Clearing is never done here: on the happy path
+        // the bootstrap still owes the non-critical collections, and the background
+        // sync that fetches them is what stands the gate down.
+        if plan.outstanding() {
+            self.settle_bootstrap(scope, true);
+        }
+        if !self.scope_is_current(scope) {
+            return false;
+        }
+        self.resubscribe_presence_subscriptions(scope.generation)
+            .await;
+        if !self.scope_is_current(scope) {
+            return false;
+        }
+        // Presence is NOT sent here. WhatsApp Web sends presence from the
+        // setting_pushName mutation handler (WAWebPushNameSync), not from
+        // criticalSyncDone. Our setting_pushName handler already does this.
+        //
+        // Whether the connection is still worth announcing is asked inside, at
+        // the point of publication, and not duplicated here: this scope check
+        // sits on the near side of a lifecycle readiness hook it would be
+        // answering across.
+        self.dispatch_connected(scope.generation).await;
+        // After the readiness transition, not before: the report claims the
+        // session is usable, and until `Connected` is actually published that
+        // claim can still be falsified by a disconnect during the resubscribe
+        // above. Re-checked once more because publishing runs consumer handlers,
+        // and one of them disconnecting would retire this generation between the
+        // two dispatches, long enough to hand the next session a failure it never
+        // earned.
+        if !self.scope_is_current(scope) {
+            return false;
+        }
+        if plan.outstanding() {
+            self.dispatch_app_state_sync_failed(outcome, self.is_ready.load(Ordering::Relaxed));
+        }
+        true
     }
 
     /// Report an incomplete batched sync to consumers.
@@ -5218,5 +5364,530 @@ mod batched_attempt_tests {
         };
         sent.note_reached_server();
         assert!(sent.reached_server());
+    }
+}
+
+#[cfg(test)]
+mod critical_bootstrap_tests {
+    use super::batched_sync_outcome_tests::batch_result;
+    use super::*;
+    use crate::types::events::{EventHandler, EventInterest, EventKind};
+
+    /// Retires the connection from inside the `Connected` handler, the way a
+    /// consumer that disconnects the moment it connects does.
+    struct RetireOnConnected(Arc<AtomicU64>);
+
+    impl EventHandler for RetireOnConnected {
+        fn handle_event(&self, event: Arc<Event>) {
+            if matches!(&*event, Event::Connected(_)) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        fn interest(&self) -> EventInterest {
+            EventInterest::of(&[EventKind::Connected])
+        }
+    }
+
+    #[derive(Default)]
+    struct BootstrapRecorder {
+        connected: AtomicU64,
+        /// The `connected` flag of every `AppStateSyncFailed`, in order.
+        failures: std::sync::Mutex<Vec<bool>>,
+    }
+
+    impl EventHandler for BootstrapRecorder {
+        fn handle_event(&self, event: Arc<Event>) {
+            match &*event {
+                Event::Connected(_) => {
+                    self.connected.fetch_add(1, Ordering::Relaxed);
+                }
+                Event::AppStateSyncFailed(failed) => self
+                    .failures
+                    .lock()
+                    .expect("recorded failures mutex")
+                    .push(failed.connected),
+                _ => {}
+            }
+        }
+
+        fn interest(&self) -> EventInterest {
+            EventInterest::of(&[EventKind::Connected, EventKind::AppStateSyncFailed])
+        }
+    }
+
+    /// A client with a recorder attached, holding the subscription alive.
+    ///
+    /// Reachable, because the bootstrap only announces a connection that still
+    /// is: a fixture that skipped the flags would have passed no matter what the
+    /// announce guard asked.
+    async fn recording_client(
+        name: &str,
+    ) -> (
+        Arc<Client>,
+        Arc<BootstrapRecorder>,
+        crate::types::events::Subscription,
+    ) {
+        let client = crate::test_utils::create_test_client_with_name(name).await;
+        client.is_running.store(true, Ordering::Relaxed);
+        client.set_connected_for_test(true);
+        client.is_logged_in.store(true, Ordering::Relaxed);
+        client.authenticated_generation.store(
+            client.connection_generation.load(Ordering::SeqCst),
+            Ordering::SeqCst,
+        );
+        assert!(
+            client.can_reach_server(),
+            "the fixture itself is announceable"
+        );
+        let recorder = Arc::new(BootstrapRecorder::default());
+        let subscription = client.subscribe(recorder.interest(), Arc::clone(&recorder) as _);
+        (client, recorder, subscription)
+    }
+
+    fn outcome(
+        synced: &[WAPatchName],
+        fatal: &[WAPatchName],
+        retryable: &[WAPatchName],
+        skipped: &[WAPatchName],
+        reached_server: bool,
+    ) -> BatchedSyncOutcome {
+        BatchedSyncOutcome {
+            synced: synced.to_vec(),
+            fatal: fatal.to_vec(),
+            retryable: retryable.to_vec(),
+            skipped: skipped.to_vec(),
+            reached_server,
+        }
+    }
+
+    struct Case {
+        what: &'static str,
+        outcome: BatchedSyncOutcome,
+        expected: CriticalSyncPlan,
+    }
+
+    fn plan(retry: &[WAPatchName], stranded: bool) -> CriticalSyncPlan {
+        CriticalSyncPlan {
+            retry: retry.to_vec(),
+            stranded,
+        }
+    }
+
+    /// Every shape a batched sync can come back in, and what each one costs the
+    /// bootstrap. The buckets are the whole surface, so a bucket added to
+    /// `BatchedSyncOutcome` without a decision fails to compile in
+    /// `CriticalSyncPlan::from_outcome` before it reaches this table. A third
+    /// collection appears where all three buckets have to be non-empty at once,
+    /// which two names cannot express.
+    fn cases() -> Vec<Case> {
+        use WAPatchName::{CriticalBlock as CB, CriticalUnblockLow as CUL, Regular};
+        vec![
+            Case {
+                what: "everything synced",
+                outcome: outcome(&[CB, CUL], &[], &[], &[], true),
+                expected: plan(&[], false),
+            },
+            Case {
+                what: "one collection refused",
+                outcome: outcome(&[CUL], &[CB], &[], &[], true),
+                expected: plan(&[], true),
+            },
+            Case {
+                what: "one collection retryable",
+                outcome: outcome(&[CUL], &[], &[CB], &[], true),
+                expected: plan(&[CB], false),
+            },
+            Case {
+                what: "one collection held by another writer",
+                outcome: outcome(&[CUL], &[], &[], &[CB], true),
+                expected: plan(&[CB], false),
+            },
+            Case {
+                what: "refused alongside a retryable",
+                outcome: outcome(&[], &[CB], &[CUL], &[], true),
+                expected: plan(&[CUL], true),
+            },
+            Case {
+                what: "refused alongside a held one",
+                outcome: outcome(&[], &[CB], &[], &[CUL], true),
+                expected: plan(&[CUL], true),
+            },
+            Case {
+                what: "retryable alongside a held one",
+                outcome: outcome(&[], &[], &[CB], &[CUL], true),
+                expected: plan(&[CB, CUL], false),
+            },
+            Case {
+                what: "every bucket at once",
+                outcome: outcome(&[], &[CB], &[CUL], &[Regular], true),
+                expected: plan(&[CUL, Regular], true),
+            },
+            Case {
+                what: "nothing reached the server",
+                outcome: outcome(&[], &[], &[], &[CB, CUL], false),
+                expected: plan(&[CB, CUL], false),
+            },
+        ]
+    }
+
+    /// The invariant the bootstrap owes a connection that has already left
+    /// passive mode: whatever the sync came back with, the session is announced.
+    /// Two of these shapes used to return in silence with the socket still
+    /// delivering stanzas.
+    #[tokio::test]
+    async fn every_sync_outcome_announces_the_connection() {
+        for (index, case) in cases().into_iter().enumerate() {
+            let (client, recorder, _subscription) =
+                recording_client(&format!("critical-plan-{index}")).await;
+            let scope = client.sync_scope(None);
+
+            let plan = CriticalSyncPlan::from_outcome(&case.outcome);
+            assert_eq!(plan, case.expected, "plan for {}", case.what);
+
+            assert!(
+                client
+                    .finish_critical_bootstrap(scope, &plan, &case.outcome)
+                    .await,
+                "the generation is live for {}",
+                case.what
+            );
+
+            assert_eq!(
+                recorder.connected.load(Ordering::Relaxed),
+                1,
+                "{} must still announce the connection",
+                case.what
+            );
+            assert_eq!(
+                recorder
+                    .failures
+                    .lock()
+                    .expect("recorded failures mutex")
+                    .as_slice(),
+                if plan.outstanding() {
+                    [true].as_slice()
+                } else {
+                    &[]
+                },
+                "failure report for {}",
+                case.what
+            );
+            assert_eq!(
+                client.needs_initial_full_sync.is_armed(),
+                plan.outstanding(),
+                "bootstrap gate for {}",
+                case.what
+            );
+        }
+    }
+
+    /// A batch that blew up before producing buckets still has to say so.
+    /// Announcing without the report would read as a clean startup to a consumer
+    /// whose session may be missing the push name and the blocklist.
+    #[tokio::test]
+    async fn a_failed_batch_reports_everything_it_asked_for() {
+        let requested = [WAPatchName::CriticalBlock, WAPatchName::CriticalUnblockLow];
+        let synthesized = BatchedSyncOutcome::all_retryable(&requested);
+        assert_eq!(synthesized.retryable, requested);
+        assert!(
+            !synthesized.reached_server(),
+            "a batch that failed outright must not charge an attempt"
+        );
+
+        let plan = CriticalSyncPlan::from_outcome(&synthesized);
+        assert_eq!(plan, self::plan(&requested, false));
+
+        let (client, recorder, _subscription) = recording_client("critical-plan-error").await;
+        let scope = client.sync_scope(None);
+        assert!(
+            client
+                .finish_critical_bootstrap(scope, &plan, &synthesized)
+                .await
+        );
+
+        assert_eq!(recorder.connected.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            recorder
+                .failures
+                .lock()
+                .expect("recorded failures mutex")
+                .as_slice(),
+            [true].as_slice(),
+            "the gap has to reach the consumer, not just the log"
+        );
+        assert!(client.needs_initial_full_sync.is_armed());
+    }
+
+    /// The symptom: a fresh pairing whose critical sync came back retryable left
+    /// the consumer with no connection event at all, while the socket, already
+    /// out of passive mode, kept delivering stanzas. The outcome here comes
+    /// from a server answering the real collection IQ with a 500.
+    #[tokio::test]
+    async fn a_retryable_critical_sync_still_announces_the_connection() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        client.is_logged_in.store(true, Ordering::Relaxed);
+        client.authenticated_generation.store(
+            client.connection_generation.load(Ordering::SeqCst),
+            Ordering::SeqCst,
+        );
+        let recorder = Arc::new(BootstrapRecorder::default());
+        let _subscription = client.subscribe(recorder.interest(), Arc::clone(&recorder) as _);
+
+        let scope = client.sync_scope(None);
+        let mut sync = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                client
+                    .sync_collections_batched(
+                        vec![WAPatchName::CriticalBlock, WAPatchName::CriticalUnblockLow],
+                        scope,
+                    )
+                    .await
+            })
+        };
+
+        let server = async {
+            let mut frame = 0usize;
+            loop {
+                let node = crate::test_utils::decode_sent_iq(&transport, frame).await;
+                let node = node.get().to_owned();
+                let id = node
+                    .attrs()
+                    .optional_string("id")
+                    .expect("every IQ carries an id")
+                    .into_owned();
+                let response = batch_result(
+                    &id,
+                    &[
+                        ("critical_block", Some("500")),
+                        ("critical_unblock_low", Some("500")),
+                    ],
+                );
+                crate::test_utils::answer_iq(&client, &id, &response).await;
+                frame += 1;
+            }
+        };
+        futures::pin_mut!(server);
+        let outcome = {
+            use futures::FutureExt;
+            futures::select! {
+                result = (&mut sync).fuse() => result
+                    .expect("the sync task should not panic")
+                    .expect("a per-collection error is an outcome, not a transport failure"),
+                () = server.as_mut().fuse() => unreachable!("the responder never completes"),
+            }
+        };
+        assert_eq!(
+            outcome.retryable,
+            vec![WAPatchName::CriticalBlock, WAPatchName::CriticalUnblockLow],
+            "a 500 is retryable, which is the shape that used to stay silent"
+        );
+
+        let plan = CriticalSyncPlan::from_outcome(&outcome);
+        assert!(
+            client
+                .finish_critical_bootstrap(scope, &plan, &outcome)
+                .await
+        );
+
+        assert_eq!(
+            recorder.connected.load(Ordering::Relaxed),
+            1,
+            "the connection must be announced even though the sync did not close"
+        );
+        assert_eq!(
+            recorder
+                .failures
+                .lock()
+                .expect("recorded failures mutex")
+                .as_slice(),
+            [true].as_slice(),
+            "and reported as degraded-but-usable, not as still-retrying"
+        );
+    }
+
+    /// A `Connected` from a dead connection is worse than none: the consumer
+    /// would mark itself open on a socket that is already gone.
+    #[tokio::test]
+    async fn a_retired_generation_announces_nothing() {
+        let (client, recorder, _subscription) = recording_client("critical-plan-retired").await;
+        let scope = client.sync_scope(None);
+        let stranded = outcome(&[], &[], &[WAPatchName::CriticalBlock], &[], true);
+        let plan = CriticalSyncPlan::from_outcome(&stranded);
+
+        client
+            .connection_generation
+            .store(scope.generation() + 1, Ordering::SeqCst);
+
+        assert!(
+            !client
+                .finish_critical_bootstrap(scope, &plan, &stranded)
+                .await,
+            "the caller must be told to stop"
+        );
+        assert_eq!(recorder.connected.load(Ordering::Relaxed), 0);
+        assert!(
+            recorder
+                .failures
+                .lock()
+                .expect("recorded failures mutex")
+                .is_empty()
+        );
+        assert!(
+            !client.needs_initial_full_sync.is_armed(),
+            "and it must not touch a gate that now belongs to the replacement"
+        );
+    }
+
+    /// The bootstrap is not finished when the critical collections land: the
+    /// non-critical ones are still owed, and the background sync that fetches
+    /// them is what stands the gate down. Clearing it here would let a reconnect
+    /// in that window skip the rest of the initial sync.
+    #[tokio::test]
+    async fn a_clean_critical_sync_leaves_the_gate_to_the_background_sync() {
+        let (client, _recorder, _subscription) = recording_client("critical-plan-clean").await;
+        client
+            .needs_initial_full_sync
+            .arm_for_pairing(client.connection_generation.load(Ordering::SeqCst));
+        let scope = client.sync_scope(None);
+
+        let clean = outcome(
+            &[WAPatchName::CriticalBlock, WAPatchName::CriticalUnblockLow],
+            &[],
+            &[],
+            &[],
+            true,
+        );
+        let plan = CriticalSyncPlan::from_outcome(&clean);
+        assert!(client.finish_critical_bootstrap(scope, &plan, &clean).await);
+
+        assert!(
+            client.needs_initial_full_sync.is_armed(),
+            "the critical half closing is not the bootstrap closing"
+        );
+    }
+
+    /// A 429 or 503 clears `is_logged_in` inline and falls through without
+    /// retiring the connection, so the generation check alone still admits it.
+    /// Announcing there would set `is_ready` on a session the client has already
+    /// stopped treating as authenticated, and the reconnect that follows is what
+    /// gets to announce. The gap is still reported and still retried, because
+    /// the collections are no less owed for the socket having gone bad.
+    #[tokio::test]
+    async fn a_de_authenticated_connection_announces_nothing() {
+        let (client, recorder, _subscription) = recording_client("critical-plan-429").await;
+        let scope = client.sync_scope(None);
+        let stalled = outcome(&[], &[], &[WAPatchName::CriticalBlock], &[], true);
+        let plan = CriticalSyncPlan::from_outcome(&stalled);
+
+        // Exactly what `handle_stream_error` does for 429 and 503.
+        client.is_logged_in.store(false, Ordering::Relaxed);
+
+        assert!(
+            client
+                .finish_critical_bootstrap(scope, &plan, &stalled)
+                .await,
+            "the generation is intact, so the leftovers still go to the background sync"
+        );
+        assert_eq!(
+            recorder.connected.load(Ordering::Relaxed),
+            0,
+            "an unauthenticated session must not be announced"
+        );
+        assert_eq!(
+            recorder
+                .failures
+                .lock()
+                .expect("recorded failures mutex")
+                .as_slice(),
+            [false].as_slice(),
+            "and the report has to say the connection never happened"
+        );
+        assert!(client.needs_initial_full_sync.is_armed());
+    }
+
+    /// A pause does not retire the generation, so the bootstrap runs to the end
+    /// on a connection the application has just asked to have closed. It must
+    /// not announce that, and it must still hand the leftovers over: the sync
+    /// parks on `await_connection` and picks them up after the resume, which is
+    /// the whole reason the return value tracks retirement rather than
+    /// publication.
+    #[tokio::test]
+    async fn a_paused_connection_announces_nothing_but_keeps_its_retries() {
+        let (client, recorder, _subscription) = recording_client("critical-plan-paused").await;
+        let scope = client.sync_scope(None);
+        let stalled = outcome(&[], &[], &[WAPatchName::CriticalBlock], &[], true);
+        let plan = CriticalSyncPlan::from_outcome(&stalled);
+
+        client.pause().await;
+        assert_eq!(
+            client.sync_scope(None).generation(),
+            scope.generation(),
+            "a pause must not retire the generation, or this proves nothing"
+        );
+
+        assert!(
+            client
+                .finish_critical_bootstrap(scope, &plan, &stalled)
+                .await,
+            "the leftovers still belong to the background sync"
+        );
+        assert_eq!(
+            recorder.connected.load(Ordering::Relaxed),
+            0,
+            "a session being taken offline must not be announced"
+        );
+        assert_eq!(
+            recorder
+                .failures
+                .lock()
+                .expect("recorded failures mutex")
+                .as_slice(),
+            [false].as_slice()
+        );
+        assert!(client.needs_initial_full_sync.is_armed());
+    }
+
+    /// Publishing runs consumer handlers synchronously, so one that disconnects
+    /// retires the generation between the announcement and the report. The
+    /// report is deliberately withheld there rather than published to whatever
+    /// took the connection's place: a consumer's documented response to a
+    /// refusal is to log out or force a recovery, and that would land on the
+    /// wrong session. Nothing is lost, because the gate was armed before the
+    /// announcement and the replacement connection runs the bootstrap again.
+    #[tokio::test]
+    async fn a_handler_that_disconnects_takes_the_report_with_it() {
+        let (client, recorder, _subscription) = recording_client("critical-plan-reentrant").await;
+        let retire = Arc::new(RetireOnConnected(Arc::clone(&client.connection_generation)));
+        let _retire_subscription = client.subscribe(retire.interest(), retire as _);
+
+        let scope = client.sync_scope(None);
+        let stalled = outcome(&[], &[], &[WAPatchName::CriticalBlock], &[], true);
+        let plan = CriticalSyncPlan::from_outcome(&stalled);
+
+        assert!(
+            !client
+                .finish_critical_bootstrap(scope, &plan, &stalled)
+                .await,
+            "the caller must not start background work for a retired connection"
+        );
+        assert_eq!(
+            recorder.connected.load(Ordering::Relaxed),
+            1,
+            "the announcement is what ran the handler"
+        );
+        assert!(
+            recorder
+                .failures
+                .lock()
+                .expect("recorded failures mutex")
+                .is_empty(),
+            "the outcome belongs to a connection that no longer exists"
+        );
+        assert!(
+            client.needs_initial_full_sync.is_armed(),
+            "and the replacement inherits the work through the gate"
+        );
     }
 }
