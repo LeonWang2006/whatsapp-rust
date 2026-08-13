@@ -5,7 +5,7 @@
 //! when the struct is dropped.
 
 use hashbrown::hash_map::Entry;
-use hashbrown::{Equivalent, HashMap as HbHashMap};
+use hashbrown::{Equivalent, HashMap as HbHashMap, HashSet as HbHashSet};
 use std::collections::HashMap;
 use std::collections::hash_map::RandomState;
 use std::hash::Hash;
@@ -67,6 +67,42 @@ impl Equivalent<MsgSecretKey> for MsgSecretKeyRef<'_> {
 
 type MsgSecretMap = HbHashMap<MsgSecretKey, MsgSecretRow, RandomState>;
 
+/// One logical secret, ignoring which sender alias a row was filed under.
+/// Eviction groups by this so a message's aliases are kept or dropped together.
+///
+/// Only `msg_id` is hashed. A stanza id already names one message across the
+/// account, so mixing `chat` into the hash buys no selectivity and doubles the
+/// string hashing on a path that runs over every row of the cutoff's tie
+/// bucket. `chat` still decides equality, so a collision stays correct.
+#[derive(Eq, PartialEq)]
+struct MsgGroupKey {
+    chat: Arc<str>,
+    msg_id: Arc<str>,
+}
+
+impl Hash for MsgGroupKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.msg_id.hash(state);
+    }
+}
+
+struct MsgGroupKeyRef<'a> {
+    chat: &'a str,
+    msg_id: &'a str,
+}
+
+impl Hash for MsgGroupKeyRef<'_> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.msg_id.hash(state);
+    }
+}
+
+impl Equivalent<MsgGroupKey> for MsgGroupKeyRef<'_> {
+    fn equivalent(&self, key: &MsgGroupKey) -> bool {
+        self.chat == key.chat.as_ref() && self.msg_id == key.msg_id.as_ref()
+    }
+}
+
 /// Inner state protected by the mutex.
 #[derive(Default)]
 struct InMemoryState {
@@ -102,6 +138,10 @@ struct InMemoryState {
     /// `expires_at = 0` means never expire; `message_ts = 0` means the parent
     /// event time is unknown. The keepalive cleanup prunes expired rows.
     msg_secrets: MsgSecretMap,
+    /// Map length at which `trim_msg_secrets` is next allowed to do its O(n)
+    /// evictable-row scan. Purely an optimisation: a stale value can only cause
+    /// an extra scan, never a missed eviction.
+    msg_secrets_rescan_at: usize,
 
     // --- Device ---
     device: Option<Device>,
@@ -113,6 +153,24 @@ struct InMemoryState {
 /// `CacheConfig::sent_message_ttl_secs`, the single source of truth for the
 /// time window); this cap only guards against a burst between sweeps.
 const MAX_SENT_MESSAGES: usize = 4096;
+
+/// Hard cap on retained message secrets, the `msg_secrets` counterpart of
+/// [`MAX_SENT_MESSAGES`] and there for the same reason: time-based pruning
+/// (`delete_expired_msg_secrets`, driven by the client's keepalive sweep)
+/// cannot reclaim anything inside a session, because the default `Managed`
+/// policy dates every row 30-90 days out. Without a cap the map is one row per
+/// message for the life of the process.
+///
+/// That is a footprint bug specifically on wasm32, where the allocator never
+/// returns pages: the table doubles by reallocation, so the old and the new
+/// table are briefly live together, and the ~1.5x spike stays committed in
+/// linear memory even after the rows are dropped. A 30k-message session
+/// reallocated this table to 4.56 MiB (65536 buckets x 73 B) and committed
+/// ~7 MiB it never gave back.
+///
+/// Sized at 2x [`MAX_SENT_MESSAGES`] and 2x the client's message-secret
+/// write-behind high-water mark, so a burst that fills both still fits.
+const MAX_MSG_SECRETS: usize = 8192;
 
 /// In-memory implementation of the full [`Backend`] trait.
 ///
@@ -985,33 +1043,82 @@ impl ProtocolStore for InMemoryBackend {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl MsgSecretStore for InMemoryBackend {
-    async fn put_msg_secrets(&self, entries: Vec<MsgSecretEntry>) -> Result<usize> {
+    async fn put_msg_secrets(&self, mut entries: Vec<MsgSecretEntry>) -> Result<usize> {
         use crate::store::traits::{merge_msg_secret_expiry, merge_msg_secret_message_ts};
         let stored = entries.len();
+        // Only a batch long enough to be chunked below can have a chunk boundary
+        // fall inside a message, and only then does the order matter. Sorting
+        // groups a message's sender alias rows together so the boundary check
+        // can see them: the client's write-behind buffer snapshots its pending
+        // set from a `HashMap`, so the aliases it queued back to back reach the
+        // store scattered. In place, so this costs no allocation on the one
+        // path -- a history-sync seed -- that is ever long enough to reach it.
+        if stored > MAX_MSG_SECRETS / 4 {
+            entries.sort_unstable_by(|a, b| {
+                (a.chat.as_ref(), a.msg_id.as_ref()).cmp(&(b.chat.as_ref(), b.msg_id.as_ref()))
+            });
+        }
         let mut state = self.state.lock().await;
         // Initial history batches are overwhelmingly new rows, so reserve
         // once. Once populated, a batch may be mostly overwrites; reserving its
         // full length then would grow the table without adding any rows.
+        // Clamped to the cap: a seed batch larger than it would otherwise size
+        // the table for rows this store is about to evict anyway.
         if state.msg_secrets.is_empty() {
-            state.msg_secrets.reserve(stored);
+            state.msg_secrets.reserve(stored.min(MAX_MSG_SECRETS));
         }
-        for entry in entries {
-            let key = MsgSecretKey {
-                chat: entry.chat,
-                sender: entry.sender,
-                msg_id: entry.msg_id,
-            };
-            match state.msg_secrets.entry(key) {
-                Entry::Occupied(mut occupied) => {
-                    let (secret, expires_at, message_ts) = occupied.get_mut();
-                    *secret = entry.secret;
-                    *expires_at = merge_msg_secret_expiry(*expires_at, entry.expires_at);
-                    *message_ts = merge_msg_secret_message_ts(*message_ts, entry.message_ts);
+        // Evict between chunks rather than once at the end. A batch bigger than
+        // the cap -- a history-sync seed goes straight to the backend, skipping
+        // the write-behind buffer's own high-water mark -- would otherwise be
+        // inserted whole, and by the time the eviction ran the table would
+        // already have doubled past the bound. `retain` frees rows but not the
+        // allocation, and on wasm32 that allocation is never returned, so the
+        // footprint bound has to hold going up, not just coming down.
+        let mut entries = entries.into_iter().peekable();
+        loop {
+            let mut inserted = 0usize;
+            while let Some(entry) = entries.next() {
+                inserted += 1;
+                // The chunk boundary must not fall between a message's sender
+                // alias rows. Eviction runs as soon as the chunk closes, and it
+                // would see the first alias with the second not yet inserted --
+                // free to drop the one it can see, after which the other lands
+                // and survives alone. That is the identity-dependent decryption
+                // failure the grouping in `trim_msg_secrets` exists to prevent,
+                // reintroduced one level up. The sort above put a message's rows
+                // next to each other, so holding the chunk open while the next
+                // entry names the same message is enough.
+                let boundary_group = (inserted >= MAX_MSG_SECRETS / 4)
+                    .then(|| (Arc::clone(&entry.chat), Arc::clone(&entry.msg_id)));
+                let key = MsgSecretKey {
+                    chat: entry.chat,
+                    sender: entry.sender,
+                    msg_id: entry.msg_id,
+                };
+                match state.msg_secrets.entry(key) {
+                    Entry::Occupied(mut occupied) => {
+                        let (secret, expires_at, message_ts) = occupied.get_mut();
+                        *secret = entry.secret;
+                        *expires_at = merge_msg_secret_expiry(*expires_at, entry.expires_at);
+                        *message_ts = merge_msg_secret_message_ts(*message_ts, entry.message_ts);
+                    }
+                    Entry::Vacant(vacant) => {
+                        vacant.insert((entry.secret, entry.expires_at, entry.message_ts));
+                    }
                 }
-                Entry::Vacant(vacant) => {
-                    vacant.insert((entry.secret, entry.expires_at, entry.message_ts));
+                if let Some((chat, msg_id)) = boundary_group
+                    && !entries
+                        .peek()
+                        .is_some_and(|next| next.chat == chat && next.msg_id == msg_id)
+                {
+                    break;
                 }
             }
+            if inserted == 0 {
+                break;
+            }
+            let state = &mut *state;
+            trim_msg_secrets(&mut state.msg_secrets, &mut state.msg_secrets_rescan_at);
         }
         Ok(stored)
     }
@@ -1211,6 +1318,147 @@ impl DeviceStore for InMemoryBackend {
             ..Default::default()
         }
     }
+}
+
+/// Drop the soonest-to-expire secrets once the map exceeds
+/// [`MAX_MSG_SECRETS`], down to 3/4 of the cap so the scan amortizes across
+/// many inserts (same shape as `store_sent_message`'s eviction).
+///
+/// Ordering by `expires_at` rather than by insertion evicts the row closest to
+/// being pruned anyway, which also keeps the longer horizons: a poll/event
+/// secret (90 days) outlives a text secret (30 days) of the same age.
+///
+/// Rows with no deadline are what `MsgSecretPolicy::Full` writes, and its
+/// documented contract is unbounded retention, so they are never candidates.
+/// A store holding nothing but those still grows without bound -- that is the
+/// policy the caller asked for.
+///
+/// For the same reason the cap is measured against the evictable rows alone,
+/// not the map length. Counting the never-expire rows toward it would make a
+/// store that holds many of them (a backend reused across a `Full` -> `Managed`
+/// switch) evict every finite row it has and still not reach the bound.
+///
+/// # Where the alias grouping stops
+///
+/// A message's sender alias rows are kept together at the cutoff, which is
+/// where an arbitrary choice would otherwise be made. Rows *below* the cutoff
+/// go individually. Those two rows are separate keys, so nothing merges their
+/// deadlines, and a write that dated one of them differently -- a later capture
+/// under another retention class -- can leave a pair straddling the cutoff and
+/// split it.
+///
+/// That gap is deliberate. Closing it means grouping every evictable row, not
+/// just the cutoff's tie bucket, and the index that needs costs about 1.0 MiB
+/// of committed linear memory on wasm32 and roughly half again the eviction's
+/// CPU (measured, 30k sends: 5.88 -> 6.88 MiB). Linear memory is never returned
+/// there, so the fix permanently spends an eighth of what this cap is here to
+/// reclaim, against a split that needs one message's aliases to be written at
+/// different times under different classes. If that trade ever stops holding --
+/// a producer that routinely dates aliases apart -- the group index is the
+/// answer, and it belongs in the eviction, not in another guard above it.
+fn trim_msg_secrets(map: &mut MsgSecretMap, rescan_at: &mut usize) {
+    // Evictable rows are a subset of the map, so this O(1) test is a sound
+    // early-out for the O(n) one below and keeps the common insert allocation-
+    // free.
+    //
+    // `rescan_at` is the second guard, and it is what keeps a `Full`-policy
+    // store off the O(n) path. There `map.len()` sits above the cap forever
+    // while nothing is ever evictable, so the length test alone would scan the
+    // whole map on every single write -- O(n) per insert, O(n^2) over a
+    // session, all under the state lock.
+    if map.len() <= MAX_MSG_SECRETS || map.len() < *rescan_at {
+        return;
+    }
+    // Only the deadlines are collected: cloning every key to sort them would
+    // allocate three `Arc<str>` bumps per retained row on each eviction while
+    // holding the state lock. `select_nth_unstable` finds the cutoff in O(n)
+    // without ordering the rest.
+    let mut deadlines: Vec<i64> = map
+        .values()
+        .filter(|(_, expires_at, _)| *expires_at != 0)
+        .map(|(_, expires_at, _)| *expires_at)
+        .collect();
+    if deadlines.len() <= MAX_MSG_SECRETS {
+        // Nothing to evict yet. Every row added between now and the next scan
+        // adds at most one evictable row, so the cap cannot be reached before
+        // that many more arrive -- exact, not a heuristic.
+        *rescan_at = map.len() + (MAX_MSG_SECRETS - deadlines.len()) + 1;
+        return;
+    }
+    *rescan_at = 0;
+    let drop_count = deadlines.len() - MAX_MSG_SECRETS * 3 / 4;
+    let (_, &mut cutoff, _) = deadlines.select_nth_unstable(drop_count - 1);
+    // Two passes apply the cutoff, because map iteration order is arbitrary and
+    // a single pass could evict a row AT the cutoff while keeping one below it.
+    // `cutoff` is never 0, so the never-expire rows stay out of both passes.
+    let mut removed = 0usize;
+    map.retain(|_, (_, expires_at, _)| {
+        if *expires_at != 0 && *expires_at < cutoff {
+            removed += 1;
+            false
+        } else {
+            true
+        }
+    });
+    let mut remaining = drop_count.saturating_sub(removed);
+    if remaining == 0 {
+        return;
+    }
+    // The rows sitting exactly on the cutoff. One message can own two of them:
+    // history seeding and inbound bot capture persist a secret under two sender
+    // aliases (`MAX_HISTORY_SECRET_SENDERS`), and those rows carry the same
+    // deadline because it is derived from the same parent event. The pair
+    // exists so a lookup succeeds under either identity, so dropping an
+    // arbitrary subset of the bucket -- keeping one alias, losing the other --
+    // would make decryption depend on which identity the later stanza happens
+    // to carry. Choose whole messages instead of whole rows.
+    //
+    // Each group is counted in full before anything is committed to. Charging
+    // the budget per visited row instead would undercount every group whose
+    // partner iteration had not reached yet -- and since a message's two rows
+    // hash independently, most of them -- so a 2049-row budget could remove
+    // close to 4098 rows and leave the store at half the target. That is not a
+    // bound being overshot, it is thousands of retainable secrets thrown away.
+    let mut bucket: HbHashMap<MsgGroupKey, usize, RandomState> = HbHashMap::default();
+    for (key, (_, expires_at, _)) in map.iter() {
+        if *expires_at != cutoff {
+            continue;
+        }
+        if let Some(rows) = bucket.get_mut(&MsgGroupKeyRef {
+            chat: &key.chat,
+            msg_id: &key.msg_id,
+        }) {
+            *rows += 1;
+        } else {
+            bucket.insert(
+                MsgGroupKey {
+                    chat: Arc::clone(&key.chat),
+                    msg_id: Arc::clone(&key.msg_id),
+                },
+                1,
+            );
+        }
+    }
+    // Skipping a group that does not fit rather than stopping outright lets a
+    // smaller one still use the remainder. Falling a row or two short of the
+    // target is fine: the next insert re-enters through the length guard.
+    let mut doomed: HbHashSet<MsgGroupKey, RandomState> = HbHashSet::default();
+    for (group, rows) in bucket {
+        if remaining == 0 {
+            break;
+        }
+        if rows <= remaining {
+            remaining -= rows;
+            doomed.insert(group);
+        }
+    }
+    map.retain(|key, (_, expires_at, _)| {
+        *expires_at != cutoff
+            || !doomed.contains(&MsgGroupKeyRef {
+                chat: &key.chat,
+                msg_id: &key.msg_id,
+            })
+    });
 }
 
 /// Bytes a hash table's single allocation occupies. hashbrown reserves a
@@ -1777,6 +2025,384 @@ mod tests {
                 .await
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    /// The cap is a footprint bound, so what it must guarantee is that a
+    /// session sending far more messages than the cap never grows the table
+    /// past it -- on wasm32 the doubling realloc commits linear memory that is
+    /// never returned.
+    #[tokio::test]
+    async fn msg_secrets_stay_bounded_and_evict_soonest_deadline_first() {
+        let backend = InMemoryBackend::new();
+        let chat: wacore_binary::Jid = "1@s.whatsapp.net".parse().unwrap();
+        let now = crate::time::now_secs();
+
+        // 4x the cap, each row dated further out than the last.
+        let total = MAX_MSG_SECRETS * 4;
+        for i in 0..total {
+            backend
+                .put_msg_secrets(vec![MsgSecretEntry::new(
+                    &chat,
+                    &chat,
+                    &format!("m{i:07}"),
+                    [1u8; crate::reporting_token::MESSAGE_SECRET_SIZE],
+                    now + i as i64,
+                    now,
+                )])
+                .await
+                .unwrap();
+            assert!(
+                backend.state.lock().await.msg_secrets.len() <= MAX_MSG_SECRETS,
+                "msg_secrets exceeded the cap at insert {i}"
+            );
+        }
+
+        // The survivors are the latest deadlines, i.e. the most recent sends.
+        let len = backend.state.lock().await.msg_secrets.len();
+        assert!(len > MAX_MSG_SECRETS * 3 / 4 - 1 && len <= MAX_MSG_SECRETS);
+        assert!(
+            backend
+                .get_msg_secret(
+                    &chat.to_string(),
+                    &chat.to_string(),
+                    &format!("m{:07}", total - 1)
+                )
+                .await
+                .unwrap()
+                .is_some(),
+            "newest row must survive"
+        );
+        assert!(
+            backend
+                .get_msg_secret(&chat.to_string(), &chat.to_string(), "m0000000")
+                .await
+                .unwrap()
+                .is_none(),
+            "oldest deadline must be evicted first"
+        );
+    }
+
+    /// A history-sync seed reaches `put_msg_secrets` as one oversized batch.
+    /// Trimming only after the whole batch landed would bound the row count but
+    /// not the table, and on wasm32 that allocation is never returned -- so what
+    /// this asserts is the allocation, not the length: one big batch must cost
+    /// no more table than the same rows trickling in one at a time.
+    #[tokio::test]
+    async fn one_oversized_msg_secret_batch_costs_no_more_table_than_trickling() {
+        let chat: wacore_binary::Jid = "1@s.whatsapp.net".parse().unwrap();
+        let now = crate::time::now_secs();
+        let total = MAX_MSG_SECRETS * 4;
+        let row = |i: usize| {
+            MsgSecretEntry::new(
+                &chat,
+                &chat,
+                &format!("m{i:07}"),
+                [1u8; crate::reporting_token::MESSAGE_SECRET_SIZE],
+                now + i as i64,
+                now,
+            )
+        };
+
+        let batched = InMemoryBackend::new();
+        batched
+            .put_msg_secrets((0..total).map(row).collect())
+            .await
+            .unwrap();
+
+        let trickled = InMemoryBackend::new();
+        for i in 0..total {
+            trickled.put_msg_secrets(vec![row(i)]).await.unwrap();
+        }
+
+        let batched_capacity = batched.state.lock().await.msg_secrets.capacity();
+        let trickled_capacity = trickled.state.lock().await.msg_secrets.capacity();
+        assert!(
+            batched_capacity <= trickled_capacity,
+            "an oversized batch grew the table past the bound: \
+             batched {batched_capacity} > trickled {trickled_capacity}"
+        );
+        assert!(batched.state.lock().await.msg_secrets.len() <= MAX_MSG_SECRETS);
+    }
+
+    /// History seeding and inbound bot capture file one secret under two sender
+    /// aliases, and both rows carry the same deadline because it comes from the
+    /// same parent event. Every row here shares one deadline, so the whole map
+    /// is the cutoff's tie bucket -- the case where eviction picks an arbitrary
+    /// subset. A surviving half-pair would make decryption depend on which
+    /// identity the later stanza carries, so each message must be all or none.
+    #[tokio::test]
+    async fn msg_secret_eviction_keeps_a_message_s_sender_aliases_together() {
+        let backend = InMemoryBackend::new();
+        let chat: wacore_binary::Jid = "1@s.whatsapp.net".parse().unwrap();
+        let alias_a: wacore_binary::Jid = "2@s.whatsapp.net".parse().unwrap();
+        let alias_b: wacore_binary::Jid = "3@lid".parse().unwrap();
+        let now = crate::time::now_secs();
+        let deadline = now + 30 * 86_400;
+
+        let total = MAX_MSG_SECRETS * 2;
+        // The low-water mark right after an eviction, which is what says
+        // whether the budget was overcharged. The length at the end of the run
+        // is not: it lands anywhere in the oscillation between evictions.
+        let mut low_water = usize::MAX;
+        let mut evicted_once = false;
+        let mut previous_len = 0usize;
+        for i in 0..total {
+            let id = format!("m{i:07}");
+            // Both aliases of one message land in the same batch, exactly as
+            // the history seed collector emits them.
+            backend
+                .put_msg_secrets(
+                    [&alias_a, &alias_b]
+                        .into_iter()
+                        .map(|sender| {
+                            MsgSecretEntry::new(
+                                &chat,
+                                sender,
+                                &id,
+                                [1u8; crate::reporting_token::MESSAGE_SECRET_SIZE],
+                                deadline,
+                                now,
+                            )
+                        })
+                        .collect(),
+                )
+                .await
+                .unwrap();
+            let len = backend.state.lock().await.msg_secrets.len();
+            assert!(
+                len <= MAX_MSG_SECRETS,
+                "msg_secrets exceeded the cap after message {i}"
+            );
+            // A drop in length is the only proof trimming actually ran.
+            // Reaching the cap is not: a multi-alias batch that stopped being
+            // trimmed at all would sail past it and still satisfy every other
+            // assertion here.
+            if len < previous_len {
+                evicted_once = true;
+                low_water = low_water.min(len);
+            }
+            previous_len = len;
+        }
+        assert!(evicted_once, "eviction never ran");
+
+        let c = chat.to_string();
+        let (a, b) = (alias_a.to_string(), alias_b.to_string());
+        let mut pairs = 0usize;
+        for i in 0..total {
+            let id = format!("m{i:07}");
+            let got_a = backend.get_msg_secret(&c, &a, &id).await.unwrap().is_some();
+            let got_b = backend.get_msg_secret(&c, &b, &id).await.unwrap().is_some();
+            assert_eq!(
+                got_a, got_b,
+                "message {i} kept one sender alias but not the other"
+            );
+            pairs += usize::from(got_a);
+        }
+        assert!(pairs > 0, "eviction removed every message");
+        // And the budget must be charged per group, not per row visited. Every
+        // group here holds two rows, so undercounting them would evict about
+        // twice the intended number and leave the store near half the target.
+        assert!(
+            low_water >= MAX_MSG_SECRETS * 3 / 4,
+            "eviction overshot: dropped to {low_water} rows, target is {}",
+            MAX_MSG_SECRETS * 3 / 4
+        );
+    }
+
+    /// The same alias invariant, but across the insertion chunk boundary rather
+    /// than the eviction cutoff. One oversized batch is split into fixed-size
+    /// chunks with an eviction after each, so a boundary landing between a
+    /// message's two rows would let the first be evicted before the second is
+    /// even inserted. Every row shares a deadline so eviction has to choose, and
+    /// every third message carries a single alias so the pairs fall out of step
+    /// with the chunk size instead of aligning to it.
+    #[tokio::test]
+    async fn msg_secret_chunking_does_not_split_alias_groups() {
+        let backend = InMemoryBackend::new();
+        let chat: wacore_binary::Jid = "1@s.whatsapp.net".parse().unwrap();
+        let alias_a: wacore_binary::Jid = "2@s.whatsapp.net".parse().unwrap();
+        let alias_b: wacore_binary::Jid = "3@lid".parse().unwrap();
+        let now = crate::time::now_secs();
+        let deadline = now + 30 * 86_400;
+
+        let total = MAX_MSG_SECRETS * 3;
+        let mut batch = Vec::new();
+        for i in 0..total {
+            let id = format!("m{i:07}");
+            // Message 0 contributes a single row. That one-row offset puts every
+            // pair on an odd boundary, so every fixed-size chunk boundary lands
+            // between a message's two rows rather than between messages.
+            let senders: &[&wacore_binary::Jid] = if i == 0 {
+                &[&alias_a]
+            } else {
+                &[&alias_a, &alias_b]
+            };
+            for sender in senders {
+                batch.push(MsgSecretEntry::new(
+                    &chat,
+                    sender,
+                    &id,
+                    [1u8; crate::reporting_token::MESSAGE_SECRET_SIZE],
+                    // Deadlines fall as the batch goes on, so the row sitting on
+                    // a chunk boundary is always among the soonest to expire and
+                    // is evicted by the very next trim -- deterministically,
+                    // rather than depending on where the cutoff's tie bucket
+                    // happens to be walked.
+                    deadline - i as i64,
+                    now,
+                ));
+            }
+        }
+        backend.put_msg_secrets(batch).await.unwrap();
+
+        let c = chat.to_string();
+        let (a, b) = (alias_a.to_string(), alias_b.to_string());
+        let mut survivors = 0usize;
+        for i in 0..total {
+            if i == 0 {
+                continue;
+            }
+            let id = format!("m{i:07}");
+            let got_a = backend.get_msg_secret(&c, &a, &id).await.unwrap().is_some();
+            let got_b = backend.get_msg_secret(&c, &b, &id).await.unwrap().is_some();
+            assert_eq!(
+                got_a, got_b,
+                "message {i} kept one sender alias but not the other"
+            );
+            survivors += usize::from(got_a);
+        }
+        assert!(survivors > 0, "eviction removed every paired message");
+        assert!(
+            backend.state.lock().await.msg_secrets.len() <= MAX_MSG_SECRETS,
+            "the oversized batch escaped the cap"
+        );
+    }
+
+    /// The write-behind buffer snapshots its pending set from a `HashMap`, so
+    /// the aliases the inbound capture queued back to back reach the store in
+    /// arbitrary order. Worst case of that: every first alias, then every
+    /// second. Chunking must still not evict one half of a message before the
+    /// other half has been inserted.
+    #[tokio::test]
+    async fn msg_secret_chunking_groups_aliases_that_arrive_scattered() {
+        let backend = InMemoryBackend::new();
+        let chat: wacore_binary::Jid = "1@s.whatsapp.net".parse().unwrap();
+        let alias_a: wacore_binary::Jid = "2@s.whatsapp.net".parse().unwrap();
+        let alias_b: wacore_binary::Jid = "3@lid".parse().unwrap();
+        let now = crate::time::now_secs();
+        let deadline = now + 30 * 86_400;
+
+        let total = MAX_MSG_SECRETS * 3;
+        let row = |i: usize, sender: &wacore_binary::Jid| {
+            MsgSecretEntry::new(
+                &chat,
+                sender,
+                &format!("m{i:07}"),
+                [1u8; crate::reporting_token::MESSAGE_SECRET_SIZE],
+                deadline - i as i64,
+                now,
+            )
+        };
+        let mut batch: Vec<_> = (0..total).map(|i| row(i, &alias_a)).collect();
+        batch.extend((0..total).map(|i| row(i, &alias_b)));
+        backend.put_msg_secrets(batch).await.unwrap();
+
+        let c = chat.to_string();
+        let (a, b) = (alias_a.to_string(), alias_b.to_string());
+        let mut survivors = 0usize;
+        for i in 0..total {
+            let id = format!("m{i:07}");
+            let got_a = backend.get_msg_secret(&c, &a, &id).await.unwrap().is_some();
+            let got_b = backend.get_msg_secret(&c, &b, &id).await.unwrap().is_some();
+            assert_eq!(
+                got_a, got_b,
+                "message {i} kept one sender alias but not the other"
+            );
+            survivors += usize::from(got_a);
+        }
+        assert!(survivors > 0, "eviction removed every message");
+        assert!(
+            backend.state.lock().await.msg_secrets.len() <= MAX_MSG_SECRETS,
+            "the scattered batch escaped the cap"
+        );
+    }
+
+    /// A backend reused across a `Full` -> `Managed` switch holds enough
+    /// never-expire rows to exceed the cap on their own. Measuring the cap
+    /// against the map length there would evict every finite row and still not
+    /// reach the bound, so the managed secrets have to survive.
+    #[tokio::test]
+    async fn msg_secrets_cap_does_not_wipe_finite_rows_behind_permanent_ones() {
+        let backend = InMemoryBackend::new();
+        let chat: wacore_binary::Jid = "1@s.whatsapp.net".parse().unwrap();
+        let c = chat.to_string();
+        let now = crate::time::now_secs();
+        let put = async |id: String, expires_at: i64| {
+            backend
+                .put_msg_secrets(vec![MsgSecretEntry::new(
+                    &chat,
+                    &chat,
+                    &id,
+                    [1u8; crate::reporting_token::MESSAGE_SECRET_SIZE],
+                    expires_at,
+                    now,
+                )])
+                .await
+                .unwrap();
+        };
+
+        // Permanent rows alone already exceed the cap.
+        for i in 0..MAX_MSG_SECRETS + 1000 {
+            put(format!("perm{i:07}"), 0).await;
+        }
+        for i in 0..100 {
+            put(format!("fin{i:07}"), now + 1 + i as i64).await;
+        }
+
+        for i in 0..100 {
+            assert!(
+                backend
+                    .get_msg_secret(&c, &c, &format!("fin{i:07}"))
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "finite row {i} was evicted to make room for un-evictable rows"
+            );
+        }
+    }
+
+    /// `MsgSecretPolicy::Full` writes `expires_at = 0` and promises unbounded
+    /// retention, so the cap must not touch those rows.
+    #[tokio::test]
+    async fn msg_secrets_cap_never_evicts_never_expire_rows() {
+        let backend = InMemoryBackend::new();
+        let chat: wacore_binary::Jid = "1@s.whatsapp.net".parse().unwrap();
+        let c = chat.to_string();
+
+        let total = MAX_MSG_SECRETS * 2;
+        for i in 0..total {
+            backend
+                .put_msg_secrets(vec![MsgSecretEntry::new(
+                    &chat,
+                    &chat,
+                    &format!("m{i:07}"),
+                    [1u8; crate::reporting_token::MESSAGE_SECRET_SIZE],
+                    0,
+                    0,
+                )])
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(backend.state.lock().await.msg_secrets.len(), total);
+        assert!(
+            backend
+                .get_msg_secret(&c, &c, "m0000000")
+                .await
+                .unwrap()
+                .is_some(),
+            "a never-expire row is not an eviction candidate"
         );
     }
 
