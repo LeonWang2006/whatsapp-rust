@@ -25,6 +25,7 @@ use wacore::stanza::group_call::{
     GroupInviteOfferParams, InitialGroupOfferParams, build_group_invite_offer,
     build_initial_group_offer, parse_initial_group_call_ack,
 };
+use wacore::stats::UnkeyableDevice;
 use wacore::types::call::{CallAction, IncomingCall, VideoState};
 use wacore::types::group_call::{
     CallLinkMedia, GROUP_CALL_MAX_PARTICIPANTS, GROUP_CALL_MAX_REMOTE_PARTICIPANTS,
@@ -1486,6 +1487,12 @@ async fn fanout_group_epoch_for_generation(
         encrypted
     };
     let encrypted = encrypted?;
+    // This path asserts sessions upstream instead of establishing them, so
+    // nothing else has counted a device the fan-out could not encrypt for.
+    // Recorded before the checks below, which can return early.
+    client
+        .stats
+        .record_unkeyable_devices(UnkeyableDevice::Encrypt, encrypted.unkeyed_at_encrypt);
     ensure_group_rekey_generation(client, &update.call_id, generation)?;
     let device_identity = wacore::send::needs_device_identity(
         encrypted.includes_prekey_message,
@@ -1665,6 +1672,11 @@ async fn place_call(
         )
         .await
         .map_err(|e| CallError::Setup(e.to_string()))?;
+        // Before the persist below, which can bail with `?`: the devices this
+        // fan-out dropped are dropped whether or not the offer goes out.
+        client
+            .stats
+            .record_unkeyable_devices(UnkeyableDevice::Encrypt, raw.unkeyed_at_encrypt);
         drop(_session_guards);
         client
             .persist_signal_state_pre_wire()
@@ -5969,6 +5981,9 @@ mod tests {
             includes_prekey_message: false,
             had_unregistered_device: false,
             rejected_devices: Vec::new(),
+            // One of the two recipients has no ciphertext, which is the drop
+            // this fixture is about.
+            unkeyed_at_encrypt: 1,
         };
 
         assert!(matches!(

@@ -32,6 +32,84 @@ use crate::sync_marker::MaybeSendSync;
 
 // ── Wire/session counters ────────────────────────────────────────────────────
 
+/// Why one attempt to obtain key material for a device failed.
+///
+/// Usually that device is then dropped and the send continues to the rest,
+/// which is the intended behavior (WA Web catches the same failure and carries
+/// on) and is why a participant stuck on "Waiting for this message" was only
+/// ever visible in a log line.
+///
+/// **Counted per attempt, not per delivered stanza.** A failure that aborts the
+/// send outright — a batch-wide `406`, a `Required` distribution that cannot
+/// reach all its targets — is counted too, and a later retry that fails the
+/// same way counts again. The question these answer is how often keying fails,
+/// which a counter that skipped the abort paths would answer worst exactly when
+/// keying is failing most.
+///
+/// The variants are disjoint: a device the server named is recorded as
+/// [`Rejected`](Self::Rejected) and never also as [`NoBundle`](Self::NoBundle).
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnkeyableDevice {
+    /// The prekey fetch came back without a bundle for it and without naming
+    /// it, so nothing says whether the device is gone or the server was
+    /// merely unhelpful this round.
+    NoBundle,
+    /// A bundle did come back, but building the Signal session from it failed.
+    SessionSetup,
+    /// The local session store could not answer whether a session exists, which
+    /// abandons the whole fan-out before any device is keyed. Shares
+    /// [`SessionSetup`](Self::SessionSetup)'s snapshot counter — both are the
+    /// session phase failing to produce a session — and keeps its own label,
+    /// because this one is a local storage fault and points nowhere near the
+    /// peer.
+    SessionLookup,
+    /// The server refused this device by name, with the `<error code>` it
+    /// attached. `406` means unregistered and is the only code acted on.
+    Rejected(u16),
+    /// The server refused the whole prekey batch this device was in (always a
+    /// `406`; the fetch is one IQ). Kept apart from [`Rejected`](Self::Rejected)
+    /// because that one is a fact about the device and this one is an
+    /// attribution: the refusal names nobody, so a registered device can sit in
+    /// a batch that is counted this way.
+    BatchRefused,
+    /// The prekey fetch produced no answer at all — a timeout, a transport
+    /// failure, or a server error that is not a refusal of these devices (429,
+    /// 5xx). Separate from [`BatchRefused`](Self::BatchRefused) because that one
+    /// says something about the devices and this one says the server never got
+    /// around to saying anything.
+    FetchFailed,
+    /// The encrypt fan-out itself could not produce ciphertext for the device:
+    /// a stored session that exists and cannot be used, or a fan-out task that
+    /// died with its whole chunk. A device that reached the fan-out with no
+    /// session is *not* counted here — [`SessionSetup`](Self::SessionSetup) or
+    /// one of the fetch reasons already owns it.
+    Encrypt,
+}
+
+impl UnkeyableDevice {
+    /// Categorical label for the `metrics` facade.
+    ///
+    /// A closed set of `&'static str`: the server's code is bucketed by class
+    /// rather than formatted, so an unfamiliar code stays countable without
+    /// minting a label (or an allocation) per value. `406` keeps its own label
+    /// because it is the one code with a defined meaning here.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NoBundle => "no_bundle",
+            Self::SessionSetup => "session_setup",
+            Self::SessionLookup => "session_lookup",
+            Self::Rejected(code) if code == crate::send::UNREGISTERED_DEVICE_CODE => "rejected_406",
+            Self::Rejected(400..=499) => "rejected_4xx",
+            Self::Rejected(500..=599) => "rejected_5xx",
+            Self::Rejected(_) => "rejected_other",
+            Self::BatchRefused => "refused_batch",
+            Self::FetchFailed => "fetch_failed",
+            Self::Encrypt => "encrypt",
+        }
+    }
+}
+
 /// Cumulative per-session counters, updated at the client's wire chokepoints.
 ///
 /// All counters are monotonic over the lifetime of the owning client (they
@@ -49,6 +127,13 @@ pub struct SessionStats {
     /// full (opt-in `EventDelivery::Ordered`). Non-zero means a slow consumer is
     /// shedding events; the durability hook is the at-least-once escape hatch.
     events_dropped: AtomicU64,
+    /// Attempts to obtain key material for one device that failed, split by
+    /// [`UnkeyableDevice`].
+    devices_unkeyed_no_bundle: AtomicU64,
+    devices_unkeyed_session_setup: AtomicU64,
+    devices_unkeyed_rejected: AtomicU64,
+    devices_unkeyed_fetch_failed: AtomicU64,
+    devices_unkeyed_encrypt: AtomicU64,
     reconnects: AtomicU64,
     /// Timestamp (ms since UNIX epoch) of the last received WebSocket data.
     /// WA Web: `parseAndHandleStanza` → `deadSocketTimer.cancel()`.
@@ -88,6 +173,27 @@ pub struct StatsSnapshot {
     /// Inbound events shed because a consumer's bounded delivery mailbox was
     /// full. A non-zero, growing value flags a consumer that can't keep up.
     pub events_dropped: u64,
+    /// Keying attempts that asked the server about a device and got no bundle
+    /// for it, with no per-device reason given.
+    pub devices_unkeyed_no_bundle: u64,
+    /// Keying attempts the session phase could not give a session to: the local
+    /// store would not answer, or a bundle arrived and building from it failed.
+    /// The `metrics` facade separates the two.
+    pub devices_unkeyed_session_setup: u64,
+    /// Keying attempts the server refused, whether it named the device or
+    /// refused the whole batch. `stats()` carries the total; the split by code,
+    /// and between named and batch-wide, is on the `metrics` facade, which has
+    /// labels.
+    pub devices_unkeyed_rejected: u64,
+    /// Keying attempts whose prekey fetch never produced an answer: a timeout,
+    /// a transport failure, or a server error that refuses nothing in
+    /// particular. This is the one that moves during an outage.
+    pub devices_unkeyed_fetch_failed: u64,
+    /// Keying attempts that had a session and still produced no ciphertext.
+    /// Alone among these, this one is not about the server: a non-zero
+    /// value points at stored session state, which is what session repair
+    /// operates on.
+    pub devices_unkeyed_encrypt: u64,
     /// Reconnect attempts started by the auto-reconnect loop.
     pub reconnects: u64,
     /// Consecutive reconnect failures (resets on success).
@@ -96,6 +202,19 @@ pub struct StatsSnapshot {
     /// chats.
     pub resends_throttled: u64,
     pub last_data_received_ms: u64,
+}
+
+impl StatsSnapshot {
+    /// Every keying attempt this client lost, whatever the reason. A rising
+    /// value is participants going quiet; the individual fields say why. See
+    /// [`UnkeyableDevice`] for what one count is and is not.
+    pub fn devices_unkeyed_total(&self) -> u64 {
+        self.devices_unkeyed_no_bundle
+            + self.devices_unkeyed_session_setup
+            + self.devices_unkeyed_rejected
+            + self.devices_unkeyed_fetch_failed
+            + self.devices_unkeyed_encrypt
+    }
 }
 
 impl SessionStats {
@@ -193,6 +312,41 @@ impl SessionStats {
         self.events_dropped.load(Ordering::Relaxed)
     }
 
+    /// One failed attempt to obtain key material for a device.
+    #[inline]
+    pub fn record_unkeyable_device(&self, reason: UnkeyableDevice) {
+        self.record_unkeyable_devices(reason, 1);
+    }
+
+    /// `count` devices left without key material for the same reason, which is
+    /// what a batch-wide refusal produces.
+    ///
+    /// The metrics emission rides here rather than at the call sites so the
+    /// per-client total and the labelled process-global counter can never
+    /// disagree about what happened.
+    #[inline]
+    pub fn record_unkeyable_devices(&self, reason: UnkeyableDevice, count: u64) {
+        // Callers that pass a tally rather than a known-nonzero event get the
+        // "nothing went wrong" case for free, without an atomic or a metrics
+        // lookup.
+        if count == 0 {
+            return;
+        }
+        let counter = match reason {
+            UnkeyableDevice::NoBundle => &self.devices_unkeyed_no_bundle,
+            UnkeyableDevice::SessionSetup | UnkeyableDevice::SessionLookup => {
+                &self.devices_unkeyed_session_setup
+            }
+            UnkeyableDevice::Rejected(_) | UnkeyableDevice::BatchRefused => {
+                &self.devices_unkeyed_rejected
+            }
+            UnkeyableDevice::FetchFailed => &self.devices_unkeyed_fetch_failed,
+            UnkeyableDevice::Encrypt => &self.devices_unkeyed_encrypt,
+        };
+        counter.fetch_add(count, Ordering::Relaxed);
+        crate::telemetry::unkeyable_device(reason.label(), count);
+    }
+
     /// Zero the activity timestamps on connection teardown so the dead-socket
     /// watchdog never reads a previous connection's values. Traffic counters
     /// are cumulative and survive.
@@ -227,6 +381,13 @@ impl SessionStats {
             messages_sent: self.messages_sent.load(Ordering::Relaxed),
             messages_received: self.messages_received.load(Ordering::Relaxed),
             events_dropped: self.events_dropped.load(Ordering::Relaxed),
+            devices_unkeyed_no_bundle: self.devices_unkeyed_no_bundle.load(Ordering::Relaxed),
+            devices_unkeyed_session_setup: self
+                .devices_unkeyed_session_setup
+                .load(Ordering::Relaxed),
+            devices_unkeyed_rejected: self.devices_unkeyed_rejected.load(Ordering::Relaxed),
+            devices_unkeyed_fetch_failed: self.devices_unkeyed_fetch_failed.load(Ordering::Relaxed),
+            devices_unkeyed_encrypt: self.devices_unkeyed_encrypt.load(Ordering::Relaxed),
             reconnects: self.reconnects.load(Ordering::Relaxed),
             reconnect_errors: 0,
             resends_throttled: 0,
@@ -795,6 +956,66 @@ mod tests {
         assert_eq!(snap.reconnects, 1);
         assert_eq!(snap.events_dropped, 2);
         assert!(snap.last_data_received_ms > 0);
+    }
+
+    #[test]
+    fn unkeyable_devices_land_in_the_snapshot_split_by_reason() {
+        let stats = SessionStats::new();
+        stats.record_unkeyable_device(UnkeyableDevice::NoBundle);
+        stats.record_unkeyable_device(UnkeyableDevice::SessionSetup);
+        stats.record_unkeyable_devices(UnkeyableDevice::Rejected(406), 4);
+        stats.record_unkeyable_device(UnkeyableDevice::Rejected(503));
+        stats.record_unkeyable_devices(UnkeyableDevice::BatchRefused, 2);
+        stats.record_unkeyable_devices(UnkeyableDevice::FetchFailed, 3);
+        stats.record_unkeyable_device(UnkeyableDevice::Encrypt);
+        stats.record_unkeyable_devices(UnkeyableDevice::Encrypt, 0);
+
+        let snap = stats.snapshot();
+        assert_eq!(snap.devices_unkeyed_no_bundle, 1);
+        assert_eq!(snap.devices_unkeyed_session_setup, 1);
+        assert_eq!(
+            snap.devices_unkeyed_fetch_failed, 3,
+            "an outage is its own field: it refuses nothing and answers nothing"
+        );
+        assert_eq!(
+            snap.devices_unkeyed_rejected, 7,
+            "a batch refusal is a refusal: it shares the snapshot total and \
+             only the metrics label separates it"
+        );
+        assert_eq!(
+            snap.devices_unkeyed_encrypt, 1,
+            "a zero-count tally must not move a counter"
+        );
+        assert_eq!(snap.devices_unkeyed_total(), 13);
+
+        assert_eq!(SessionStats::new().snapshot().devices_unkeyed_total(), 0);
+    }
+
+    /// The metrics label is a closed set: a server code we have never seen must
+    /// bucket rather than mint a label of its own.
+    #[test]
+    fn a_rejection_label_is_bucketed_by_class() {
+        assert_eq!(UnkeyableDevice::NoBundle.label(), "no_bundle");
+        assert_eq!(UnkeyableDevice::SessionSetup.label(), "session_setup");
+        assert_eq!(UnkeyableDevice::Rejected(406).label(), "rejected_406");
+        for code in [400, 401, 403, 404, 409, 429] {
+            assert_eq!(UnkeyableDevice::Rejected(code).label(), "rejected_4xx");
+        }
+        for code in [500, 503, 599] {
+            assert_eq!(UnkeyableDevice::Rejected(code).label(), "rejected_5xx");
+        }
+        for code in [0, 302, 600, u16::MAX] {
+            assert_eq!(UnkeyableDevice::Rejected(code).label(), "rejected_other");
+        }
+        // A batch refusal names nobody, so it must never share a label with a
+        // rejection the server attached to a specific device.
+        assert_eq!(UnkeyableDevice::BatchRefused.label(), "refused_batch");
+        assert_ne!(
+            UnkeyableDevice::BatchRefused.label(),
+            UnkeyableDevice::Rejected(406).label()
+        );
+        assert_eq!(UnkeyableDevice::FetchFailed.label(), "fetch_failed");
+        assert_eq!(UnkeyableDevice::Encrypt.label(), "encrypt");
     }
 
     #[test]

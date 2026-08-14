@@ -421,6 +421,10 @@ struct MockSendContextResolver {
     phone_to_lid: HashMap<String, String>,
     /// JIDs reported via `on_local_identity_change` (send-path detection).
     identity_changes: std::sync::Mutex<Vec<Jid>>,
+    /// What `on_unkeyable_devices` reported, in call order. This is the hook a
+    /// client turns into a counter, so a test asserting on it asserts on the
+    /// only thing that reaches `stats()`.
+    unkeyable: std::sync::Mutex<Vec<(crate::stats::UnkeyableDevice, u64)>>,
     chain_lock_probe: Option<ChainLockProbe>,
     prekey_error_code: Option<u16>,
     /// Devices the server names as rejected inside an otherwise fine response.
@@ -434,6 +438,7 @@ impl MockSendContextResolver {
             devices: Vec::new(),
             phone_to_lid: HashMap::new(),
             identity_changes: std::sync::Mutex::new(Vec::new()),
+            unkeyable: std::sync::Mutex::new(Vec::new()),
             chain_lock_probe: None,
             prekey_error_code: None,
             rejected_devices: Vec::new(),
@@ -447,6 +452,10 @@ impl MockSendContextResolver {
 
     fn captured_identity_changes(&self) -> Vec<Jid> {
         self.identity_changes.lock().unwrap().clone()
+    }
+
+    fn captured_unkeyable(&self) -> Vec<(crate::stats::UnkeyableDevice, u64)> {
+        self.unkeyable.lock().unwrap().clone()
     }
 
     fn with_missing_bundle(mut self, jid: Jid) -> Self {
@@ -554,6 +563,10 @@ impl SendContextResolver for MockSendContextResolver {
 
     fn on_local_identity_change(&self, jid: &Jid) {
         self.identity_changes.lock().unwrap().push(jid.clone());
+    }
+
+    fn on_unkeyable_devices(&self, reason: crate::stats::UnkeyableDevice, count: u64) {
+        self.unkeyable.lock().unwrap().push((reason, count));
     }
 }
 
@@ -3143,6 +3156,39 @@ mod mark_full_distribution_list {
         }
     }
 
+    /// A store whose reads fail, standing in for a backend that is down.
+    #[derive(Clone)]
+    struct FailingSessionStore;
+    #[async_trait::async_trait]
+    impl SessionStore for FailingSessionStore {
+        async fn load_session(
+            &self,
+            _: &ProtocolAddress,
+        ) -> SigResult<Option<crate::libsignal::protocol::SessionRecord>> {
+            Err(
+                crate::libsignal::protocol::SignalProtocolError::InvalidState(
+                    "load_session",
+                    "session store is unavailable".to_string(),
+                ),
+            )
+        }
+        async fn has_session(&self, _: &ProtocolAddress) -> SigResult<bool> {
+            Err(
+                crate::libsignal::protocol::SignalProtocolError::InvalidState(
+                    "has_session",
+                    "session store is unavailable".to_string(),
+                ),
+            )
+        }
+        async fn store_session(
+            &mut self,
+            _: &ProtocolAddress,
+            _: crate::libsignal::protocol::SessionRecord,
+        ) -> SigResult<()> {
+            unreachable!("nothing is stored once the reads fail")
+        }
+    }
+
     #[derive(Clone)]
     struct MemIdentityStore {
         pair: IdentityKeyPair,
@@ -4000,6 +4046,346 @@ mod mark_full_distribution_list {
         );
     }
 
+    /// Same fixture as the isolation test above, read from the other side: the
+    /// device that gets no SKDM is the moment a participant starts seeing
+    /// "Waiting for this message", and until it reached a counter the only
+    /// evidence it happened was a log line nobody was tailing.
+    #[tokio::test]
+    async fn a_device_the_group_send_cannot_key_is_counted() {
+        let group: Jid = "120363000000000003@g.us".parse().unwrap();
+        let own_jid: Jid = "559900000001@s.whatsapp.net".parse().unwrap();
+        let own_lid: Jid = "100000000000001@lid".parse().unwrap();
+        let good: Jid = "559911112222:0@s.whatsapp.net".parse().unwrap();
+        let bad: Jid = "559933334444:0@s.whatsapp.net".parse().unwrap();
+
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mut ss = MemSessionStore::default();
+        let mut is = MemIdentityStore {
+            pair: IdentityKeyPair::generate(&mut rng),
+            reg_id: 7,
+            known: Default::default(),
+        };
+        let mut sks = MemSenderKeyStore::default();
+        let mut pks = UnusedPreKeyStore;
+        let spks = UnusedSignedPreKeyStore;
+        let mut stores = SignalStores {
+            sender_key_store: &mut sks,
+            session_store: &mut ss,
+            identity_store: &mut is,
+            prekey_store: &mut pks,
+            signed_prekey_store: &spks,
+        };
+
+        // `create_mock_bundle`'s zeroed signature fails X3DH, so `bad` is the
+        // device the fan-out drops.
+        let resolver = MockSendContextResolver::new()
+            .with_bundle(good.clone(), signed_prekey_bundle())
+            .with_bundle(bad.clone(), create_mock_bundle());
+
+        let group_info = GroupInfo::new(
+            vec![own_jid.to_non_ad(), good.to_non_ad(), bad.to_non_ad()],
+            AddressingMode::Pn,
+        );
+        let msg = wa::Message {
+            conversation: Some("hi".into()),
+            ..Default::default()
+        };
+
+        prepare_group_stanza(
+            &TokioTestRuntime,
+            &mut stores,
+            &resolver,
+            GroupStanzaRequest {
+                group: &group_info,
+                own_jid: &own_jid,
+                own_lid: &own_lid,
+                account: None,
+                to: &group,
+                message: &msg,
+                message_id: "TESTREQID_COUNT",
+                force_distribution: false,
+                distribution_targets: Some(vec![good.clone(), bad.clone()]),
+                distribution_policy: SenderKeyDistributionPolicy::BestEffort,
+                phash_devices: None,
+                edit: None,
+                extra_nodes: &[],
+                pre_encoded: None,
+            },
+        )
+        .await
+        .expect("the send still succeeds; that part is parity and does not change");
+
+        // Exactly one entry, and this is also what pins the no-double-count
+        // rule: `bad` has no session, so it fails the encrypt fan-out too, and a
+        // fan-out that counted that failure would report one dropped device as
+        // both a session-setup drop and an encrypt drop.
+        assert_eq!(
+            resolver.captured_unkeyable(),
+            vec![(crate::stats::UnkeyableDevice::SessionSetup, 1)],
+            "the dropped device must be reported exactly once, as a session-setup failure"
+        );
+    }
+
+    /// The counter has to stay silent when nothing went wrong, or a rate built
+    /// on it measures traffic rather than breakage.
+    #[tokio::test]
+    async fn a_group_send_that_keys_every_device_counts_nothing() {
+        let group: Jid = "120363000000000004@g.us".parse().unwrap();
+        let own_jid: Jid = "559900000001@s.whatsapp.net".parse().unwrap();
+        let own_lid: Jid = "100000000000001@lid".parse().unwrap();
+        let first: Jid = "559911112222:0@s.whatsapp.net".parse().unwrap();
+        let second: Jid = "559933334444:0@s.whatsapp.net".parse().unwrap();
+
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mut ss = MemSessionStore::default();
+        let mut is = MemIdentityStore {
+            pair: IdentityKeyPair::generate(&mut rng),
+            reg_id: 7,
+            known: Default::default(),
+        };
+        let mut sks = MemSenderKeyStore::default();
+        let mut pks = UnusedPreKeyStore;
+        let spks = UnusedSignedPreKeyStore;
+        let mut stores = SignalStores {
+            sender_key_store: &mut sks,
+            session_store: &mut ss,
+            identity_store: &mut is,
+            prekey_store: &mut pks,
+            signed_prekey_store: &spks,
+        };
+
+        let resolver = MockSendContextResolver::new()
+            .with_bundle(first.clone(), signed_prekey_bundle())
+            .with_bundle(second.clone(), signed_prekey_bundle());
+
+        let group_info = GroupInfo::new(
+            vec![own_jid.to_non_ad(), first.to_non_ad(), second.to_non_ad()],
+            AddressingMode::Pn,
+        );
+        let msg = wa::Message {
+            conversation: Some("hi".into()),
+            ..Default::default()
+        };
+
+        let prepared = prepare_group_stanza(
+            &TokioTestRuntime,
+            &mut stores,
+            &resolver,
+            GroupStanzaRequest {
+                group: &group_info,
+                own_jid: &own_jid,
+                own_lid: &own_lid,
+                account: None,
+                to: &group,
+                message: &msg,
+                message_id: "TESTREQID_CLEAN",
+                force_distribution: false,
+                distribution_targets: Some(vec![first.clone(), second.clone()]),
+                distribution_policy: SenderKeyDistributionPolicy::BestEffort,
+                phash_devices: None,
+                edit: None,
+                extra_nodes: &[],
+                pre_encoded: None,
+            },
+        )
+        .await
+        .expect("prepare");
+
+        assert_eq!(
+            prepared
+                .node
+                .get_optional_child("participants")
+                .and_then(|p| p.children().map(|c| c.len()))
+                .unwrap_or(0),
+            2,
+            "both devices are keyed, so both get an SKDM"
+        );
+        assert!(
+            resolver.captured_unkeyable().is_empty(),
+            "a send that keyed everyone must not report a drop: {:?}",
+            resolver.captured_unkeyable()
+        );
+    }
+
+    /// Run the session half of the fan-out, which is where a device the server
+    /// will not hand key material for is dropped.
+    async fn ensure_sessions(resolver: &MockSendContextResolver, devices: &[Jid]) -> SessionPlan {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mut ss = MemSessionStore::default();
+        let mut is = MemIdentityStore {
+            pair: IdentityKeyPair::generate(&mut rng),
+            reg_id: 7,
+            known: Default::default(),
+        };
+        let mut sks = MemSenderKeyStore::default();
+        let mut pks = UnusedPreKeyStore;
+        let spks = UnusedSignedPreKeyStore;
+        let mut stores = SignalStores {
+            sender_key_store: &mut sks,
+            session_store: &mut ss,
+            identity_store: &mut is,
+            prekey_store: &mut pks,
+            signed_prekey_store: &spks,
+        };
+        ensure_sessions_for_devices(&TokioTestRuntime, &mut stores, resolver, devices)
+            .await
+            .expect("a device without key material is skipped, not fatal")
+    }
+
+    /// A device the response simply omits is ambiguous, and is counted as such.
+    #[tokio::test]
+    async fn a_device_that_came_back_without_a_bundle_is_counted() {
+        let absent: Jid = "559955556666:0@s.whatsapp.net".parse().unwrap();
+        let resolver = MockSendContextResolver::new().with_missing_bundle(absent.clone());
+
+        ensure_sessions(&resolver, std::slice::from_ref(&absent)).await;
+
+        assert_eq!(
+            resolver.captured_unkeyable(),
+            vec![(crate::stats::UnkeyableDevice::NoBundle, 1)]
+        );
+    }
+
+    /// A rejection carries the server's code, and only a 406 claims the device
+    /// is gone: any other code is counted and otherwise left alone, so no
+    /// device list is refreshed on a server-side wobble. The rejection is also
+    /// the reason the bundle is missing, so it must not also be counted as one.
+    #[tokio::test]
+    async fn a_rejected_device_is_counted_under_its_code_and_only_a_406_invalidates() {
+        for code in [406u16, 503] {
+            let gone: Jid = "559977778888:0@s.whatsapp.net".parse().unwrap();
+            let resolver = MockSendContextResolver::new().with_rejected_device(gone.clone(), code);
+
+            let plan = ensure_sessions(&resolver, std::slice::from_ref(&gone)).await;
+
+            assert_eq!(
+                resolver.captured_unkeyable(),
+                vec![(crate::stats::UnkeyableDevice::Rejected(code), 1)],
+                "a {code} rejection is one drop, named by its code"
+            );
+            assert_eq!(
+                plan.rejected_devices.is_empty(),
+                code != 406,
+                "only a 406 may put the device on the device-list refresh list"
+            );
+        }
+    }
+
+    /// A batch-wide 406 names nobody, so every device it answered for is
+    /// counted under it rather than as an absent bundle — and under its own
+    /// reason, because attributing a named rejection to each device would claim
+    /// per-device knowledge the refusal does not carry.
+    #[tokio::test]
+    async fn a_batch_wide_refusal_counts_every_device_it_answered_for() {
+        let first: Jid = "559911112222:0@s.whatsapp.net".parse().unwrap();
+        let second: Jid = "559933334444:0@s.whatsapp.net".parse().unwrap();
+        let resolver = MockSendContextResolver::new().with_prekey_error(406);
+
+        ensure_sessions(&resolver, &[first, second]).await;
+
+        assert_eq!(
+            resolver.captured_unkeyable(),
+            vec![(crate::stats::UnkeyableDevice::BatchRefused, 2)],
+            "the whole batch is one refusal covering both devices"
+        );
+    }
+
+    /// A fetch that never answered — a timeout, a dropped socket, a 429 —
+    /// leaves the same devices unkeyed as a refusal does, and a best-effort
+    /// group send carries on without distributing to any of them. Counting only
+    /// the refusal would make the signal go quiet during the outage.
+    #[tokio::test]
+    async fn a_fetch_that_never_answered_counts_every_device_it_asked_about() {
+        let first: Jid = "559911112222:0@s.whatsapp.net".parse().unwrap();
+        let second: Jid = "559933334444:0@s.whatsapp.net".parse().unwrap();
+        let resolver = MockSendContextResolver::new().with_prekey_error(503);
+
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mut ss = MemSessionStore::default();
+        let mut is = MemIdentityStore {
+            pair: IdentityKeyPair::generate(&mut rng),
+            reg_id: 7,
+            known: Default::default(),
+        };
+        let mut sks = MemSenderKeyStore::default();
+        let mut pks = UnusedPreKeyStore;
+        let spks = UnusedSignedPreKeyStore;
+        let mut stores = SignalStores {
+            sender_key_store: &mut sks,
+            session_store: &mut ss,
+            identity_store: &mut is,
+            prekey_store: &mut pks,
+            signed_prekey_store: &spks,
+        };
+
+        // `expect_err` would need SessionPlan: Debug, which it has no other
+        // reason to carry.
+        assert!(
+            ensure_sessions_for_devices(
+                &TokioTestRuntime,
+                &mut stores,
+                &resolver,
+                &[first, second]
+            )
+            .await
+            .is_err(),
+            "a non-406 batch failure still fails the session half"
+        );
+
+        assert_eq!(
+            resolver.captured_unkeyable(),
+            vec![(crate::stats::UnkeyableDevice::FetchFailed, 2)],
+            "both devices the fetch asked about are counted, under a reason that \
+             claims nothing about them"
+        );
+    }
+
+    /// A session store that cannot answer abandons the plan before any device
+    /// is keyed, and a best-effort group send then distributes to nobody. The
+    /// loudest local fault a send can hit has to move a counter.
+    #[tokio::test]
+    async fn a_session_store_that_cannot_answer_counts_every_device() {
+        let first: Jid = "559911112222:0@s.whatsapp.net".parse().unwrap();
+        let second: Jid = "559933334444:0@s.whatsapp.net".parse().unwrap();
+
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mut sessions = FailingSessionStore;
+        let mut identities = MemIdentityStore {
+            pair: IdentityKeyPair::generate(&mut rng),
+            reg_id: 7,
+            known: Default::default(),
+        };
+        let mut sender_keys = MemSenderKeyStore::default();
+        let mut prekeys = UnusedPreKeyStore;
+        let signed_prekeys = UnusedSignedPreKeyStore;
+        let mut stores = SignalStores {
+            sender_key_store: &mut sender_keys,
+            session_store: &mut sessions,
+            identity_store: &mut identities,
+            prekey_store: &mut prekeys,
+            signed_prekey_store: &signed_prekeys,
+        };
+        let resolver = MockSendContextResolver::new();
+
+        assert!(
+            ensure_sessions_for_devices(
+                &TokioTestRuntime,
+                &mut stores,
+                &resolver,
+                &[first, second]
+            )
+            .await
+            .is_err(),
+            "a store that cannot answer still fails the session half"
+        );
+
+        assert_eq!(
+            resolver.captured_unkeyable(),
+            vec![(crate::stats::UnkeyableDevice::SessionLookup, 2)],
+            "the error takes the whole plan with it, so every device is unkeyed"
+        );
+    }
+
     /// A steady-state group stanza's size tracks our OWN device count, never
     /// the group's.
     ///
@@ -4593,6 +4979,61 @@ mod local_identity_change_on_send {
 
         assert_eq!(raw.devices.len(), 1);
         assert_eq!(raw.devices[0].device_jid, device_ok);
+        // `assume_ready` ran no session setup, so nothing has counted this
+        // device yet and the fan-out is the first thing to see it dropped.
+        assert_eq!(raw.unkeyed_at_encrypt, 1);
+    }
+
+    /// A stored session that cannot be used is the failure session repair
+    /// exists for, and the fan-out is the only place that sees it: session
+    /// setup skips the device because `has_session` says one is there.
+    ///
+    /// This is also why the "already counted" set names devices instead of
+    /// testing the error: libsignal reports a degenerate stored session as
+    /// `SessionNotFound`, exactly like a device that has no session at all.
+    #[tokio::test]
+    async fn a_stored_session_that_cannot_be_used_is_counted_at_encrypt() {
+        let device = Jid::pn_device("15550000002", 0);
+
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mut session_store = MemSessionStore::default();
+        let mut identity_store = MemIdentityStore {
+            pair: IdentityKeyPair::generate(&mut rng),
+            known: HashMap::new(),
+        };
+        // A row that exists (so `has_session` is true) and carries no usable
+        // state, which is what an unusable stored session looks like.
+        session_store
+            .0
+            .insert(device.to_protocol_address(), Vec::new());
+
+        let mut prekey_store = UnusedPreKeyStore;
+        let signed_prekey_store = UnusedSignedPreKeyStore;
+        let mut sender_key_store = MemSenderKeyStore::default();
+        let mut stores = raw_fanout_stores(
+            &mut sender_key_store,
+            &mut session_store,
+            &mut identity_store,
+            &mut prekey_store,
+            &signed_prekey_store,
+        );
+
+        let devices = vec![device];
+        let raw = encrypt_for_devices_with_sessions_raw(
+            &TokioTestRuntime,
+            &mut stores,
+            &devices,
+            b"payload",
+            SessionPlan::assume_ready(devices.len()),
+        )
+        .await
+        .expect("the send carries on without the device");
+
+        assert!(raw.devices.is_empty());
+        assert_eq!(
+            raw.unkeyed_at_encrypt, 1,
+            "the drop nobody else can see must be the one this counter reports"
+        );
     }
 
     /// Regression: the chunked fan-out must return empty, not divide by zero, for
