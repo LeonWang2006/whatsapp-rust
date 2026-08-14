@@ -128,8 +128,34 @@ impl Client {
         node: &OwnedNodeRef,
     ) -> Option<ClassifiedMessage> {
         let nr = node.get();
+
+        // The `<enc>` nodes are enumerated before the parse so the media type
+        // they declare lands on `MessageInfo` while it is still owned. Every
+        // holder of the Arc -- a custom enc handler, a per-node failure event,
+        // the classified message -- then sees the same finished struct, which
+        // finishing the field after the decrypt loop could not promise.
+        let own_jid = nr
+            .get_optional_child("participants")
+            .and_then(|_| self.pn());
+        let mut all_enc_nodes: Vec<&NodeRef<'_>> = Vec::with_capacity(4);
+        let mut media_type: Option<crate::types::message::EncMediaType> = None;
+        for enc_node in message_enc_nodes_for_device(nr, own_jid.as_ref()) {
+            // The declared media type belongs to the message, not to a device
+            // copy, so the first `<enc>` carrying one settles it for the whole
+            // stanza and a divergent later value is dropped.
+            if media_type.is_none()
+                && let Some(value) = enc_node.attrs().optional_string("mediatype")
+            {
+                media_type = Some(crate::types::message::EncMediaType::from(value.as_ref()));
+            }
+            all_enc_nodes.push(enc_node);
+        }
+
         let info = match self.parse_message_info(nr).await {
-            Ok(info) => Arc::new(info),
+            Ok(mut info) => {
+                info.media_type = media_type;
+                Arc::new(info)
+            }
             Err(e) => {
                 let id = nr.get_attr("id").map(|v| v.as_str());
                 let from = nr.get_attr("from").map(|v| v.as_str());
@@ -154,12 +180,6 @@ impl Client {
         let sender_encryption_jid = self.resolve_encryption_jid(&info.source.sender).await;
 
         let unavailable_node = nr.get_optional_child("unavailable");
-
-        let own_jid = nr
-            .get_optional_child("participants")
-            .and_then(|_| self.pn());
-        let mut all_enc_nodes: Vec<&NodeRef<'_>> = Vec::with_capacity(4);
-        all_enc_nodes.extend(message_enc_nodes_for_device(nr, own_jid.as_ref()));
 
         if all_enc_nodes.is_empty() && unavailable_node.is_none() {
             log::warn!(
@@ -721,7 +741,13 @@ impl Client {
                 enc_type,
                 padding_version,
                 enc_index,
+                state,
+                session_type,
             } = payload;
+            let annotations = EncNodeAnnotations {
+                state: state.as_deref(),
+                session_type: session_type.as_deref(),
+            };
             let enc_type_str = enc_type.as_wire_str();
             #[cfg(feature = "tracing")]
             let ciphertext_len = ciphertext.len();
@@ -851,6 +877,8 @@ impl Client {
                         plaintext: decrypted.plaintext,
                         padding_version,
                         enc_index,
+                        state: state.clone(),
+                        session_type: session_type.clone(),
                     });
                 }
                 Err(e) => {
@@ -974,6 +1002,8 @@ impl Client {
                                     plaintext: decrypted.plaintext,
                                     padding_version,
                                     enc_index,
+                                    state: state.clone(),
+                                    session_type: session_type.clone(),
                                 });
                             }
                             Err(retry_err) => {
@@ -1005,6 +1035,7 @@ impl Client {
                                             enc_type,
                                             padding_version,
                                             enc_index,
+                                            annotations,
                                             info,
                                             &session_mutex,
                                             &mut session_guard,
@@ -1122,6 +1153,7 @@ impl Client {
                                 enc_type,
                                 padding_version,
                                 enc_index,
+                                annotations,
                                 info,
                                 &session_mutex,
                                 &mut session_guard,
@@ -1176,6 +1208,7 @@ impl Client {
                                 enc_type,
                                 padding_version,
                                 enc_index,
+                                annotations,
                                 info,
                                 &session_mutex,
                                 &mut session_guard,
@@ -1248,6 +1281,7 @@ impl Client {
                                 enc_type,
                                 padding_version,
                                 enc_index,
+                                annotations,
                                 info,
                                 &session_mutex,
                                 &mut session_guard,
@@ -1362,10 +1396,22 @@ impl Client {
             plaintext,
             padding_version,
             enc_index,
+            state,
+            session_type,
         } in deferred
         {
             match self
-                .handle_decrypted_plaintext(enc_type, plaintext, padding_version, enc_index, info)
+                .handle_decrypted_plaintext(
+                    enc_type,
+                    plaintext,
+                    padding_version,
+                    enc_index,
+                    EncNodeAnnotations {
+                        state: state.as_deref(),
+                        session_type: session_type.as_deref(),
+                    },
+                    info,
+                )
                 .await
             {
                 Ok(plaintext_outcome) => {
@@ -1468,6 +1514,7 @@ impl Client {
                             padded_plaintext,
                             padding_version,
                             enc_index,
+                            payload.annotations(),
                             info,
                         )
                         .await
@@ -1658,6 +1705,7 @@ impl Client {
         padded_plaintext: Vec<u8>,
         padding_version: u8,
         enc_index: usize,
+        annotations: EncNodeAnnotations<'_>,
         info: &Arc<MessageInfo>,
     ) -> Result<PlaintextHandleOutcome, anyhow::Error> {
         let source = wacore::messages::unpad_plaintext(padded_plaintext, padding_version)?;
@@ -1671,6 +1719,8 @@ impl Client {
                     .info(Arc::clone(info))
                     .enc_index(enc_index)
                     .enc_type(enc_type)
+                    .maybe_state(annotations.state.map(str::to_owned))
+                    .maybe_session_type(annotations.session_type.map(str::to_owned))
                     .payload(source.clone())
                     .build(),
             ));
@@ -1867,6 +1917,7 @@ impl Client {
         enc_type: &'static str,
         padding_version: u8,
         enc_index: usize,
+        annotations: EncNodeAnnotations<'_>,
         info: &Arc<MessageInfo>,
         session_mutex: &Arc<async_lock::Mutex<()>>,
         session_guard: &mut Option<async_lock::MutexGuardArc<()>>,
@@ -1927,6 +1978,8 @@ impl Client {
                     plaintext: decrypted.plaintext,
                     padding_version,
                     enc_index,
+                    state: annotations.state.map(str::to_owned),
+                    session_type: annotations.session_type.map(str::to_owned),
                 });
                 MigrationDecryptResult::Decrypted
             }
@@ -2011,6 +2064,8 @@ mod enc_bucket_tests {
             ciphertext: bytes::Bytes::from_static(b"ct"),
             enc_type,
             padding_version: 2,
+            state: None,
+            session_type: None,
         }
     }
 
