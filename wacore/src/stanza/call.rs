@@ -680,6 +680,13 @@ pub fn build_accept(p: &AcceptParams<'_>) -> Node {
     )
 }
 
+/// The rotation an offer, accept or preaccept announces.
+///
+/// Upright, and not a parameter: none of them has a `CallHandle` yet, so no
+/// rotation can have been set for the call they open. `CallHandle::set_video_orientation`
+/// is where one is set and what carries it from there.
+const INITIAL_DEVICE_ORIENTATION: &str = "0";
+
 /// Default initiator-side geometry used by the WaCalls reference.
 const VIDEO_SCREEN_WIDTH: &str = "1920";
 const VIDEO_SCREEN_HEIGHT: &str = "1080";
@@ -692,7 +699,7 @@ fn video_offer_node() -> Node {
         .attr("orientation", "0")
         .attr("screen_width", VIDEO_SCREEN_WIDTH)
         .attr("screen_height", VIDEO_SCREEN_HEIGHT)
-        .attr("device_orientation", "0")
+        .attr("device_orientation", INITIAL_DEVICE_ORIENTATION)
         .build()
 }
 
@@ -700,7 +707,7 @@ fn video_offer_node() -> Node {
 fn video_accept_node() -> Node {
     NodeBuilder::new("video")
         .attr("dec", "H264")
-        .attr("device_orientation", "0")
+        .attr("device_orientation", INITIAL_DEVICE_ORIENTATION)
         .build()
 }
 
@@ -709,7 +716,7 @@ fn video_accept_node() -> Node {
 fn video_preaccept_node() -> Node {
     NodeBuilder::new("video")
         .attr("dec", "H264")
-        .attr("device_orientation", "0")
+        .attr("device_orientation", INITIAL_DEVICE_ORIENTATION)
         .attr("screen_width", "0")
         .attr("screen_height", "0")
         .build()

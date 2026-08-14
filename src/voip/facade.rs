@@ -3250,6 +3250,7 @@ impl CallHandle {
             target_devices: &devices,
             participants: &participants,
             video,
+            device_orientation: self.local_video_orientation(),
         })
         .map_err(|error| CallError::Response(error.to_string()))?;
         self.ensure_current()?;
@@ -3375,6 +3376,94 @@ impl CallHandle {
         self.muted.load(Ordering::Relaxed)
     }
 
+    /// The rotation to stamp on a `<video>` we are about to send. `0` for a call
+    /// that has already gone: the stanza is on its way out either way, and an
+    /// upright default is the one that cannot describe a rotation that never
+    /// happened.
+    fn local_video_orientation(&self) -> u8 {
+        self.client_registry
+            .local_video_orientation(&self.call_id, self.generation)
+            .unwrap_or(0)
+    }
+
+    /// Announce this side's camera rotation to the peer, as quarter turns in
+    /// `0..=3`. See `CallEntry::self_video_orientation` for what the value is
+    /// and what it is not.
+    ///
+    /// Every `<video>` this call sends from now on carries it. While video is
+    /// running the change is announced at once, as a `<video state=1>` that
+    /// re-states the current state: that is the shape the peer's own rotations
+    /// arrive in, and a no-op there beyond the new orientation. A call still
+    /// ringing has nobody to tell — the peer has no call entry to apply it
+    /// against — so the value waits and is announced when they answer.
+    ///
+    /// `Err` when the call is over, when the value is out of range, or when the
+    /// stanza could not be sent. A value rejected for range is not stored.
+    pub async fn set_video_orientation(&self, orientation: u8) -> Result<(), CallError> {
+        self.ensure_current()?;
+        // Range first: rejecting it costs nothing and does not need the lock.
+        if orientation > 3 {
+            return Err(CallError::Media(
+                "video orientation must be quarter turns in 0..=3",
+            ));
+        }
+
+        // Store and announce under the same lock the state transitions take. Two
+        // handles rotating at once would otherwise interleave — one storing `1`
+        // and pausing while the other stores and sends `2` — and the first would
+        // then send its stale `1`, leaving the peer at a rotation the registry
+        // does not record. The lock also keeps a rotation from putting a
+        // `state=1` on the wire after `stop_video`'s `state=6`.
+        let transition_lock = self
+            .client_registry
+            .video_transition_lock(&self.call_id, self.generation)
+            .ok_or(CallError::Media("call no longer active"))?;
+        let _transition_guard = transition_lock.lock().await;
+        self.ensure_current()?;
+
+        if !self.client_registry.set_local_video_orientation(
+            &self.call_id,
+            self.generation,
+            orientation,
+        ) {
+            return Err(CallError::Media("call no longer active"));
+        }
+
+        // Nothing to announce until there is a direction to announce it for, and
+        // nobody to announce it to until the call is answered: a video-from-start
+        // offer sets `self_state` to Enabled while the peer is still ringing, and
+        // it has no call entry to apply a `<video>` against, so one sent now is
+        // dropped. The value is kept either way — `announce_orientation_on_accept`
+        // sends it when the peer answers, and the stanza that enables video
+        // carries it for every other path.
+        let announceable = self
+            .client_registry
+            .video_states(&self.call_id, self.generation)
+            .is_some_and(|(self_state, _)| self_state == VideoState::Enabled)
+            && self
+                .client_registry
+                .phase_if_current(&self.call_id, self.generation)
+                .is_some_and(|phase| phase != CallPhase::Ringing);
+        if !announceable {
+            return Ok(());
+        }
+
+        let client = self.upgrade_client()?;
+        let stanza = build_video_state(&VideoStateParams {
+            call_id: &self.call_id,
+            to: &self.peer_jid(),
+            id: &client.generate_request_id(),
+            call_creator: &self.call_creator,
+            state: VideoState::Enabled,
+            dec: Some(VIDEO_DEC_REQUEST),
+            // Read back rather than reusing the argument: under the lock they
+            // agree, and reading makes that the invariant rather than a habit.
+            device_orientation: Some(self.local_video_orientation()),
+        });
+        client.send_node(stanza).await?;
+        Ok(())
+    }
+
     /// UPGRADE the call to video (we initiate): attaches the endpoints, enables the media plane,
     /// and sends `<video state=11 dec="H264" device_orientation="0" voip_settings="video">`.
     /// The peer answers with
@@ -3431,7 +3520,7 @@ impl CallHandle {
             call_creator: &self.call_creator,
             state: VideoState::Enabled,
             dec: Some(VIDEO_DEC_REQUEST),
-            device_orientation: Some(0),
+            device_orientation: Some(self.local_video_orientation()),
         });
         client.send_node(stanza).await?;
         Ok(())
@@ -3462,7 +3551,9 @@ impl CallHandle {
             call_creator: &self.call_creator,
             state: VideoState::Stopped,
             dec: None,
-            device_orientation: Some(0),
+            // No direction left for a rotation to describe. `None` omits the
+            // attribute rather than asserting `0`, which is a real rotation.
+            device_orientation: None,
         });
         client.send_node(stanza).await?;
         Ok(())
@@ -3570,7 +3661,12 @@ impl CallHandle {
                 call_creator: &self.call_creator,
                 state,
                 dec,
-                device_orientation: Some(0),
+                // The rotation rides every stanza that announces a direction, so
+                // one set before video started is announced by the stanza that
+                // starts it rather than waiting for the next rotation. Read per
+                // stanza, so a rotation between the two an upgrade sends lands on
+                // the second.
+                device_orientation: Some(self.local_video_orientation()),
             });
             let client = client.clone();
             async move { client.send_node(stanza).await }
@@ -8131,6 +8227,268 @@ mod tests {
     /// The action child of a sent `<call>` node.
     fn call_action_of(node: &wacore_binary::Node) -> wacore_binary::Node {
         node.as_node_ref().children().unwrap()[0].to_owned()
+    }
+
+    /// The rotation rides the stanza that announces a direction, so one set
+    /// before video starts is announced by the stanza that starts it rather than
+    /// waiting for the app to rotate again.
+    #[tokio::test]
+    async fn orientation_set_before_video_rides_the_upgrade_request() {
+        let (client, _sent, handle, _relay_keepalive) = sending_handle().await;
+        handle
+            .set_video_orientation(3)
+            .await
+            .expect("no direction yet, so nothing to announce");
+
+        let (vsrc, vsink) = video_endpoints();
+        let waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        handle.start_video(vsrc, vsink).await.expect("start_video");
+        let node = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("upgrade request must be sent")
+            .expect("waiter");
+        let action = call_action_of(&node);
+        assert_eq!(
+            action
+                .as_node_ref()
+                .attrs()
+                .optional_string("device_orientation")
+                .as_deref(),
+            Some("3"),
+            "the stanza that starts video must carry the rotation already set"
+        );
+        handle.hangup().await;
+    }
+
+    /// A rotation while video is running is announced on its own, as a `state=1`
+    /// that re-states the direction — which is how the peer's own rotations
+    /// arrive, and a no-op there beyond the new orientation.
+    #[tokio::test]
+    async fn rotating_mid_call_announces_the_new_orientation() {
+        let (client, _sent, handle, _relay_keepalive) = sending_handle().await;
+        let (vsrc, vsink) = video_endpoints();
+        handle.start_video(vsrc, vsink).await.expect("start_video");
+        client.call_registry().apply_peer_video_state(
+            "CID-FACADE",
+            handle.generation,
+            VideoState::UpgradeAccept,
+        );
+        // Answered: a call still ringing has no entry on the peer's side to
+        // apply a `<video>` against, and deliberately sends none.
+        assert!(client.call_registry().transition_if_current(
+            "CID-FACADE",
+            handle.generation,
+            CallPhase::Connecting
+        ));
+
+        let waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        handle.set_video_orientation(1).await.expect("rotate");
+        let node = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("a rotation with video running must reach the peer")
+            .expect("waiter");
+        let action = call_action_of(&node);
+        let ar = action.as_node_ref();
+        assert_eq!(ar.tag, "video");
+        assert_eq!(ar.attrs().optional_string("state").as_deref(), Some("1"));
+        assert_eq!(
+            ar.attrs().optional_string("device_orientation").as_deref(),
+            Some("1")
+        );
+        handle.hangup().await;
+    }
+
+    /// Every mutating method on `CallHandle` refuses a handle a replacement has
+    /// superseded, and a rotation is no exception: it would otherwise write the
+    /// live call's orientation from a handle that no longer owns it.
+    #[tokio::test]
+    async fn a_stale_handle_cannot_rotate_the_replacement() {
+        let client = make_client().await;
+        let spawn = |_client: &Client| {
+            let (_relay_tx, relay_rx) = async_channel::unbounded();
+            let factory = MockFactory {
+                sent: Arc::new(Mutex::new(Vec::new())),
+                relay_rx: Mutex::new(Some(relay_rx)),
+                connects: Arc::new(AtomicUsize::new(0)),
+            };
+            let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
+            let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
+            (factory, Arc::new(mic_rx), Arc::new(spk_tx))
+        };
+
+        let (f1, mic1, spk1) = spawn(&client);
+        let stale = spawn_call(
+            &client,
+            mk_session(),
+            engine(),
+            &f1,
+            pcm_audio(mic1, spk1),
+            None,
+        )
+        .await
+        .expect("first spawn_call");
+        let (f2, mic2, spk2) = spawn(&client);
+        let live = spawn_call(
+            &client,
+            mk_session(),
+            engine(),
+            &f2,
+            pcm_audio(mic2, spk2),
+            None,
+        )
+        .await
+        .expect("replacement spawn_call");
+
+        stale
+            .set_video_orientation(3)
+            .await
+            .expect_err("a superseded handle must not rotate the call");
+        assert_eq!(
+            client
+                .call_registry()
+                .local_video_orientation(&stale.call_id, live.generation),
+            Some(0),
+            "the live call keeps the rotation it had"
+        );
+        live.hangup().await;
+    }
+
+    /// A camera does not un-rotate because a negotiation restarted. Six paths
+    /// rebuild `VideoNegotiation` — a group downgrade among them — and a rotation
+    /// stored before one of them has to still be there for the `<video>` that
+    /// starts video again.
+    #[tokio::test]
+    async fn a_rotation_survives_a_video_negotiation_rebuild() {
+        let (client, _sent, handle, _relay_keepalive) = sending_handle().await;
+        let (vsrc, vsink) = video_endpoints();
+        handle.start_video(vsrc, vsink).await.expect("start_video");
+        handle.set_video_orientation(3).await.expect("rotate");
+        handle.stop_video().await.expect("stop_video");
+
+        assert_eq!(
+            client
+                .call_registry()
+                .local_video_orientation("CID-FACADE", handle.generation),
+            Some(3),
+            "the device is still rotated, whatever the negotiation did"
+        );
+
+        let (vsrc, vsink) = video_endpoints();
+        let waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        handle.start_video(vsrc, vsink).await.expect("restart");
+        let node = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("restart must be sent")
+            .expect("waiter");
+        assert_eq!(
+            call_action_of(&node)
+                .as_node_ref()
+                .attrs()
+                .optional_string("device_orientation")
+                .as_deref(),
+            Some("3"),
+            "restarting video must announce the rotation still in force"
+        );
+        handle.hangup().await;
+    }
+
+    /// A video-from-start offer leaves `self_state` Enabled while the peer is
+    /// still ringing, so the direction check alone would send a `<video>` the
+    /// peer has no call entry to apply — dropped, and never resent, because such
+    /// a caller sends no further video stanza of its own. The value waits for
+    /// the answer instead.
+    #[tokio::test]
+    async fn a_ringing_call_stores_the_rotation_without_announcing_it() {
+        let (client, sent, handle, _relay_keepalive) = sending_handle().await;
+        // What a video-from-start offer leaves behind: the direction is already
+        // Enabled, from the offer, while the call is still ringing. The direction
+        // check alone would take that for a call that can be told about a
+        // rotation.
+        assert!(
+            client
+                .call_registry()
+                .set_is_video("CID-FACADE", handle.generation, true)
+        );
+        assert_eq!(
+            client
+                .call_registry()
+                .video_states("CID-FACADE", handle.generation)
+                .map(|(self_state, _)| self_state),
+            Some(VideoState::Enabled)
+        );
+        assert_eq!(
+            client
+                .call_registry()
+                .phase_if_current("CID-FACADE", handle.generation),
+            Some(CallPhase::Ringing),
+            "and still ringing, which is the case under test"
+        );
+
+        let before = sent.load(Ordering::SeqCst);
+        handle.set_video_orientation(2).await.expect("store it");
+        assert_eq!(
+            sent.load(Ordering::SeqCst),
+            before,
+            "a ringing call has nobody to announce to"
+        );
+        assert_eq!(
+            client
+                .call_registry()
+                .local_video_orientation("CID-FACADE", handle.generation),
+            Some(2),
+            "and the rotation is kept for the answer"
+        );
+        handle.hangup().await;
+    }
+
+    /// Out of range is refused rather than folded in: `4` is a caller counting
+    /// something other than quarter turns, and answering it with `0` would leave
+    /// the call upright and wrong. The stored value must survive the attempt.
+    #[tokio::test]
+    async fn an_out_of_range_orientation_is_refused_and_does_not_replace_the_stored_one() {
+        let (client, _sent, handle, _relay_keepalive) = sending_handle().await;
+        handle.set_video_orientation(2).await.expect("in range");
+
+        for rejected in [4u8, 255] {
+            handle
+                .set_video_orientation(rejected)
+                .await
+                .expect_err("out of range must not be accepted");
+        }
+        assert_eq!(
+            client
+                .call_registry()
+                .local_video_orientation("CID-FACADE", handle.generation),
+            Some(2),
+            "a rejected value must not have replaced the one in force"
+        );
+        handle.hangup().await;
+    }
+
+    /// Stopping leaves no direction for a rotation to describe, so the stanza
+    /// omits the attribute rather than asserting `0`, which is a real rotation.
+    #[tokio::test]
+    async fn stopping_video_announces_no_orientation() {
+        let (client, _sent, handle, _relay_keepalive) = sending_handle().await;
+        let (vsrc, vsink) = video_endpoints();
+        handle.start_video(vsrc, vsink).await.expect("start_video");
+        handle.set_video_orientation(3).await.expect("rotate");
+
+        let waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        handle.stop_video().await.expect("stop_video");
+        let node = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("stop must be sent")
+            .expect("waiter");
+        let action = call_action_of(&node);
+        let ar = action.as_node_ref();
+        assert_eq!(ar.attrs().optional_string("state").as_deref(), Some("6"));
+        assert_eq!(
+            ar.attrs().optional_string("device_orientation"),
+            None,
+            "a stopped direction has no rotation to announce"
+        );
+        handle.hangup().await;
     }
 
     #[tokio::test]
