@@ -6,6 +6,8 @@
 //! - `GET /health` — liveness. 200 as long as the process is up.
 //! - `GET /ready`  — readiness. 200 when the pod can accept sessions.
 //! - `GET /status` — JSON pod + session summary.
+//! - `GET /pair-code?jid=...` — poll the current 8-char pairing code from its
+//!   Redis key; 200 with `{jid, code}` while a code is live, 404 when none is.
 //! - `POST /send`  — build a `send_message` task and dispatch it.
 //! - `POST /react` — build a `react` task and dispatch it.
 //! - `POST /pair`  — build a `pair_code` task and dispatch it.
@@ -127,6 +129,7 @@ impl Api {
             ("GET", "/health") => Self::handle_health(),
             ("GET", "/ready") => Self::handle_ready(&ctx),
             ("GET", "/status") => Self::handle_status(&ctx),
+            ("GET", "/pair-code") => Self::handle_pair_code(ctx, req).await,
             ("POST", "/send") => Self::handle_send(ctx, req).await,
             ("POST", "/react") => Self::handle_react(ctx, req).await,
             ("POST", "/pair") => Self::handle_pair(ctx, req).await,
@@ -223,6 +226,43 @@ impl Api {
         dispatch_and_ack(ctx, task, jid)
     }
 
+    /// Poll the current pairing code for `jid` from its Redis key.
+    ///
+    /// The code is written by the session's event bridge when `Event::PairingCode`
+    /// fires (see [`crate::event_bridge`]). 404 means no code is currently live
+    /// (still pairing, expired, or already logged in); the client polls again.
+    async fn handle_pair_code(ctx: ServerContext, req: Request<Body>) -> Response<Body> {
+        let jid = req
+            .uri()
+            .query()
+            .and_then(|q| query_param(q, "jid"))
+            .filter(|j| !j.is_empty());
+        let Some(jid) = jid else {
+            return Self::error_to_response(ApiError::BadRequest(
+                "missing required query param: jid".to_string(),
+            ));
+        };
+        let key = crate::task::pair_code_key(&ctx.pair_code_key_prefix, &jid);
+        let mut redis = ctx.redis.clone();
+        match redis::Cmd::get(&key)
+            .query_async::<Option<String>>(&mut redis)
+            .await
+        {
+            Ok(Some(code)) => json_response(
+                StatusCode::OK,
+                &serde_json::json!({ "jid": jid, "code": code }),
+            ),
+            Ok(None) => json_response(
+                StatusCode::NOT_FOUND,
+                &serde_json::json!({ "error": "no pairing code currently live" }),
+            ),
+            Err(e) => {
+                error!("failed to GET pair code for jid={jid}: {e}");
+                Self::error_to_response(ApiError::InternalServerError)
+            }
+        }
+    }
+
     fn handle_not_found() -> Response<Body> {
         Self::error_to_response(ApiError::NotFound)
     }
@@ -290,6 +330,38 @@ async fn body_bytes(req: Request<Body>) -> Vec<u8> {
         .await
         .map(|b| b.to_vec())
         .unwrap_or_default()
+}
+
+/// Read a percent-decoded query parameter from a raw query string.
+fn query_param(query: &str, key: &str) -> Option<String> {
+    query.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        if k != key {
+            return None;
+        }
+        Some(percent_decode(v))
+    })
+}
+
+/// Minimal percent-decoder for query values (`%40` -> `@`).
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push(((h << 4) | l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn json_response<T: Serialize>(status: StatusCode, body: &T) -> Response<Body> {

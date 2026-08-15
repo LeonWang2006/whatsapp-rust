@@ -39,6 +39,8 @@ pub struct Server {
     shutdown: CancellationToken,
     /// Hard cap on concurrent sessions per pod. 0 = unlimited.
     max_sessions: usize,
+    /// Prefix for per-JID pair-code keys written to Redis for the API to serve.
+    pair_code_key_prefix: String,
 }
 
 impl Server {
@@ -47,6 +49,7 @@ impl Server {
         redis: redis::aio::ConnectionManager,
         redis_client: redis::Client,
         pod_id: String,
+        pair_code_key_prefix: String,
     ) -> Self {
         Self {
             storage_factory,
@@ -56,6 +59,7 @@ impl Server {
             registry: SessionRegistry::new(),
             shutdown: CancellationToken::new(),
             max_sessions: 0,
+            pair_code_key_prefix,
         }
     }
 
@@ -102,6 +106,7 @@ impl Server {
             self.redis_client.clone(),
             self.pod_id.clone(),
             self.max_sessions,
+            self.pair_code_key_prefix.clone(),
         );
 
         // One BRPOP task per shard. Each pulls tasks off its own shard key.

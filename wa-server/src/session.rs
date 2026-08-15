@@ -42,6 +42,8 @@ pub struct ServerContext {
     pub pod_id: String,
     /// Hard cap on concurrent sessions per pod. 0 = unlimited.
     pub max_sessions: usize,
+    /// Prefix for per-JID pair-code keys written to Redis for the API to serve.
+    pub pair_code_key_prefix: String,
 }
 
 /// Build and run one session for `jid`. `first_task` (if present) is delivered
@@ -82,6 +84,7 @@ pub async fn run_session(ctx: ServerContext, jid: String, first_task: Option<Tas
     let event_cancel = cancel.clone();
     let event_factory = ctx.storage_factory.clone();
     let event_registry = ctx.registry.clone();
+    let event_pair_prefix = ctx.pair_code_key_prefix.clone();
 
     let mut builder = Bot::builder()
         .with_backend_arc(backend)
@@ -92,11 +95,12 @@ pub async fn run_session(ctx: ServerContext, jid: String, first_task: Option<Tas
             let cancel = event_cancel.clone();
             let factory = event_factory.clone();
             let registry = event_registry.clone();
+            let pair_prefix = event_pair_prefix.clone();
             async move {
                 // Forward every event to the Redis event stream first so the
                 // business system learns about the logout/replacement and the
                 // pairing code / QR stream the admin polls.
-                forward_event_to_redis(&mut redis, &jid, &pod, &event).await;
+                forward_event_to_redis(&mut redis, &jid, &pod, &event, &pair_prefix).await;
 
                 // Lifecycle events trigger session teardown.
                 let (should_delete, label) = match &*event {

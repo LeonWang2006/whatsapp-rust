@@ -12,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 use wa_server::in_memory_factory::InMemoryStorageFactory;
 use wa_server::server::Server;
 use wa_server::storage_factory::StorageFactory;
+use wa_server::task::PAIR_CODE_KEY_PREFIX;
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
@@ -78,6 +79,7 @@ async fn main() {
     let pod_id = env_or("POD_ID", "pod-1");
     let api_addr = env_or("API_ADDR", "0.0.0.0:8080");
     let max_sessions = env_or_parse("MAX_SESSIONS", 0usize);
+    let pair_code_key_prefix = env_or("PAIR_CODE_KEY_PREFIX", PAIR_CODE_KEY_PREFIX);
 
     info!(
         "starting wa-server pod={pod_id} api={api_addr} max_sessions={max_sessions} redis={redis_url}"
@@ -135,6 +137,7 @@ async fn main() {
         redis.clone(),
         client.clone(),
         pod_id.clone(),
+        pair_code_key_prefix.clone(),
     )
     .with_max_sessions(max_sessions)
     .with_shutdown(shutdown.clone());
@@ -153,6 +156,7 @@ async fn main() {
         redis_client: client,
         pod_id,
         max_sessions,
+        pair_code_key_prefix,
     };
     let api_addr: SocketAddr = match api_addr.parse() {
         Ok(a) => a,

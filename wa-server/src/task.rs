@@ -61,6 +61,16 @@ pub const REGISTRY_KEY: &str = "wa-registry";
 pub const REGISTRY_TTL: Duration = Duration::from_secs(60);
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
 
+/// Default prefix for the per-JID pair-code keys the HTTP API serves to
+/// clients that poll for a freshly minted pairing code. Overridable via the
+/// `PAIR_CODE_KEY_PREFIX` env var.
+pub const PAIR_CODE_KEY_PREFIX: &str = "wa-pair-code";
+
+/// Redis key that holds the current 8-char pairing code for `jid`.
+pub fn pair_code_key(prefix: &str, jid: &str) -> String {
+    format!("{prefix}:{jid}")
+}
+
 /// Per-pod inbox key: `wa-inbox:{pod_id}`. Cross-pod forwarded tasks land here.
 pub fn inbox_key(pod_id: &str) -> String {
     format!("wa-inbox:{pod_id}")
@@ -147,5 +157,19 @@ mod tests {
         let env: TaskEnvelope = serde_json::from_str(json).unwrap();
         assert_eq!(env.task_type, TaskType::Unknown);
         assert!(!env.task_type.is_pairing());
+    }
+
+    #[test]
+    fn pair_code_key_format() {
+        // The API reads whatever key the event bridge writes; the prefix must
+        // be the configurable knob, so pin the exact key shape here.
+        assert_eq!(
+            pair_code_key("wa-pair-code", "8618666206882@s.whatsapp.net"),
+            "wa-pair-code:8618666206882@s.whatsapp.net"
+        );
+        assert_eq!(
+            pair_code_key("custom", "j@s.whatsapp.net"),
+            "custom:j@s.whatsapp.net"
+        );
     }
 }

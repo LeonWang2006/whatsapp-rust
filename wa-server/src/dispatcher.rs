@@ -99,6 +99,7 @@ pub fn make_context(
     redis_client: redis::Client,
     pod_id: String,
     max_sessions: usize,
+    pair_code_key_prefix: String,
 ) -> ServerContext {
     ServerContext {
         registry,
@@ -107,5 +108,6 @@ pub fn make_context(
         redis_client,
         pod_id,
         max_sessions,
+        pair_code_key_prefix,
     }
 }
