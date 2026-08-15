@@ -6,8 +6,9 @@
 //! - `GET /health` — liveness. 200 as long as the process is up.
 //! - `GET /ready`  — readiness. 200 when the pod can accept sessions.
 //! - `GET /status` — JSON pod + session summary.
-//! - `GET /pair-code?jid=...` — poll the current 8-char pairing code from its
-//!   Redis key; 200 with `{jid, code}` while a code is live, 404 when none is.
+//! - `GET /pair-code?phone=...` — poll the current 8-char pairing code from its
+//!   Redis key (`{prefix}:{phone}`); 200 with `{phone, code}` while a code is
+//!   live, 404 when none is. `?jid=...` is also accepted and derives the phone.
 //! - `POST /send`  — build a `send_message` task and dispatch it.
 //! - `POST /react` — build a `react` task and dispatch it.
 //! - `POST /pair`  — build a `pair_code` task and dispatch it.
@@ -226,23 +227,27 @@ impl Api {
         dispatch_and_ack(ctx, task, jid)
     }
 
-    /// Poll the current pairing code for `jid` from its Redis key.
+    /// Poll the current pairing code for a phone number from its Redis key.
     ///
-    /// The code is written by the session's event bridge when `Event::PairingCode`
-    /// fires (see [`crate::event_bridge`]). 404 means no code is currently live
-    /// (still pairing, expired, or already logged in); the client polls again.
+    /// The key is `{prefix}:{phone}` (see [`crate::task::pair_code_key`]).
+    /// Accepts either `?phone=861866620688` or `?jid=861866620688@s.whatsapp.net`
+    /// (the JID form derives the phone automatically). 404 means no code is
+    /// currently live (still pairing, expired, or already logged in); the
+    /// client polls again.
     async fn handle_pair_code(ctx: ServerContext, req: Request<Body>) -> Response<Body> {
-        let jid = req
-            .uri()
-            .query()
-            .and_then(|q| query_param(q, "jid"))
-            .filter(|j| !j.is_empty());
-        let Some(jid) = jid else {
+        let query = req.uri().query().unwrap_or_default();
+        let phone = query_param(query, "phone")
+            .filter(|p| !p.is_empty())
+            .or_else(|| {
+                let jid = query_param(query, "jid")?;
+                crate::task::phone_from_jid(&jid).map(str::to_owned)
+            });
+        let Some(phone) = phone else {
             return Self::error_to_response(ApiError::BadRequest(
-                "missing required query param: jid".to_string(),
+                "missing required query param: phone (or jid)".to_string(),
             ));
         };
-        let key = crate::task::pair_code_key(&ctx.pair_code_key_prefix, &jid);
+        let key = crate::task::pair_code_key(&ctx.pair_code_key_prefix, &phone);
         let mut redis = ctx.redis.clone();
         match redis::Cmd::get(&key)
             .query_async::<Option<String>>(&mut redis)
@@ -250,14 +255,14 @@ impl Api {
         {
             Ok(Some(code)) => json_response(
                 StatusCode::OK,
-                &serde_json::json!({ "jid": jid, "code": code }),
+                &serde_json::json!({ "phone": phone, "code": code }),
             ),
             Ok(None) => json_response(
                 StatusCode::NOT_FOUND,
                 &serde_json::json!({ "error": "no pairing code currently live" }),
             ),
             Err(e) => {
-                error!("failed to GET pair code for jid={jid}: {e}");
+                error!("failed to GET pair code for phone={phone}: {e}");
                 Self::error_to_response(ApiError::InternalServerError)
             }
         }

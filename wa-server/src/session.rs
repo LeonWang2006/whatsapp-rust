@@ -85,6 +85,10 @@ pub async fn run_session(ctx: ServerContext, jid: String, first_task: Option<Tas
     let event_factory = ctx.storage_factory.clone();
     let event_registry = ctx.registry.clone();
     let event_pair_prefix = ctx.pair_code_key_prefix.clone();
+    // Key the pair-code Redis entry by the bare phone number when the session
+    // was created by a pair_code task; otherwise fall back to the JID.
+    let event_pair_phone = pair_phone_from_task(first_task.as_ref())
+        .or_else(|| crate::task::phone_from_jid(&jid).map(str::to_owned));
 
     let mut builder = Bot::builder()
         .with_backend_arc(backend)
@@ -96,11 +100,20 @@ pub async fn run_session(ctx: ServerContext, jid: String, first_task: Option<Tas
             let factory = event_factory.clone();
             let registry = event_registry.clone();
             let pair_prefix = event_pair_prefix.clone();
+            let pair_phone = event_pair_phone.clone();
             async move {
                 // Forward every event to the Redis event stream first so the
                 // business system learns about the logout/replacement and the
                 // pairing code / QR stream the admin polls.
-                forward_event_to_redis(&mut redis, &jid, &pod, &event, &pair_prefix).await;
+                forward_event_to_redis(
+                    &mut redis,
+                    &jid,
+                    &pod,
+                    &event,
+                    &pair_prefix,
+                    pair_phone.as_deref(),
+                )
+                .await;
 
                 // Lifecycle events trigger session teardown.
                 let (should_delete, label) = match &*event {
@@ -371,6 +384,17 @@ fn pair_code_options_from_task(task: Option<&TaskEnvelope>) -> Option<PairCodeOp
         phone_number: payload.phone_number,
         ..Default::default()
     })
+}
+
+/// The bare phone number a `pair_code` task carries, if this session was
+/// created by one. Used to key the pair-code Redis entry by phone number.
+fn pair_phone_from_task(task: Option<&TaskEnvelope>) -> Option<String> {
+    let task = task?;
+    if task.task_type != TaskType::PairCode {
+        return None;
+    }
+    let payload = serde_json::from_value::<PairCodePayload>(task.payload.clone()).ok()?;
+    Some(payload.phone_number)
 }
 
 async fn handle_pair_code(client: &Arc<whatsapp_rust::Client>, task_id: &str, p: PairCodePayload) {

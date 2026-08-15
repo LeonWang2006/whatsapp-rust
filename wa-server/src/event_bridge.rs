@@ -32,11 +32,12 @@ pub async fn forward_event_to_redis(
     pod_id: &str,
     event: &Event,
     pair_code_key_prefix: &str,
+    pair_phone: Option<&str>,
 ) {
     let ts = wacore::time::now_secs().max(0) as u64;
 
     // Maintain the pollable pairing-code key alongside the event stream.
-    sync_pair_code_key(redis, jid, event, pair_code_key_prefix).await;
+    sync_pair_code_key(redis, jid, pair_phone, event, pair_code_key_prefix).await;
 
     let envelope = EventEnvelope {
         jid,
@@ -66,13 +67,21 @@ pub async fn forward_event_to_redis(
 /// validity window; a `PairSuccess`, `PairingCodeError`, or `PairingCodeRefresh`
 /// invalidates the current code, so the key is removed. Everything else leaves
 /// it untouched.
+///
+/// The key is keyed by the bare phone number (`pair_phone`) when known, so a
+/// client can poll it without the `@s.whatsapp.net` suffix; otherwise the full
+/// JID is used.
 async fn sync_pair_code_key(
     redis: &mut ConnectionManager,
     jid: &str,
+    pair_phone: Option<&str>,
     event: &Event,
     pair_code_key_prefix: &str,
 ) {
-    let key = pair_code_key(pair_code_key_prefix, jid);
+    // `pair_phone` may be a different string than the JID's user part (the
+    // task's phone number wins), but both key the same logical pairing flow.
+    let key_part = pair_phone.unwrap_or(jid);
+    let key = pair_code_key(pair_code_key_prefix, key_part);
     match event {
         Event::PairingCode(pc) => {
             // `timeout` is the ~180s window during which the phone must enter

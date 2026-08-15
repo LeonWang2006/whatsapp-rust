@@ -66,9 +66,24 @@ pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
 /// `PAIR_CODE_KEY_PREFIX` env var.
 pub const PAIR_CODE_KEY_PREFIX: &str = "wa-pair-code";
 
-/// Redis key that holds the current 8-char pairing code for `jid`.
-pub fn pair_code_key(prefix: &str, jid: &str) -> String {
-    format!("{prefix}:{jid}")
+/// Redis key that holds the current 8-char pairing code for a phone number.
+///
+/// The key is keyed by the bare phone number (`wa-pair-code:8618666206882`)
+/// so the client can poll it without knowing the full `@s.whatsapp.net` JID.
+pub fn pair_code_key(prefix: &str, phone_or_jid: &str) -> String {
+    format!("{prefix}:{phone_or_jid}")
+}
+
+/// Extract the bare phone number from a `@s.whatsapp.net` JID, if it is one.
+/// Other JIDs (groups `@g.us`, LIDs `@lid`) yield `None`, in which case the
+/// caller falls back to the full JID for the key.
+pub fn phone_from_jid(jid: &str) -> Option<&str> {
+    let (user, domain) = jid.split_once('@')?;
+    if domain == "s.whatsapp.net" && user.chars().all(|c| c.is_ascii_digit()) {
+        Some(user)
+    } else {
+        None
+    }
 }
 
 /// Per-pod inbox key: `wa-inbox:{pod_id}`. Cross-pod forwarded tasks land here.
@@ -162,14 +177,26 @@ mod tests {
     #[test]
     fn pair_code_key_format() {
         // The API reads whatever key the event bridge writes; the prefix must
-        // be the configurable knob, so pin the exact key shape here.
+        // be the configurable knob, so pin the exact key shape here. Keyed by
+        // bare phone number, not the full JID.
         assert_eq!(
-            pair_code_key("wa-pair-code", "8618666206882@s.whatsapp.net"),
-            "wa-pair-code:8618666206882@s.whatsapp.net"
+            pair_code_key("wa-pair-code", "861866620688"),
+            "wa-pair-code:861866620688"
         );
         assert_eq!(
-            pair_code_key("custom", "j@s.whatsapp.net"),
-            "custom:j@s.whatsapp.net"
+            pair_code_key("custom", "861866620688"),
+            "custom:861866620688"
         );
+    }
+
+    #[test]
+    fn phone_from_jid_extracts_bare_number() {
+        assert_eq!(
+            phone_from_jid("861866620688@s.whatsapp.net"),
+            Some("861866620688")
+        );
+        // Groups and non-numeric user parts have no phone number to key on.
+        assert_eq!(phone_from_jid("1234@g.us"), None);
+        assert_eq!(phone_from_jid("not-a-number@s.whatsapp.net"), None);
     }
 }
