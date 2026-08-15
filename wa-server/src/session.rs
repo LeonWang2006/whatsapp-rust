@@ -121,7 +121,26 @@ pub async fn run_session(ctx: ServerContext, jid: String, first_task: Option<Tas
                     Event::StreamReplaced(_) => (false, "stream_replaced"),
                     _ => return,
                 };
-                info!("jid={jid} got {label}; tearing down session");
+                // Record why the session is going away before tearing it down, so
+                // ops can distinguish a user-initiated unlink (device_removed) from
+                // a server-side refusal (account locked, 401, temp ban, ...).
+                if let Event::LoggedOut(l) = &*event {
+                    let msg = l.logout_message.as_ref().map(|m| {
+                        format!(
+                            "header={:?} subtext={:?}",
+                            m.header.as_deref().unwrap_or(""),
+                            m.subtext.as_deref().unwrap_or("")
+                        )
+                    });
+                    info!(
+                        "jid={jid} logged out: on_connect={} reason={:?} logout_message={}",
+                        l.on_connect,
+                        l.reason,
+                        msg.as_deref().unwrap_or("n/a")
+                    );
+                } else {
+                    info!("jid={jid} got {label}; tearing down session");
+                }
                 if should_delete && let Err(e) = factory.delete_for_jid(&jid).await {
                     warn!("failed to delete device for jid={jid} on logout: {e}");
                 }
