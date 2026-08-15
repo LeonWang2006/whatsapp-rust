@@ -4183,24 +4183,31 @@ name = "wa-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-channel",
  "async-trait",
  "chrono",
  "dashmap",
  "env_logger",
  "futures",
+ "http 1.5.0",
  "hyper 0.14.32",
  "log",
  "redis",
+ "rustls",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
+ "tokio-websockets",
  "uuid",
  "wacore",
  "wacore-binary",
  "waproto",
+ "webpki-roots",
  "whatsapp-rust",
  "whatsapp-rust-postgres-storage",
+ "whatsapp-rust-tokio-transport",
 ]
 
 [[package]]

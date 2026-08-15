@@ -8,6 +8,7 @@ pub mod api;
 pub mod dispatcher;
 pub mod event_bridge;
 pub mod in_memory_factory;
+pub mod proxy_transport;
 pub mod redis_registry;
 pub mod registry;
 pub mod server;

@@ -144,6 +144,12 @@ pub async fn run_session(ctx: ServerContext, jid: String, first_task: Option<Tas
         builder = builder.with_pair_code(pair_options);
     }
 
+    // Optional HTTP proxy for environments that cannot reach WhatsApp directly
+    // (WA_PROXY_URL, e.g. http://127.0.0.1:7890). Unset keeps the default.
+    if let Some(proxy) = crate::proxy_transport::proxy_factory_from_env() {
+        builder = builder.with_transport_factory(proxy);
+    }
+
     let bot = builder.build().await;
 
     let bot = match bot {

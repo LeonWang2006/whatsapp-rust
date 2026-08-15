@@ -8,20 +8,27 @@ license = "MIT"
 
 [dependencies]
 anyhow = { workspace = true }
+async-channel = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true, features = ["now"] }
 dashmap = "6"
 env_logger = { workspace = true }
 futures = { workspace = true, features = ["std"] }
+http = "1.5.0"
 hyper = { version = "0.14", default-features = false, features = ["full"] }
 log = { workspace = true }
 redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["std"] }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "signal"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "signal", "net", "io-util"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring"] }
 tokio-util = { version = "0.7", features = ["rt"] }
+tokio-websockets = { version = "0.13.3", features = ["client", "ring"] }
+webpki-roots = "1.0.9"
 whatsapp-rust = { path = "..", version = "0.7.0" }
 whatsapp-rust-postgres-storage = { path = "../storages/postgres-storage", version = "0.7.0" }
+whatsapp-rust-tokio-transport = { path = "../transports/tokio-transport", version = "0.7.0" }
 wacore = { path = "../wacore", version = "0.7.0" }
 wacore-binary = { path = "../wacore/binary", version = "0.7.0" }
 waproto = { path = "../waproto", version = "0.7.0" }
