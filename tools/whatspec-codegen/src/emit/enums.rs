@@ -6,8 +6,16 @@
 //! by concatenating the variant values, so adding one variant upstream renames
 //! the entry; names also repeat across modules (`ACK`, `ENUM_LID_PN`,
 //! `EventType`), and 17 are proto-nested names `waproto` already generates from
-//! the `.proto`. None of those can carry a stable Rust type identity. So the
-//! split is: [`WANTED`] binds a name, a shape and any variant spellings, and
+//! the `.proto`. None of those can carry a stable Rust type identity.
+//!
+//! What makes an entry bindable is that its module owns the wire format we
+//! parse, not that its variants match ours. Two enums can agree on every value
+//! and still be unrelated -- the catalog's only `audio`/`video` pair belongs to
+//! the status composer, and binding it to the call-link media type would let a
+//! kind added for composing a status arrive in `<call_link>`. A variant set is
+//! how a candidate is found; the module is what decides.
+//!
+//! So the split is: [`WANTED`] binds a name, a shape and any variant spellings, and
 //! the IR owns everything that can drift -- which variants exist, what they
 //! carry, and whether integers are bit positions. A variant added upstream
 //! lands here on the next sync, and `--check` fails if the tree disagrees.
@@ -30,20 +38,53 @@ const HEADER: &str = "\
 
 ";
 
+/// Which variant carries `#[wire_default]`.
+///
+/// Stated per enum rather than inferred, because `WireEnum` emits `Default`
+/// whether or not we ask for one and falls back to the variant declared first.
+/// Variant order here is the catalog's, so inferring would hand upstream the
+/// power to change a default by reordering: `DecryptFailType` is listed
+/// `hide, show` and would have flipped this client's `Show` to `Hide` with no
+/// compile error and no failing test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WireDefault {
+    /// The protocol's default for this attribute, named by its wire value.
+    /// Checked against the catalog, so a value that is renamed or dropped
+    /// upstream fails generation rather than moving the default.
+    Wire(&'static str),
+    /// The protocol defines no default. `Default` still exists, since the
+    /// derive emits it unconditionally, and resolves to whichever variant the
+    /// catalog happens to list first; no meaning may be read into that value.
+    Unspecified,
+}
+
 /// How a catalog entry is bound to Rust.
+///
+/// The default rides on the shape rather than sitting beside it so that the
+/// combinations that do not exist cannot be written down: an enum always
+/// answers the question, and a mask set is never asked it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Shape {
     /// A `WireEnum` over the variant values, closed: a wire value outside the
     /// set is not representable. Mirrors an `attrEnumOrNullIfUnknown` field,
     /// where the official parser nulls what it does not recognize.
-    Closed,
+    Closed(WireDefault),
     /// The same, plus a `#[wire_fallback] Unknown(String)` arm keeping the wire
     /// bytes of a value this build does not model.
-    Open,
+    Open(WireDefault),
     /// Integer variants emitted as `pub const` masks named `<rust>_<VARIANT>`.
     /// `bitPosition` entries are shifted here so a caller never repeats the
-    /// shift.
+    /// shift. Constants have no `Default` to pin.
     Masks,
+}
+
+impl Shape {
+    fn default_value(self) -> Option<&'static str> {
+        match self {
+            Self::Closed(WireDefault::Wire(v)) | Self::Open(WireDefault::Wire(v)) => Some(v),
+            _ => None,
+        }
+    }
 }
 
 /// One catalog entry this repository binds, keyed the way the catalog is:
@@ -67,7 +108,7 @@ pub const WANTED: &[Wanted] = &[
         module: "WAWebHandleMsgCommon",
         name: "STANZA_MSG_TYPES",
         rust: "StanzaMessageType",
-        shape: Shape::Open,
+        shape: Shape::Open(WireDefault::Unspecified),
         renames: &[("medianotify", "MediaNotify")],
         doc: "The `type` attribute of an incoming `<message>` envelope.\n\
               ///\n\
@@ -80,7 +121,7 @@ pub const WANTED: &[Wanted] = &[
         module: "WAWebHandleMsgCommon",
         name: "POLL_TYPES",
         rust: "PollType",
-        shape: Shape::Closed,
+        shape: Shape::Closed(WireDefault::Unspecified),
         renames: &[],
         doc: "The `polltype` attribute of an incoming `<message><meta>` node.\n\
               ///\n\
@@ -92,7 +133,7 @@ pub const WANTED: &[Wanted] = &[
         module: "WAWebBackendJobs.flow",
         name: "EncMediaType",
         rust: "EncMediaType",
-        shape: Shape::Open,
+        shape: Shape::Open(WireDefault::Unspecified),
         renames: &[("livelocation", "LiveLocation")],
         doc: "The `mediatype` attribute of an `<enc>` node.\n\
               ///\n\
@@ -108,6 +149,49 @@ pub const WANTED: &[Wanted] = &[
         renames: &[],
         doc: "Bits of a receipt's `<meta mode>` bitmask.",
     },
+    Wanted {
+        module: "WAWebBackendJobs.flow",
+        name: "DecryptFailType",
+        rust: "DecryptFailMode",
+        shape: Shape::Closed(WireDefault::Wire("show")),
+        renames: &[],
+        doc: "The `decrypt-fail` attribute of an `<enc>` node.\n\
+              ///\n\
+              /// `Hide` is the server asking that a failure to decrypt this\n\
+              /// stanza not be surfaced to the user.",
+    },
+    Wanted {
+        module: "WAWebSchemaGroupMetadata",
+        name: "MemberAddMode",
+        rust: "MemberAddMode",
+        shape: Shape::Closed(WireDefault::Wire("admin_add")),
+        renames: &[],
+        doc: "Who may add participants to a group.",
+    },
+    Wanted {
+        module: "WAWebGroupHistoryShareMode",
+        name: "MemberShareGroupHistoryMode",
+        rust: "MemberShareHistoryMode",
+        shape: Shape::Closed(WireDefault::Wire("admin_share")),
+        renames: &[],
+        doc: "Who may share a group's history with a new participant.",
+    },
+    Wanted {
+        module: "WAWebSetPrivacyJob",
+        name: "PrivacyUserAction",
+        rust: "DisallowedListAction",
+        shape: Shape::Closed(WireDefault::Wire("add")),
+        renames: &[],
+        doc: "Whether a privacy disallowed-list entry is being added or removed.",
+    },
+    Wanted {
+        module: "WAWebGroupApiConst",
+        name: "GROUP_PARTICIPANT_TYPES",
+        rust: "GroupParticipantType",
+        shape: Shape::Closed(WireDefault::Wire("participant")),
+        renames: &[("superadmin", "SuperAdmin")],
+        doc: "A participant's role in a group.",
+    },
 ];
 
 pub fn generate(ir: &EnumsIr) -> Result<String> {
@@ -117,7 +201,7 @@ pub fn generate(ir: &EnumsIr) -> Result<String> {
     for wanted in WANTED {
         let def = lookup(ir, wanted)?;
         match wanted.shape {
-            Shape::Closed | Shape::Open => out.push_str(&wire_enum(wanted, def)?),
+            Shape::Closed(_) | Shape::Open(_) => out.push_str(&wire_enum(wanted, def)?),
             Shape::Masks => out.push_str(&masks(wanted, def)?),
         }
     }
@@ -174,16 +258,15 @@ fn wire_enum(wanted: &Wanted, def: &EnumDef) -> Result<String> {
         wanted.name
     );
 
-    let copy = if wanted.shape == Shape::Closed {
-        ", Copy"
-    } else {
-        ""
-    };
+    let open = matches!(wanted.shape, Shape::Open(_));
+    let copy = if open { "" } else { ", Copy" };
     let mut out = format!(
         "/// {}\n///\n/// Generated from `{}` in `{}`.\n#[derive(Debug, Clone{copy}, PartialEq, Eq, crate::WireEnum)]\npub enum {} {{\n",
         wanted.doc, wanted.name, def.module, wanted.rust
     );
 
+    let declared_default = wanted.shape.default_value();
+    let mut marked = 0usize;
     let mut used = BTreeSet::new();
     for variant in &def.variants {
         let Scalar::Str(wire) = &variant.value else {
@@ -201,10 +284,26 @@ fn wire_enum(wanted: &Wanted, def: &EnumDef) -> Result<String> {
             wanted.module,
             wanted.name
         );
+        if declared_default == Some(wire.as_str()) {
+            out.push_str("    #[wire_default]\n");
+            marked += 1;
+        }
         out.push_str(&format!("    #[wire = {}]\n    {ident},\n", rust_str(wire)));
     }
 
-    if wanted.shape == Shape::Open {
+    // Checked against what was emitted rather than against the catalog, so the
+    // assertion covers the write as well as the declaration: a default the
+    // catalog dropped and a default the loop failed to place both land here.
+    let expected = usize::from(declared_default.is_some());
+    ensure!(
+        marked == expected,
+        "{}::{} expected {expected} variant(s) to carry #[wire_default] and {marked} did; \
+         the declared default {declared_default:?} is not a wire value this catalog entry carries",
+        wanted.module,
+        wanted.name
+    );
+
+    if open {
         out.push_str(
             "    /// A value this build does not model, kept verbatim.\n    #[wire_fallback]\n    Unknown(String),\n",
         );
@@ -326,6 +425,35 @@ mod tests {
             wire_enum(wanted("POLL_TYPES"), &def("POLL_TYPES", "m", &["vote"])).expect("emit");
         assert!(!closed.contains("#[wire_fallback]"));
         assert!(closed.contains(", Copy,"));
+    }
+
+    /// The failure this guards is silent by nature: the derive always produces
+    /// a `Default`, so a declared default the catalog stopped carrying would
+    /// otherwise leave the first variant standing in for it.
+    #[test]
+    fn a_declared_default_the_catalog_dropped_stops_the_generator() {
+        let entry = wanted("DecryptFailType");
+        assert_eq!(entry.shape.default_value(), Some("show"));
+
+        let ok = wire_enum(entry, &def("DecryptFailType", "m", &["hide", "show"])).expect("emit");
+        // Placed on the declared value, not on whichever the catalog lists first.
+        assert!(ok.contains("#[wire_default]\n    #[wire = \"show\"]"));
+
+        let err = wire_enum(entry, &def("DecryptFailType", "m", &["hide", "suppress"]))
+            .expect_err("the declared default is gone");
+        assert!(err.to_string().contains("#[wire_default]"), "{err}");
+    }
+
+    /// The mirror case: an enum that declares no default must not pick one up
+    /// from a variant that happens to share the spelling of another's.
+    #[test]
+    fn an_unspecified_default_marks_nothing() {
+        let out = wire_enum(
+            wanted("POLL_TYPES"),
+            &def("POLL_TYPES", "m", &["vote", "show", "add"]),
+        )
+        .expect("emit");
+        assert!(!out.contains("#[wire_default]"));
     }
 
     /// The catalog repeats names across modules, so binding by name alone would

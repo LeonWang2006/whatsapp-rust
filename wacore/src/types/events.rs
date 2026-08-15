@@ -241,7 +241,11 @@ pub enum EventKind {
     IncomingCall,
     MissedCall,
     CallEndedElsewhere,
-    PushNameUpdate,
+    /// Retired: the payload promised an old-name/new-name comparison this
+    /// client has no contact store to make, and nothing ever dispatched it.
+    /// The slot stays because the discriminant is an `EventInterest` bit index
+    /// a consumer persists, so removing it would re-point every mask past it.
+    RetiredPushNameUpdate,
     SelfPushNameUpdated,
     PinUpdate,
     MuteUpdate,
@@ -630,6 +634,16 @@ impl CoreEventBus {
     }
 }
 
+/// Payload of the retired [`Event::RetiredPushNameUpdate`], kept only so that
+/// variant can keep its position in an index-based `Serialize` format.
+///
+/// Deliberately empty: the fields it used to carry named a comparison this
+/// repository cannot make, and leaving them would keep promising it. Nothing
+/// constructs this and nothing dispatches the variant it fills.
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct RetiredPushNameUpdate {}
+
 #[derive(Debug, Clone, Serialize, bon::Builder)]
 #[non_exhaustive]
 pub struct SelfPushNameUpdated {
@@ -921,7 +935,17 @@ pub enum Event {
     /// Rejected call-log outcomes (`<terminate reason="accepted_elsewhere"|"rejected_elsewhere">`).
     CallEndedElsewhere(CallEndedElsewhere),
 
-    PushNameUpdate(PushNameUpdate),
+    /// Retired: nothing dispatches this, and nothing can. The payload promised
+    /// an old-name/new-name comparison, and this repository holds no contact
+    /// store to source the previous name from. Read the current name from
+    /// [`crate::types::message::MessageInfo::push_name`] instead.
+    ///
+    /// The variant stays because its *position* is load-bearing, for the same
+    /// reason new variants are appended rather than inserted: an index-based
+    /// `Serialize` format keys variants by position, so dropping one renumbers
+    /// every variant after it and changes how already-stored events decode.
+    RetiredPushNameUpdate(RetiredPushNameUpdate),
+
     SelfPushNameUpdated(SelfPushNameUpdated),
     PinUpdate(PinUpdate),
     MuteUpdate(MuteUpdate),
@@ -1119,7 +1143,7 @@ impl Event {
             Event::IncomingCall(_) => EventKind::IncomingCall,
             Event::MissedCall(_) => EventKind::MissedCall,
             Event::CallEndedElsewhere(_) => EventKind::CallEndedElsewhere,
-            Event::PushNameUpdate(_) => EventKind::PushNameUpdate,
+            Event::RetiredPushNameUpdate(_) => EventKind::RetiredPushNameUpdate,
             Event::SelfPushNameUpdated(_) => EventKind::SelfPushNameUpdated,
             Event::AppStateSyncFailed(_) => EventKind::AppStateSyncFailed,
             Event::PinUpdate(_) => EventKind::PinUpdate,
@@ -1668,13 +1692,7 @@ pub struct DirtyState {
     pub timestamp: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, crate::WireEnum)]
-pub enum DecryptFailMode {
-    #[wire = "show"]
-    Show,
-    #[wire = "hide"]
-    Hide,
-}
+pub use crate::types::wire_enums::DecryptFailMode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, crate::WireEnum)]
 pub enum UnavailableType {
@@ -2205,16 +2223,6 @@ pub struct ContactUpdate {
     pub timestamp: DateTime<Utc>,
     pub action: Box<wa::sync_action_value::ContactAction>,
     pub from_full_sync: bool,
-}
-
-#[derive(Debug, Clone, Serialize, bon::Builder)]
-#[non_exhaustive]
-pub struct PushNameUpdate {
-    /// The contact who changed their push name.
-    pub jid: Jid,
-    pub message: Box<MessageInfo>,
-    pub old_push_name: String,
-    pub new_push_name: String,
 }
 
 #[derive(Debug, Clone, Serialize, bon::Builder)]
