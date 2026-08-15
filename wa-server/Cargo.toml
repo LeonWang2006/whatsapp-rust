@@ -1,0 +1,33 @@
+[package]
+name = "wa-server"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Multi-pod WhatsApp session server: Redis queue consumer + HTTP API"
+license = "MIT"
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true, features = ["now"] }
+dashmap = "6"
+env_logger = { workspace = true }
+futures = { workspace = true, features = ["std"] }
+hyper = { version = "0.14", default-features = false, features = ["full"] }
+log = { workspace = true }
+redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager"] }
+serde = { workspace = true }
+serde_json = { workspace = true, features = ["std"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "signal"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+whatsapp-rust = { path = "..", version = "0.7.0" }
+whatsapp-rust-postgres-storage = { path = "../storages/postgres-storage", version = "0.7.0" }
+wacore = { path = "../wacore", version = "0.7.0" }
+wacore-binary = { path = "../wacore/binary", version = "0.7.0" }
+waproto = { path = "../waproto", version = "0.7.0" }
+
+[dev-dependencies]
+uuid = { workspace = true, features = ["v4"] }
+
+[lints]
+workspace = true
