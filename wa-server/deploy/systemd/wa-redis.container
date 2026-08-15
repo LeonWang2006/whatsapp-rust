@@ -1,0 +1,31 @@
+# Quadlet unit: Redis 7 (wa-server task queue + registry + pair codes)
+# Install: cp wa-server/deploy/systemd/*.container ~/.config/containers/systemd/
+# Then: systemctl --user daemon-reload && systemctl --user start wa-redis
+#
+# Boot autostart: the [Install] section is auto-applied by the Quadlet generator
+# (no systemctl --user enable needed); WSL boot starts user default.target which
+# pulls these in via default.target.wants.
+
+[Unit]
+Description=WhatsApp Rust Redis (wa-redis)
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+ContainerName=wa-redis
+Image=docker.io/library/redis:latest
+Exec=redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy noeviction
+PublishPort=6379:6379
+Volume=compose_redis_data:/data
+HealthCmd=redis-cli ping
+HealthInterval=10s
+HealthTimeout=3s
+HealthRetries=5
+HealthStartPeriod=5s
+
+[Service]
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
