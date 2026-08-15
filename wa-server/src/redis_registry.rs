@@ -54,13 +54,13 @@ pub async fn unregister_in_redis(redis: &mut ConnectionManager, jid: &str, pod_i
     let lease_key = format!("{LEASE_PREFIX}{jid}");
     // Lua-free best effort: HDEL the map entry, then DEL the lease only if it
     // still points at us. A stale lease from a crashed pod will simply expire.
-    let mut pipe = redis::pipe();
-    pipe.atomic()
-        .hdel(REGISTRY_KEY, jid)
-        .ignore()
-        .get(&lease_key);
-    let current: Option<String> = match pipe.query_async(redis).await {
-        Ok(((), current)) => current,
+    // Run HDEL and the lease GET as separate commands: the `ignore()`d HDEL in a
+    // single atomic pipeline shifts the GET's response position, and `query_async`
+    // then mis-decodes it ("Array response of wrong dimension"), which left the
+    // lease behind to linger until its TTL.
+    let _: redis::RedisResult<()> = redis::Cmd::hdel(REGISTRY_KEY, jid).query_async(redis).await;
+    let current: Option<String> = match redis::Cmd::get(&lease_key).query_async(redis).await {
+        Ok(c) => c,
         Err(e) => {
             warn!("failed to read lease for jid={jid} during unregister: {e}");
             return;
