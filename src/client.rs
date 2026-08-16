@@ -474,6 +474,8 @@ pub struct MemoryReport {
     pub session_locks: u64,
     /// Addresses with a session establishment in flight; normally zero.
     pub ensure_inflight: u64,
+    /// Groups with a metadata query in flight; normally zero.
+    pub group_metadata_inflight: u64,
     pub chat_lanes: u64,
     pub group_distribution_locks: u64,
     /// Cumulative capacity evictions; poll successive reports to derive a rate.
@@ -623,6 +625,11 @@ impl std::fmt::Display for MemoryReport {
         writeln!(f, "--- Capacity-only caches ---")?;
         writeln!(f, "  session_locks:          {}", self.session_locks)?;
         writeln!(f, "  ensure_inflight:        {}", self.ensure_inflight)?;
+        writeln!(
+            f,
+            "  group_metadata_inflight:{}",
+            self.group_metadata_inflight
+        )?;
         writeln!(f, "  chat_lanes:             {}", self.chat_lanes)?;
         writeln!(
             f,
@@ -1295,6 +1302,13 @@ pub struct Client {
     /// Holds only what is in flight — normally empty — so it is a plain map
     /// rather than a capacity-bounded cache.
     pub(crate) ensure_inflight: Arc<sessions::EnsureRegistry>,
+
+    /// Group-metadata queries in flight, so a burst of callers for one group
+    /// shares a single round trip. See [`GroupMetadataRegistry`] for why only
+    /// `get_metadata` needs it.
+    ///
+    /// [`GroupMetadataRegistry`]: crate::features::GroupMetadataRegistry
+    pub(crate) group_metadata_inflight: Arc<crate::features::GroupMetadataRegistry>,
 
     /// Per-chat lane combining enqueue lock + message queue into a single cached entry.
     /// One cache lookup instead of two per incoming message.
