@@ -91,6 +91,33 @@ pub fn inbox_key(pod_id: &str) -> String {
     format!("wa-inbox:{pod_id}")
 }
 
+/// Number of `wa-queue` shards. Must match the producer side (`QUEUE_SHARDS`
+/// in `server.rs`) and the shell producer (`demo-inject.sh`, crc32 % 16).
+pub const QUEUE_SHARDS: usize = 16;
+
+/// Which `wa-queue:{shard}` key a JID belongs to.
+///
+/// Same algorithm as the shell producer (`python binascii.crc32 % 16`) so an
+/// API-side push lands on the same shard `demo-inject.sh` would use and the
+/// same session stays shard-stable across producers.
+pub fn shard_for_jid(jid: &str) -> usize {
+    (crc32(jid.as_bytes()) % QUEUE_SHARDS as u32) as usize
+}
+
+/// Standard IEEE CRC-32 (poly 0xEDB88320, init 0xFFFFFFFF, final xor
+/// 0xFFFFFFFF), the same variant Python's `binascii.crc32` returns.
+pub fn crc32(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    crc ^ 0xFFFF_FFFF
+}
+
 /// Payload for `send_message` tasks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SendMessagePayload {
@@ -198,5 +225,29 @@ mod tests {
         // Groups and non-numeric user parts have no phone number to key on.
         assert_eq!(phone_from_jid("1234@g.us"), None);
         assert_eq!(phone_from_jid("not-a-number@s.whatsapp.net"), None);
+    }
+
+    #[test]
+    fn crc32_matches_python_binascii() {
+        // Expected values from `python3 -c "import binascii;print(binascii.crc32(b'...'))"`.
+        assert_eq!(crc32(b""), 0);
+        assert_eq!(crc32(b"a"), 0xE8B7_BE43);
+        assert_eq!(crc32(b"abc"), 0x3524_41C2);
+        assert_eq!(crc32(b"8618666206882@s.whatsapp.net"), 0x5F5B_7685);
+    }
+
+    #[test]
+    fn shard_for_jid_is_stable_and_in_range() {
+        let jids = [
+            "8618666206882@s.whatsapp.net",
+            "15550000001@s.whatsapp.net",
+            "447907841573@s.whatsapp.net",
+            "1234@g.us",
+        ];
+        for j in &jids {
+            let s = shard_for_jid(j);
+            assert!(s < QUEUE_SHARDS, "shard {s} out of range for {j}");
+            assert_eq!(shard_for_jid(j), s, "shard not stable for {j}");
+        }
     }
 }

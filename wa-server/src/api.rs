@@ -12,6 +12,9 @@
 //! - `POST /send`  — build a `send_message` task and dispatch it.
 //! - `POST /react` — build a `react` task and dispatch it.
 //! - `POST /pair`  — build a `pair_code` task and dispatch it.
+//! - `POST /link`  — business link action: push a `pair_code` task onto the
+//!   shared Redis `wa-queue` so any pod's server loop consumes it (the
+//!   multi-pod path; `/pair` stays for local single-pod debugging).
 //!
 //! `/send`, `/react`, `/pair` are synchronous dispatch: they enqueue into the
 //! local session's command channel (or spawn a session for pairing tasks) and
@@ -27,7 +30,9 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 
 use crate::session::ServerContext;
-use crate::task::{PairCodePayload, ReactPayload, SendMessagePayload, TaskEnvelope, TaskType};
+use crate::task::{
+    PairCodePayload, ReactPayload, SendMessagePayload, TaskEnvelope, TaskType, shard_for_jid,
+};
 
 #[derive(Clone)]
 pub struct Api {
@@ -84,6 +89,22 @@ struct PairRequest {
     phone_number: String,
 }
 
+/// Business `link` request: a client asks the server to pair a contact's phone
+/// number with WhatsApp and obtain the 8-char pairing code. The code is pushed
+/// onto the shared Redis `wa-queue` (multi-pod), and the code is later polled
+/// via `GET /pair-code?phone=...`.
+#[derive(Debug, Serialize, Deserialize)]
+struct LinkRequest {
+    /// Business user id (`biz.wa_user.id`). Optional — used for audit only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    user_id: Option<i64>,
+    /// Client device uuid (`biz.wa_user.device_uuid`). Optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    device_uuid: Option<String>,
+    /// Contact phone number (E.164, digits only) to pair.
+    phone_number: String,
+}
+
 enum ApiError {
     NotFound,
     #[allow(dead_code)]
@@ -134,6 +155,7 @@ impl Api {
             ("POST", "/send") => Self::handle_send(ctx, req).await,
             ("POST", "/react") => Self::handle_react(ctx, req).await,
             ("POST", "/pair") => Self::handle_pair(ctx, req).await,
+            ("POST", "/link") => Self::handle_link(ctx, req).await,
             _ => Self::handle_not_found(),
         };
         Ok(response)
@@ -227,7 +249,70 @@ impl Api {
         dispatch_and_ack(ctx, task, jid)
     }
 
-    /// Poll the current pairing code for a phone number from its Redis key.
+    /// Business `link` action: push a `pair_code` task onto the shared Redis
+    /// `wa-queue` for any pod to consume.
+    ///
+    /// Unlike `/pair` (which dispatches into the local process), this is the
+    /// multi-pod path: the API pushes onto `wa-queue:{shard}` and whichever
+    /// pod's shard consumer picks it up requests the 8-char code. The code is
+    /// then polled via `GET /pair-code?phone=...`.
+    async fn handle_link(ctx: ServerContext, req: Request<Body>) -> Response<Body> {
+        let parsed: Result<LinkRequest, serde_json::Error> =
+            serde_json::from_slice(&body_bytes(req).await);
+        let request = match parsed {
+            Ok(r) => r,
+            Err(e) => return Self::error_to_response(ApiError::BadRequest(e.to_string())),
+        };
+        if request.phone_number.trim().is_empty() {
+            return Self::error_to_response(ApiError::BadRequest(
+                "missing required field: phone_number".to_string(),
+            ));
+        }
+        let phone = request.phone_number.trim().to_string();
+        let jid = format!("{phone}@s.whatsapp.net");
+        let payload = serde_json::to_value(PairCodePayload {
+            phone_number: phone.clone(),
+        })
+        .unwrap_or(serde_json::Value::Null);
+        let (task, jid) = build_envelope(jid, TaskType::PairCode, payload);
+        let task_id = task.task_id.clone();
+
+        // Push onto the sharded queue, not the local dispatch path.
+        let shard = shard_for_jid(&jid);
+        let key = format!("{}:{shard}", crate::task::QUEUE_PREFIX);
+        let mut conn = match ctx.redis_client.get_multiplexed_tokio_connection().await {
+            Ok(c) => c,
+            Err(e) => {
+                error!("link: failed to open redis connection: {e}");
+                return Self::error_to_response(ApiError::InternalServerError);
+            }
+        };
+        let payload_bytes = match serde_json::to_vec(&task) {
+            Ok(b) => b,
+            Err(e) => {
+                error!("link: failed to serialize task: {e}");
+                return Self::error_to_response(ApiError::InternalServerError);
+            }
+        };
+        match redis::Cmd::lpush(&key, payload_bytes)
+            .query_async::<()>(&mut conn)
+            .await
+        {
+            Ok(()) => {
+                info!("link: pushed pair_code task={task_id} phone={phone} to {key}");
+                let body = AckResponse {
+                    accepted: true,
+                    task_id,
+                    jid,
+                };
+                json_response(StatusCode::ACCEPTED, &body)
+            }
+            Err(e) => {
+                error!("link: failed to LPUSH to {key}: {e}");
+                Self::error_to_response(ApiError::InternalServerError)
+            }
+        }
+    }
     ///
     /// The key is `{prefix}:{phone}` (see [`crate::task::pair_code_key`]).
     /// Accepts either `?phone=861866620688` or `?jid=861866620688@s.whatsapp.net`
