@@ -15,7 +15,7 @@ use std::time::Duration;
 use log::{error, info, warn};
 use tokio_util::sync::CancellationToken;
 
-use crate::dispatcher::{dispatch, make_context};
+use crate::dispatcher::dispatch;
 use crate::redis_registry::unregister_in_redis;
 use crate::registry::SessionRegistry;
 use crate::session::ServerContext;
@@ -41,6 +41,9 @@ pub struct Server {
     max_sessions: usize,
     /// Prefix for per-JID pair-code keys written to Redis for the API to serve.
     pair_code_key_prefix: String,
+    /// Prefix for per-phone link-status keys written to Redis for the API to
+    /// serve (`GET /link-status`).
+    link_status_key_prefix: String,
 }
 
 impl Server {
@@ -50,6 +53,7 @@ impl Server {
         redis_client: redis::Client,
         pod_id: String,
         pair_code_key_prefix: String,
+        link_status_key_prefix: String,
     ) -> Self {
         Self {
             storage_factory,
@@ -60,6 +64,7 @@ impl Server {
             shutdown: CancellationToken::new(),
             max_sessions: 0,
             pair_code_key_prefix,
+            link_status_key_prefix,
         }
     }
 
@@ -99,15 +104,16 @@ impl Server {
     /// Main consumer loop. Runs until `shutdown` is cancelled, then drains
     /// live sessions.
     pub async fn run(self) {
-        let ctx = make_context(
-            self.registry.clone(),
-            self.storage_factory.clone(),
-            self.redis.clone(),
-            self.redis_client.clone(),
-            self.pod_id.clone(),
-            self.max_sessions,
-            self.pair_code_key_prefix.clone(),
-        );
+        let ctx = ServerContext {
+            registry: self.registry.clone(),
+            storage_factory: self.storage_factory.clone(),
+            redis: self.redis.clone(),
+            redis_client: self.redis_client.clone(),
+            pod_id: self.pod_id.clone(),
+            max_sessions: self.max_sessions,
+            pair_code_key_prefix: self.pair_code_key_prefix.clone(),
+            link_status_key_prefix: self.link_status_key_prefix.clone(),
+        };
 
         // One BRPOP task per shard. Each pulls tasks off its own shard key.
         let mut consumer_handles = Vec::new();

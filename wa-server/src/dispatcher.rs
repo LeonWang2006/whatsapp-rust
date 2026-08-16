@@ -8,7 +8,6 @@
 use log::{info, warn};
 
 use crate::redis_registry::lookup_pod;
-use crate::registry::SessionRegistry;
 use crate::session::{ServerContext, run_session};
 use crate::task::{SessionCommand, TaskEnvelope, inbox_key};
 
@@ -88,26 +87,5 @@ pub async fn dispatch(ctx: &ServerContext, task: TaskEnvelope) {
         None => {
             warn!("task for jid={jid} has no owner and is not a pairing task; dropped");
         }
-    }
-}
-
-/// Build a `ServerContext` convenience constructor.
-pub fn make_context(
-    registry: SessionRegistry,
-    storage_factory: std::sync::Arc<dyn crate::storage_factory::StorageFactory>,
-    redis: redis::aio::ConnectionManager,
-    redis_client: redis::Client,
-    pod_id: String,
-    max_sessions: usize,
-    pair_code_key_prefix: String,
-) -> ServerContext {
-    ServerContext {
-        registry,
-        storage_factory,
-        redis,
-        redis_client,
-        pod_id,
-        max_sessions,
-        pair_code_key_prefix,
     }
 }

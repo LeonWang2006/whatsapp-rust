@@ -44,6 +44,9 @@ pub struct ServerContext {
     pub max_sessions: usize,
     /// Prefix for per-JID pair-code keys written to Redis for the API to serve.
     pub pair_code_key_prefix: String,
+    /// Prefix for per-phone link-status keys written to Redis for the API to
+    /// serve (`GET /link-status`).
+    pub link_status_key_prefix: String,
 }
 
 /// Build and run one session for `jid`. `first_task` (if present) is delivered
@@ -54,10 +57,14 @@ pub async fn run_session(ctx: ServerContext, jid: String, first_task: Option<Tas
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<SessionCommand>(64);
 
     // Resolve or lazily create the storage backend for this JID.
-    let backend = match ctx.storage_factory.for_jid(&jid).await {
-        Some(b) => b,
+    // `device_existed` distinguishes a fresh device (needs pairing) from one
+    // that already has credentials (resume): for the latter, a `pair_code` task
+    // must not request a code — the device is already linked and asking for one
+    // would both be redundant and surface a false failure.
+    let (backend, device_existed) = match ctx.storage_factory.for_jid(&jid).await {
+        Some(b) => (b, true),
         None => match ctx.storage_factory.create_for_jid(&jid).await {
-            Ok((_, b)) => b,
+            Ok((_, b)) => (b, false),
             Err(e) => {
                 error!("failed to create device for jid={jid}: {e}");
                 return;
@@ -85,6 +92,8 @@ pub async fn run_session(ctx: ServerContext, jid: String, first_task: Option<Tas
     let event_factory = ctx.storage_factory.clone();
     let event_registry = ctx.registry.clone();
     let event_pair_prefix = ctx.pair_code_key_prefix.clone();
+    let event_link_status_prefix = ctx.link_status_key_prefix.clone();
+    let event_device_existed = device_existed;
     // Key the pair-code Redis entry by the bare phone number when the session
     // was created by a pair_code task; otherwise fall back to the JID.
     let event_pair_phone = pair_phone_from_task(first_task.as_ref())
@@ -100,18 +109,24 @@ pub async fn run_session(ctx: ServerContext, jid: String, first_task: Option<Tas
             let factory = event_factory.clone();
             let registry = event_registry.clone();
             let pair_prefix = event_pair_prefix.clone();
+            let link_status_prefix = event_link_status_prefix.clone();
             let pair_phone = event_pair_phone.clone();
+            let device_existed = event_device_existed;
             async move {
                 // Forward every event to the Redis event stream first so the
                 // business system learns about the logout/replacement and the
                 // pairing code / QR stream the admin polls.
                 forward_event_to_redis(
                     &mut redis,
-                    &jid,
-                    &pod,
+                    crate::event_bridge::EventForwardConfig {
+                        jid: &jid,
+                        pod_id: &pod,
+                        pair_code_key_prefix: &pair_prefix,
+                        link_status_key_prefix: &link_status_prefix,
+                        device_existed,
+                        pair_phone: pair_phone.as_deref(),
+                    },
                     &event,
-                    &pair_prefix,
-                    pair_phone.as_deref(),
                 )
                 .await;
 
@@ -159,7 +174,13 @@ pub async fn run_session(ctx: ServerContext, jid: String, first_task: Option<Tas
     // calling `pair_with_code` from the command loop before the socket exists
     // (which fails with `client is not connected`). The generated code is
     // dispatched as `Event::PairingCode` and bridged to `wa-events` above.
-    if let Some(pair_options) = pair_code_options_from_task(first_task.as_ref()) {
+    //
+    // Only for a *fresh* device: one that already has credentials must not
+    // request a code — it is already linked, and the request would fail with
+    // `client is not connected` during the resume handshake, surfacing a false
+    // failure on the link-status key.
+    if !device_existed && let Some(pair_options) = pair_code_options_from_task(first_task.as_ref())
+    {
         builder = builder.with_pair_code(pair_options);
     }
 
@@ -192,9 +213,13 @@ pub async fn run_session(ctx: ServerContext, jid: String, first_task: Option<Tas
     ctx.registry.insert(session_handle.clone());
 
     // Deliver the task that triggered session creation, UNLESS it was a
-    // `pair_code` task consumed above to configure `with_pair_code` — the
-    // library already requested the code once the socket came up, so
-    // re-running `handle_pair_code` would request a second, duplicate code.
+    // `pair_code` task. For a fresh device the task was consumed above to
+    // configure `with_pair_code` (the library already requested the code once
+    // the socket came up, so re-running `handle_pair_code` would request a
+    // second, duplicate code). For an existing device `with_pair_code` was
+    // deliberately NOT configured — the device is already linked — and
+    // `handle_pair_code` would request a code that must not be requested, so
+    // the task is consumed as a resume trigger either way.
     if let Some(task) = first_task {
         let already_paired_via_builder = task.task_type == TaskType::PairCode;
         if !already_paired_via_builder {

@@ -9,6 +9,10 @@
 //! - `GET /pair-code?phone=...` — poll the current 8-char pairing code from its
 //!   Redis key (`{prefix}:{phone}`); 200 with `{phone, code}` while a code is
 //!   live, 404 when none is. `?jid=...` is also accepted and derives the phone.
+//! - `GET /link-status?phone=...` — poll the pairing flow's outcome from its
+//!   Redis key (`{link_prefix}:{phone}`): `{status: pairing|success|failed}`,
+//!   with `code` while pairing and `error` on failure. 404 when no flow is
+//!   known for the phone. `?jid=...` is also accepted.
 //! - `POST /send`  — build a `send_message` task and dispatch it.
 //! - `POST /react` — build a `react` task and dispatch it.
 //! - `POST /pair`  — build a `pair_code` task and dispatch it.
@@ -31,7 +35,8 @@ use std::net::SocketAddr;
 
 use crate::session::ServerContext;
 use crate::task::{
-    PairCodePayload, ReactPayload, SendMessagePayload, TaskEnvelope, TaskType, shard_for_jid,
+    LinkStatus, LinkStatusKind, PairCodePayload, ReactPayload, SendMessagePayload, TaskEnvelope,
+    TaskType, shard_for_jid,
 };
 
 #[derive(Clone)]
@@ -152,6 +157,7 @@ impl Api {
             ("GET", "/ready") => Self::handle_ready(&ctx),
             ("GET", "/status") => Self::handle_status(&ctx),
             ("GET", "/pair-code") => Self::handle_pair_code(ctx, req).await,
+            ("GET", "/link-status") => Self::handle_link_status(ctx, req).await,
             ("POST", "/send") => Self::handle_send(ctx, req).await,
             ("POST", "/react") => Self::handle_react(ctx, req).await,
             ("POST", "/pair") => Self::handle_pair(ctx, req).await,
@@ -255,7 +261,12 @@ impl Api {
     /// Unlike `/pair` (which dispatches into the local process), this is the
     /// multi-pod path: the API pushes onto `wa-queue:{shard}` and whichever
     /// pod's shard consumer picks it up requests the 8-char code. The code is
-    /// then polled via `GET /pair-code?phone=...`.
+    /// then polled via `GET /pair-code?phone=...` and the flow's outcome via
+    /// `GET /link-status?phone=...`.
+    ///
+    /// The per-phone link-status key is reset to `pairing` here so a stale
+    /// terminal state from a previous flow (e.g. a `failed`) does not linger
+    /// after the client initiates a fresh link.
     async fn handle_link(ctx: ServerContext, req: Request<Body>) -> Response<Body> {
         let parsed: Result<LinkRequest, serde_json::Error> =
             serde_json::from_slice(&body_bytes(req).await);
@@ -294,12 +305,31 @@ impl Api {
                 return Self::error_to_response(ApiError::InternalServerError);
             }
         };
-        match redis::Cmd::lpush(&key, payload_bytes)
-            .query_async::<()>(&mut conn)
-            .await
-        {
+        // Reset the link-status key to `pairing` so a previous terminal state
+        // doesn't linger. Use the phone-keyed status key (same shape the worker
+        // writes); set with a generous TTL — the worker's real `pairing`+code
+        // write will supersede it as soon as the code is minted.
+        let status_key = crate::task::link_status_key(&ctx.link_status_key_prefix, &phone);
+        let reset_status = LinkStatus {
+            status: LinkStatusKind::Pairing,
+            code: None,
+            error: None,
+            updated_at: wacore::time::now_secs().max(0) as i64,
+        };
+        let reset_body = serde_json::to_vec(&reset_status).unwrap_or_default();
+        let mut pipe = redis::pipe();
+        pipe.atomic()
+            .lpush(&key, payload_bytes)
+            .ignore()
+            .set(&status_key, reset_body)
+            .ignore()
+            .expire(&status_key, crate::task::LINK_STATUS_RESET_TTL_SECS)
+            .ignore();
+        match pipe.query_async::<()>(&mut conn).await {
             Ok(()) => {
-                info!("link: pushed pair_code task={task_id} phone={phone} to {key}");
+                info!(
+                    "link: pushed pair_code task={task_id} phone={phone} to {key}; reset link status"
+                );
                 let body = AckResponse {
                     accepted: true,
                     task_id,
@@ -348,6 +378,62 @@ impl Api {
             ),
             Err(e) => {
                 error!("failed to GET pair code for phone={phone}: {e}");
+                Self::error_to_response(ApiError::InternalServerError)
+            }
+        }
+    }
+
+    /// Poll the pairing flow's outcome for a phone number from its Redis key.
+    ///
+    /// The key is `{link_prefix}:{phone}` (see [`crate::task::link_status_key`]).
+    /// Accepts either `?phone=861866620688` or `?jid=861866620688@s.whatsapp.net`
+    /// (the JID form derives the phone automatically). 200 with
+    /// `{phone, status, code?, error?, updated_at}` while a flow is known;
+    /// 404 when none is (no link initiated, or the terminal state expired).
+    ///
+    /// `status` is one of `pairing` / `success` / `failed`. On `failed` the
+    /// client shows `error` and may retry by calling `POST /link` again.
+    async fn handle_link_status(ctx: ServerContext, req: Request<Body>) -> Response<Body> {
+        let query = req.uri().query().unwrap_or_default();
+        let phone = query_param(query, "phone")
+            .filter(|p| !p.is_empty())
+            .or_else(|| {
+                let jid = query_param(query, "jid")?;
+                crate::task::phone_from_jid(&jid).map(str::to_owned)
+            });
+        let Some(phone) = phone else {
+            return Self::error_to_response(ApiError::BadRequest(
+                "missing required query param: phone (or jid)".to_string(),
+            ));
+        };
+        let key = crate::task::link_status_key(&ctx.link_status_key_prefix, &phone);
+        let mut redis = ctx.redis.clone();
+        match redis::Cmd::get(&key)
+            .query_async::<Option<String>>(&mut redis)
+            .await
+        {
+            Ok(Some(raw)) => match serde_json::from_str::<LinkStatus>(&raw) {
+                Ok(status) => json_response(
+                    StatusCode::OK,
+                    &serde_json::json!({
+                        "phone": phone,
+                        "status": status.status,
+                        "code": status.code,
+                        "error": status.error,
+                        "updated_at": status.updated_at,
+                    }),
+                ),
+                Err(e) => {
+                    error!("link-status for phone={phone} is corrupt: {e}");
+                    Self::error_to_response(ApiError::InternalServerError)
+                }
+            },
+            Ok(None) => json_response(
+                StatusCode::NOT_FOUND,
+                &serde_json::json!({ "error": "no link status for this phone" }),
+            ),
+            Err(e) => {
+                error!("failed to GET link status for phone={phone}: {e}");
                 Self::error_to_response(ApiError::InternalServerError)
             }
         }

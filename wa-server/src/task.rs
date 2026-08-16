@@ -74,6 +74,55 @@ pub fn pair_code_key(prefix: &str, phone_or_jid: &str) -> String {
     format!("{prefix}:{phone_or_jid}")
 }
 
+/// Default prefix for the per-phone link-status keys the API serves to clients
+/// that poll for the pairing flow's outcome. Overridable via the
+/// `LINK_STATUS_KEY_PREFIX` env var.
+pub const LINK_STATUS_KEY_PREFIX: &str = "wa-link-status";
+
+/// TTL for the terminal (success/failed) link status. Long enough that a slow
+/// client still sees the outcome of a pairing flow it triggered.
+pub const LINK_STATUS_TERMINAL_TTL_SECS: i64 = 24 * 3600;
+
+/// TTL for the reset `pairing` status written by `POST /link` before any code
+/// is minted. Generous so a slow handshake doesn't expire it before the worker
+/// writes the real `pairing`+code state.
+pub const LINK_STATUS_RESET_TTL_SECS: i64 = 300;
+
+/// Redis key that holds the JSON [`LinkStatus`] for a phone number.
+///
+/// Keyed by the bare phone number (`wa-link-status:8618666206882`) like the
+/// pair-code key, so the client polls it without the JID suffix.
+pub fn link_status_key(prefix: &str, phone_or_jid: &str) -> String {
+    format!("{prefix}:{phone_or_jid}")
+}
+
+/// Progress of a phone-number pairing flow, persisted to Redis by the session
+/// worker as the flow advances and polled by the client via `GET /link-status`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinkStatus {
+    pub status: LinkStatusKind,
+    /// The 8-char code while waiting for phone confirmation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    /// Human-readable reason when `status` is `failed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Unix seconds when this status was written.
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkStatusKind {
+    /// Code minted (or `/link` accepted), waiting for the phone to confirm.
+    Pairing,
+    /// Pairing succeeded; the device is online.
+    Success,
+    /// Pairing failed; the client should surface the error and may retry by
+    /// calling `/link` again.
+    Failed,
+}
+
 /// Extract the bare phone number from a `@s.whatsapp.net` JID, if it is one.
 /// Other JIDs (groups `@g.us`, LIDs `@lid`) yield `None`, in which case the
 /// caller falls back to the full JID for the key.
@@ -212,6 +261,45 @@ mod tests {
         );
         assert_eq!(
             pair_code_key("custom", "861866620688"),
+            "custom:861866620688"
+        );
+    }
+
+    #[test]
+    fn link_status_roundtrip() {
+        let status = LinkStatus {
+            status: LinkStatusKind::Pairing,
+            code: Some("39X486Z6".into()),
+            error: None,
+            updated_at: 1_700_000_000,
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        let back: LinkStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.status, LinkStatusKind::Pairing);
+        assert_eq!(back.code.as_deref(), Some("39X486Z6"));
+        assert!(back.error.is_none());
+        // Failed carries an error and no code.
+        let failed = LinkStatus {
+            status: LinkStatusKind::Failed,
+            code: None,
+            error: Some("rate-overlimit".into()),
+            updated_at: 1_700_000_000,
+        };
+        let back: LinkStatus =
+            serde_json::from_str(&serde_json::to_string(&failed).unwrap()).unwrap();
+        assert_eq!(back.status, LinkStatusKind::Failed);
+        assert!(back.code.is_none());
+        assert_eq!(back.error.as_deref(), Some("rate-overlimit"));
+    }
+
+    #[test]
+    fn link_status_key_format() {
+        assert_eq!(
+            link_status_key("wa-link-status", "861866620688"),
+            "wa-link-status:861866620688"
+        );
+        assert_eq!(
+            link_status_key("custom", "861866620688"),
             "custom:861866620688"
         );
     }

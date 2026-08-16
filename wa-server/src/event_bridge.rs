@@ -10,13 +10,20 @@
 //! The key lives only as long as the code is valid (`timeout`, ~180s) and is
 //! cleared as soon as the code is superseded, the flow fails, or the device
 //! logs in.
+//!
+//! The same events also drive a per-phone link-status key
+//! ([`link_status_key`], [`LinkStatus`]) that tracks the whole pairing flow's
+//! outcome — pairing / success / failed — so a client can tell whether a link
+//! succeeded or what to surface on failure, and retry by calling `/link` again.
 
 use log::warn;
 use redis::aio::ConnectionManager;
 use serde::Serialize;
 use wacore::types::events::Event;
 
-use crate::task::{EVENT_QUEUE, pair_code_key};
+use crate::task::{EVENT_QUEUE, LinkStatus, LinkStatusKind, pair_code_key};
+
+use crate::task::link_status_key;
 
 #[derive(Serialize)]
 struct EventEnvelope<'a> {
@@ -26,18 +33,48 @@ struct EventEnvelope<'a> {
     event: &'a Event,
 }
 
+/// Per-session configuration the event bridge needs to forward an event.
+/// Bundled so `forward_event_to_redis` doesn't grow an unwieldy argument list.
+#[derive(Clone)]
+pub struct EventForwardConfig<'a> {
+    pub jid: &'a str,
+    pub pod_id: &'a str,
+    pub pair_code_key_prefix: &'a str,
+    pub link_status_key_prefix: &'a str,
+    /// Whether the device already had credentials before this session started
+    /// (a resume rather than a fresh pairing).
+    pub device_existed: bool,
+    /// Bare phone number to key the pair-code/link-status keys by, when known.
+    pub pair_phone: Option<&'a str>,
+}
+
 pub async fn forward_event_to_redis(
     redis: &mut ConnectionManager,
-    jid: &str,
-    pod_id: &str,
+    cfg: EventForwardConfig<'_>,
     event: &Event,
-    pair_code_key_prefix: &str,
-    pair_phone: Option<&str>,
 ) {
+    let EventForwardConfig {
+        jid,
+        pod_id,
+        pair_code_key_prefix,
+        link_status_key_prefix,
+        device_existed,
+        pair_phone,
+    } = cfg;
     let ts = wacore::time::now_secs().max(0) as u64;
 
     // Maintain the pollable pairing-code key alongside the event stream.
     sync_pair_code_key(redis, jid, pair_phone, event, pair_code_key_prefix).await;
+    // Track the pairing flow's outcome for `GET /link-status` polling.
+    sync_link_status(
+        redis,
+        jid,
+        pair_phone,
+        event,
+        link_status_key_prefix,
+        device_existed,
+    )
+    .await;
 
     let envelope = EventEnvelope {
         jid,
@@ -106,5 +143,110 @@ async fn sync_pair_code_key(
             }
         }
         _ => {}
+    }
+}
+
+/// Track the pairing flow's outcome under `wa-link-status:{phone}`.
+///
+/// The client polls this via `GET /link-status?phone=...` to learn whether a
+/// link succeeded or what went wrong. Written from the session worker's event
+/// callback alongside [`sync_pair_code_key`], using the same phone-keying rule.
+///
+/// - [`Event::PairingCode`] → `pairing` + the code (the flow is live).
+/// - [`Event::PairSuccess`] → `success`, clearing any code.
+/// - [`Event::PairingCodeError`] → `failed` + a reason the client can show.
+/// - [`Event::PairingCodeRefresh`] → `pairing` again (the code was rotated;
+///   the consumer re-requests, so the flow is still live).
+/// - [`Event::Connected`] on a *resume* session (`device_existed`) → `success`:
+///   an already-paired device coming back online is the desired outcome of a
+///   `/link` call on it, and there is no [`Event::PairSuccess`] for a resume.
+///
+/// Success/failed are terminal: the key gets a long TTL so a slow client still
+/// reads the outcome after the pairing session is gone.
+async fn sync_link_status(
+    redis: &mut ConnectionManager,
+    jid: &str,
+    pair_phone: Option<&str>,
+    event: &Event,
+    link_status_key_prefix: &str,
+    device_existed: bool,
+) {
+    let key_part = pair_phone.unwrap_or(jid);
+    let key = link_status_key(link_status_key_prefix, key_part);
+    let updated_at = wacore::time::now_secs().max(0) as i64;
+    let write = match event {
+        Event::PairingCode(pc) => {
+            let ttl = pc.timeout.as_secs().max(1) as i64;
+            let status = LinkStatus {
+                status: LinkStatusKind::Pairing,
+                code: Some(pc.code.clone()),
+                error: None,
+                updated_at,
+            };
+            Some((status, ttl))
+        }
+        Event::PairSuccess(_) => {
+            let status = LinkStatus {
+                status: LinkStatusKind::Success,
+                code: None,
+                error: None,
+                updated_at,
+            };
+            Some((status, crate::task::LINK_STATUS_TERMINAL_TTL_SECS))
+        }
+        // A resume device coming online is a successful link — the client asked
+        // for the device to be online and it is.
+        Event::Connected(_) if device_existed => {
+            let status = LinkStatus {
+                status: LinkStatusKind::Success,
+                code: None,
+                error: None,
+                updated_at,
+            };
+            Some((status, crate::task::LINK_STATUS_TERMINAL_TTL_SECS))
+        }
+        Event::PairingCodeError(e) => {
+            let error = match &e.rejection {
+                Some(rej) => rej
+                    .text()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("unknown-{}", rej.code())),
+                None => "no-server-answer".to_string(),
+            };
+            let status = LinkStatus {
+                status: LinkStatusKind::Failed,
+                code: None,
+                error: Some(error),
+                updated_at,
+            };
+            Some((status, crate::task::LINK_STATUS_TERMINAL_TTL_SECS))
+        }
+        Event::PairingCodeRefresh(_) => {
+            let status = LinkStatus {
+                status: LinkStatusKind::Pairing,
+                code: None,
+                error: None,
+                updated_at,
+            };
+            Some((status, crate::task::LINK_STATUS_RESET_TTL_SECS))
+        }
+        _ => None,
+    };
+    let Some((status, ttl)) = write else { return };
+    let body = match serde_json::to_vec(&status) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("failed to serialize link status for jid={jid}: {e}");
+            return;
+        }
+    };
+    let mut pipe = redis::pipe();
+    pipe.atomic()
+        .set(&key, body)
+        .ignore()
+        .expire(&key, ttl)
+        .ignore();
+    if let Err(e) = pipe.query_async::<()>(redis).await {
+        warn!("failed to write link status for jid={jid}: {e}");
     }
 }
