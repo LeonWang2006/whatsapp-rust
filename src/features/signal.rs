@@ -79,6 +79,14 @@ impl SignalSessionMigration {
     }
 }
 
+/// Decode a sender-key distribution, tolerating the unframed encoding.
+///
+/// The primary parser reads WhatsApp's framed form: a version byte, then the
+/// protobuf body with a type-prefixed signing key. Peers also send the body on
+/// its own, and that shape reaches here as a version refusal rather than a
+/// decode error, because the leading protobuf tag (`0x08`) has a zero high
+/// nibble. So the fallback decodes the whole buffer and reads the signing key
+/// bare. Neither half is redundant, and neither may be aligned to the other.
 fn decode_sender_key_distribution(
     bytes: &[u8],
 ) -> Result<SenderKeyDistributionMessage, SignalError> {
@@ -1311,5 +1319,64 @@ mod tests {
         client
             .signal_flush_test_block
             .store(false, Ordering::Release);
+    }
+
+    /// Holds down the unframed encoding described on
+    /// [`decode_sender_key_distribution`], which nothing covered before.
+    #[tokio::test]
+    async fn unframed_sender_key_distribution_is_still_accepted() {
+        use wacore::libsignal::protocol::KeyPair;
+
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let signing = KeyPair::generate(&mut rng);
+
+        // Hand-encoded, because this shape has no constructor: id, iteration,
+        // chain_key, then the signing key with no type prefix.
+        let mut unframed = vec![0x08, 7, 0x10, 0];
+        unframed.extend_from_slice(&[0x1A, 32]);
+        unframed.extend_from_slice(&[0x11; 32]);
+        unframed.extend_from_slice(&[0x22, 32]);
+        unframed.extend_from_slice(signing.public_key.public_key_bytes());
+
+        assert!(
+            matches!(
+                SenderKeyDistributionMessage::try_from(&unframed[..]),
+                Err(SignalProtocolError::LegacyCiphertextVersion(0))
+            ),
+            "the primary reads the leading protobuf tag as a version, which is \
+             how this shape reaches the fallback at all"
+        );
+
+        let decoded = decode_sender_key_distribution(&unframed)
+            .expect("the unframed encoding must keep decoding");
+        assert_eq!(decoded.chain_id(), 7);
+        assert_eq!(decoded.chain_key(), &[0x11u8; 32]);
+        assert_eq!(decoded.signing_key(), &signing.public_key);
+    }
+
+    /// The framed encoding keeps working through the primary, unchanged.
+    #[tokio::test]
+    async fn framed_sender_key_distribution_decodes_through_the_primary() {
+        use wacore::libsignal::protocol::KeyPair;
+
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let signing = KeyPair::generate(&mut rng);
+        let framed = SenderKeyDistributionMessage::new(
+            SENDERKEY_MESSAGE_CURRENT_VERSION,
+            7,
+            0,
+            [0x11; 32],
+            signing.public_key,
+        )
+        .expect("distribution")
+        .into_serialized();
+
+        assert!(
+            SenderKeyDistributionMessage::try_from(&framed[..]).is_ok(),
+            "the framed shape must decode through the primary, not by falling back"
+        );
+        let decoded = decode_sender_key_distribution(&framed).expect("framed distribution");
+        assert_eq!(decoded.chain_id(), 7);
+        assert_eq!(decoded.signing_key(), &signing.public_key);
     }
 }
