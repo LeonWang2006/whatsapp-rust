@@ -6,7 +6,7 @@
 -- 换卡流程: 客户端调"更新用户信息"API -> 服务器取消旧号关联 ->
 --           对新号重新配对。旧号关联记录留存在 pair_history。
 -- 平台: platform 列以 WhatsApp 官方 PlatformType 枚举为准 (0-25),
---       业务侧 X-Platform (1-5) 单独存 x_platform, 映射在代码层。
+--       客户端 X-Platform 请求头直接传官方对应值, 无需业务侧映射。
 -- ============================================================
 
 CREATE SCHEMA IF NOT EXISTS biz;
@@ -21,8 +21,7 @@ CREATE TABLE biz.wa_user (
     status         TEXT        NOT NULL DEFAULT 'init', -- init/pairing/online/logged_out/disabled
     wa_device_id   INTEGER,                           -- wa-server device.id, 配对成功后回填
     -- 平台 (官方 PlatformType 为准)
-    platform       SMALLINT,                          -- WhatsApp 官方 PlatformType 0-25 (1=CHROME 7=DESKTOP 14=IOS_PHONE 16=ANDROID_PHONE...)
-    x_platform     SMALLINT,                          -- 业务侧客户端类型 (1=android 2=ios 3=web 4=windows 5=macos)
+    platform       SMALLINT,                          -- WhatsApp 官方 PlatformType 0-25 (1=CHROME 7=DESKTOP 14=IOS_PHONE 16=ANDROID_PHONE...), 客户端 X-Platform 请求头直接传此值
     platform_display TEXT,                            -- 配对用的 companion_platform_display, 如 "Chrome (Linux)"
     -- 客户端设备信息 (init 提交)
     os_version     TEXT,                              -- device_info.osVersion
