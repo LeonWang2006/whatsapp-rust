@@ -1,10 +1,12 @@
 -- ============================================================
--- wa-online 业务表设计 (v3 定稿: 用户=设备, 手机号可变)
+-- wa-online 业务表设计 (v4 定稿: 用户=设备, 手机号可变, 官方平台类型为准)
 -- schema: biz (独立, 与协议层 public 隔离)
 -- 核心模型: 用户实体由客户端设备唯一标识 (device_uuid),
 --           手机号是"当前号码"可变属性, 换卡不换用户。
 -- 换卡流程: 客户端调"更新用户信息"API -> 服务器取消旧号关联 ->
 --           对新号重新配对。旧号关联记录留存在 pair_history。
+-- 平台: platform 列以 WhatsApp 官方 PlatformType 枚举为准 (0-25),
+--       业务侧 X-Platform (1-5) 单独存 x_platform, 映射在代码层。
 -- ============================================================
 
 CREATE SCHEMA IF NOT EXISTS biz;
@@ -18,9 +20,11 @@ CREATE TABLE biz.wa_user (
     phone_number   TEXT        NOT NULL,              -- 当前绑定的 WhatsApp 号码(E.164), init 必填, 可换
     status         TEXT        NOT NULL DEFAULT 'init', -- init/pairing/online/logged_out/disabled
     wa_device_id   INTEGER,                           -- wa-server device.id, 配对成功后回填
+    -- 平台 (官方 PlatformType 为准)
+    platform       SMALLINT,                          -- WhatsApp 官方 PlatformType 0-25 (1=CHROME 7=DESKTOP 14=IOS_PHONE 16=ANDROID_PHONE...)
+    x_platform     SMALLINT,                          -- 业务侧客户端类型 (1=android 2=ios 3=web 4=windows 5=macos)
+    platform_display TEXT,                            -- 配对用的 companion_platform_display, 如 "Chrome (Linux)"
     -- 客户端设备信息 (init 提交)
-    platform       SMALLINT,                          -- X-Platform: 7=Desktop/Electron...
-    platform_display TEXT,                            -- 推导的 "Chrome (Linux)"
     os_version     TEXT,                              -- device_info.osVersion
     manufacturer   TEXT,                              -- device_info.manufacturer
     device_model   TEXT,                              -- device_info.device
