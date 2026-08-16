@@ -460,6 +460,8 @@ impl Client {
 
             pending_retries: Arc::new(std::sync::Mutex::new(HashSet::new())),
 
+            pending_lid_refreshes: Arc::new(std::sync::Mutex::new(HashSet::new())),
+
             message_retry_counts: cache_config.message_retry_counts.build_with_ttl(),
 
             session_recreate_history: cache_config.session_recreate_history.build_with_ttl(),
@@ -1787,6 +1789,13 @@ impl Client {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clear();
+        // `pending_lid_refreshes` is deliberately NOT cleared here. Its keys are
+        // released by a `scopeguard` that runs on drop as well as on completion,
+        // so a refresh whose query dies with the socket still frees its own key,
+        // and there is nothing stale left to sweep. Clearing anyway would drop a
+        // reservation belonging to a live task: a refresh spanning a reconnect
+        // would release a key the new connection had since taken, and the peer
+        // would get the duplicate query the set exists to prevent.
         // Commit any accumulated drain batch and settle the Signal cache in
         // ONE permit-held section (see teardown_inbound_commits_bounded):
         // persisting ratchet advances while dropping their uncommitted batch

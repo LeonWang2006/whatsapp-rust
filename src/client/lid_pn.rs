@@ -10,6 +10,7 @@
 //! - Bidirectional lookup (LID to PN and PN to LID)
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use anyhow::Result;
 use log::debug;
@@ -360,13 +361,15 @@ impl Client {
         let runtime = client.runtime.clone();
         runtime
             .spawn(Box::pin(async move {
-                client.reconcile_lid_mappings_via_usync(phones).await;
+                let jids = phones.iter().map(|p| Jid::pn(p.as_str())).collect();
+                client.reconcile_lid_mappings_via_usync(jids).await;
             }))
             .detach();
     }
 
-    async fn reconcile_lid_mappings_via_usync(&self, phones: Vec<String>) {
-        let jids: Vec<Jid> = phones.iter().map(|p| Jid::pn(p.as_str())).collect();
+    /// Takes JIDs rather than bare numbers because a `refresh_lid` peer can be
+    /// hosted, and usync validates `Hosted` as a server distinct from `Pn`.
+    async fn reconcile_lid_mappings_via_usync(&self, jids: Vec<Jid>) {
         let sid = self.generate_request_id();
         match self.execute(LidQuerySpec::new(jids, sid)).await {
             Ok(resp) => {
@@ -1195,6 +1198,101 @@ impl Client {
                 None
             }
         }
+    }
+
+    /// The phone number a `refresh_lid` flag should be resolved under, or
+    /// `None` when there is nothing to refresh.
+    ///
+    /// A refresh is addressed by phone number because that is the side of the
+    /// pair the server resolves from: asking about a LID we already suspect is
+    /// wrong would look the answer up under the very key in doubt. WA Web does
+    /// the same, mapping the peer through `toPn` first and dropping the refresh
+    /// when no mapping exists to map through -- a peer we have never resolved
+    /// has nothing stale to correct.
+    ///
+    /// Both families are accepted for the same reason the message learn path
+    /// accepts them: a hosted peer derives its Signal address from this cache
+    /// too, so its mapping goes stale in exactly the same way.
+    ///
+    /// The PN-side namespace is carried, not flattened to `@s.whatsapp.net`.
+    /// The cache is keyed by bare user and does not care -- `resolve_encryption_jid`
+    /// looks a hosted target up under the same key -- but `validate_user_jid`
+    /// admits `Hosted` and `Pn` as separate servers and `pn_jid` accepts only
+    /// those two, so usync treats them as distinct identities and the query has
+    /// to name the one the peer actually arrived under.
+    async fn refresh_lid_target(&self, peer: &Jid) -> Option<Jid> {
+        use wacore_binary::Server;
+        let bare = peer.to_non_ad();
+        if bare.server.is_pn_family() {
+            return Some(bare);
+        }
+        let pn_server = match bare.server {
+            Server::Lid => Server::Pn,
+            Server::HostedLid => Server::Hosted,
+            _ => return None,
+        };
+        let user = self.lid_pn_cache.get_phone_number(&bare.user).await?;
+        Some(Jid::new(user, pn_server))
+    }
+
+    /// Re-ask the server for a peer's LID after it flagged ours as stale.
+    ///
+    /// Goes through the same authoritative re-resolve an observational conflict
+    /// uses ([`RecordOutcome::NeedsUsync`]), which asks for `<lid>` and nothing
+    /// else. WA Web fires its contact-sync job here, but pins the two knobs that
+    /// matter -- `mode: "query"` and `shouldSyncDevice: false` -- and
+    /// [`LidQuerySpec`] is what carries those; the contact query would also
+    /// request `<contact>` and `<business>`, whose result-level errors reject
+    /// the whole response, so an unrelated failure would discard a mapping the
+    /// server did return.
+    ///
+    /// One query per identity at a time, scoped to the connection that started
+    /// it. A burst of sends to a stale peer is acked one message at a time and
+    /// every ack repeats the flag, so the second onward would otherwise
+    /// duplicate a query already in flight.
+    ///
+    /// The generation is what keeps that from becoming a suppression bug.
+    /// Teardown does not await these detached tasks, so a refresh can still be
+    /// parked on a dead socket's IQ while the next connection is already acking.
+    /// Keyed on the number alone, that new ack would be dropped as a duplicate
+    /// of a query that is about to fail, and nothing would refresh the mapping
+    /// until some later ack happened to repeat the flag. Keyed by generation
+    /// the new refresh is a different reservation, so it proceeds, and the old
+    /// task can only ever release its own.
+    pub(crate) async fn refresh_lid_mapping_for(&self, peer: Jid) {
+        let Some(pn) = self.refresh_lid_target(&peer).await else {
+            debug!(
+                "refresh_lid: no phone number to refresh {} under",
+                peer.observe()
+            );
+            return;
+        };
+
+        let key = (
+            self.connection_generation.load(Ordering::SeqCst),
+            pn.to_string(),
+        );
+        if !self
+            .pending_lid_refreshes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(key.clone())
+        {
+            return;
+        }
+        let pending = Arc::clone(&self.pending_lid_refreshes);
+        let _guard = scopeguard::guard((), move |()| {
+            pending
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&key);
+        });
+
+        // Persists through `add_lid_pn_mapping`, so a corrected pair is durable
+        // before the next send resolves an address from it. A failed query
+        // leaves the mapping exactly as stale as it was: nothing to roll back,
+        // and nothing to retry more cheaply than the next ack carrying the flag.
+        self.reconcile_lid_mappings_via_usync(vec![pn]).await;
     }
 }
 
@@ -2774,6 +2872,194 @@ mod tests {
                 .await
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    // ── `<ack refresh_lid="true">` ────────────────────────────────────────
+
+    /// The refresh is answered under the phone number, so a flagged LID peer
+    /// is mapped through the cache first. The device suffix goes with it: the
+    /// mapping is per user, not per device.
+    #[tokio::test]
+    async fn refresh_lid_target_maps_a_lid_peer_to_its_phone_number() {
+        let (client, pn, lid) = client_with_peer_mapping().await;
+
+        let peer = Jid::new(lid, Server::Lid).with_device(7);
+        assert_eq!(
+            client.refresh_lid_target(&peer).await,
+            Some(Jid::new(pn, Server::Pn))
+        );
+    }
+
+    /// A LID we have never resolved has nothing stale to correct, so the flag
+    /// must not turn into a usync for a peer we know nothing about.
+    #[tokio::test]
+    async fn refresh_lid_target_drops_a_lid_peer_with_no_mapping() {
+        let client = create_test_client().await;
+
+        let peer = Jid::new("111000099998888", Server::Lid);
+        assert_eq!(client.refresh_lid_target(&peer).await, None);
+    }
+
+    /// A phone-number peer is already the side the server resolves from, so it
+    /// is queried as-is rather than mapped to the LID under suspicion.
+    #[tokio::test]
+    async fn refresh_lid_target_queries_a_phone_number_peer_directly() {
+        let (client, pn, _lid) = client_with_peer_mapping().await;
+
+        let peer = Jid::new(pn, Server::Pn).with_device(2);
+        assert_eq!(
+            client.refresh_lid_target(&peer).await,
+            Some(Jid::new(pn, Server::Pn))
+        );
+    }
+
+    /// A hosted peer resolves its Signal address from this same cache, so a
+    /// hosted ack has to reach the same refresh; the strict `is_lid`/`is_pn`
+    /// pair would drop it and leave the mapping stale forever.
+    ///
+    /// The query keeps `@hosted` rather than flattening to `@s.whatsapp.net`:
+    /// usync validates the two as separate servers, so the identity asked about
+    /// has to be the one the ack arrived under.
+    #[tokio::test]
+    async fn refresh_lid_target_keeps_the_hosted_namespace() {
+        let (client, pn, lid) = client_with_peer_mapping().await;
+
+        for peer in [
+            Jid::new(lid, Server::HostedLid),
+            Jid::new(pn, Server::Hosted).with_device(4),
+        ] {
+            assert_eq!(
+                client.refresh_lid_target(&peer).await,
+                Some(Jid::new(pn, Server::Hosted)),
+                "{peer} must refresh as a hosted identity"
+            );
+        }
+    }
+
+    /// Groups, newsletters and status broadcast carry no LID-PN pair.
+    #[tokio::test]
+    async fn refresh_lid_target_ignores_non_user_peers() {
+        let client = create_test_client().await;
+
+        for peer in [
+            Jid::new("120363098765432100", Server::Group),
+            Jid::new("120363298765432100", Server::Newsletter),
+            Jid::new("status", Server::Broadcast),
+        ] {
+            assert_eq!(
+                client.refresh_lid_target(&peer).await,
+                None,
+                "{peer} carries no LID-PN pair"
+            );
+        }
+    }
+
+    /// The reservation key for `pn` on the connection the test is running on.
+    fn reservation(client: &Client, pn: &str) -> (u64, String) {
+        (
+            client.connection_generation.load(Ordering::SeqCst),
+            Jid::new(pn, Server::Pn).to_string(),
+        )
+    }
+
+    /// A second ack for an identity already being refreshed must not duplicate
+    /// the query. The guard releases on completion, so a later ack still
+    /// refreshes.
+    #[tokio::test]
+    async fn a_refresh_already_in_flight_is_not_started_twice() {
+        let (client, pn, _lid) = client_with_peer_mapping().await;
+        let key = reservation(&client, pn);
+
+        assert!(
+            client
+                .pending_lid_refreshes
+                .lock()
+                .unwrap()
+                .insert(key.clone()),
+            "the fixture starts with no refresh in flight"
+        );
+
+        // Not connected, so a query that got past the guard would fail out
+        // rather than hang; what is asserted is that the key survives, i.e.
+        // this call did not run the guarded body and drop the key on the way.
+        client
+            .refresh_lid_mapping_for(Jid::new(pn, Server::Pn))
+            .await;
+        assert!(
+            client.pending_lid_refreshes.lock().unwrap().contains(&key),
+            "a coalesced call must leave the in-flight key for its owner to clear"
+        );
+
+        client.pending_lid_refreshes.lock().unwrap().remove(&key);
+        client
+            .refresh_lid_mapping_for(Jid::new(pn, Server::Pn))
+            .await;
+        assert!(
+            !client.pending_lid_refreshes.lock().unwrap().contains(&key),
+            "the owning call must clear its key even when the query fails"
+        );
+    }
+
+    /// A refresh still parked on the old connection's IQ must not suppress the
+    /// new connection's. Teardown does not await these detached tasks, so
+    /// keyed on the number alone the new ack would be dropped as a duplicate of
+    /// a query that is about to fail, and nothing would refresh the mapping.
+    #[tokio::test]
+    async fn a_stale_reservation_does_not_suppress_the_next_connection() {
+        let (client, pn, _lid) = client_with_peer_mapping().await;
+
+        let stale = reservation(&client, pn);
+        client
+            .pending_lid_refreshes
+            .lock()
+            .unwrap()
+            .insert(stale.clone());
+
+        // What a reconnect does to the generation.
+        client.connection_generation.fetch_add(1, Ordering::SeqCst);
+
+        client
+            .refresh_lid_mapping_for(Jid::new(pn, Server::Pn))
+            .await;
+
+        assert!(
+            client
+                .pending_lid_refreshes
+                .lock()
+                .unwrap()
+                .contains(&stale),
+            "the new refresh must not touch the old connection's reservation"
+        );
+        assert!(
+            !client
+                .pending_lid_refreshes
+                .lock()
+                .unwrap()
+                .contains(&reservation(&client, pn)),
+            "the new refresh ran and released its own reservation"
+        );
+    }
+
+    /// A reservation outlives a disconnect: it belongs to the task that took
+    /// it, and only that task releases it. `cleanup_connection_state_inner`
+    /// carries why the set is not swept there.
+    #[tokio::test]
+    async fn a_disconnect_does_not_release_a_live_reservation() {
+        let (client, pn, _lid) = client_with_peer_mapping().await;
+
+        let key = reservation(&client, pn);
+        client
+            .pending_lid_refreshes
+            .lock()
+            .unwrap()
+            .insert(key.clone());
+
+        client.disconnect().await;
+
+        assert!(
+            client.pending_lid_refreshes.lock().unwrap().contains(&key),
+            "teardown must leave a live reservation to its owner"
         );
     }
 }
