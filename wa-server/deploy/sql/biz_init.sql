@@ -1,12 +1,14 @@
 -- ============================================================
--- wa-online 业务表设计 (v4 定稿: 用户=设备, 手机号可变, 官方平台类型为准)
+-- wa-online 业务表 (v5: 用户 + 关联历史 + 联系人 + 订阅订单)
 -- schema: biz (独立, 与协议层 public 隔离)
--- 核心模型: 用户实体由客户端设备唯一标识 (device_uuid),
---           手机号是"当前号码"可变属性, 换卡不换用户。
--- 换卡流程: 客户端调"更新用户信息"API -> 服务器取消旧号关联 ->
---           对新号重新配对。旧号关联记录留存在 pair_history。
--- 平台: platform 列以 WhatsApp 官方 PlatformType 枚举为准 (0-25),
---       客户端 X-Platform 请求头直接传官方对应值, 无需业务侧映射。
+--
+-- 模型:
+-- - 用户实体由客户端设备唯一标识 (device_uuid), 手机号可变(换卡不换用户)。
+-- - 用户添加联系人(号码), 为联系人购买/续费订阅。
+-- - 联系人表: 每个用户对每个号码一条记录, 存"当前生效订单"的 order_id。
+--   多个用户可各自添加同一联系人, 各自订单独立。
+-- - 订阅订单表: 通用订单表(其他功能模块也用), 通过 module 区分。
+--   记录初始购买 + 续费订单, 含商店原始订单 id 与回执。
 -- ============================================================
 
 CREATE SCHEMA IF NOT EXISTS biz;
@@ -59,3 +61,46 @@ CREATE TABLE biz.pair_history (
 );
 
 CREATE INDEX idx_pair_history_user ON biz.pair_history (user_id, created_at DESC);
+
+-- ------------------------------------------------------------
+-- 联系人表 (user 维度: 每个用户对每个号码一条)
+-- ------------------------------------------------------------
+CREATE TABLE biz.contact (
+    id            BIGSERIAL PRIMARY KEY,
+    user_id       BIGINT      NOT NULL REFERENCES biz.wa_user(id) ON DELETE CASCADE,
+    phone_number  TEXT        NOT NULL,              -- 联系人号码
+    order_id      BIGINT,                            -- 当前生效订单 id (客户端提交最新 或 检测到续费后的最新), 指向 biz.subscription_order.id
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (user_id, phone_number)                   -- 一个用户下号码唯一; 不同用户可重复添加
+);
+
+CREATE INDEX idx_contact_user ON biz.contact (user_id);
+CREATE INDEX idx_contact_phone ON biz.contact (phone_number);
+
+-- ------------------------------------------------------------
+-- 订阅订单表 (通用订单, 各功能模块共用)
+-- ------------------------------------------------------------
+CREATE TABLE biz.subscription_order (
+    id             BIGSERIAL PRIMARY KEY,            -- 订单 id (自增), 联系人表 order_id 指向这里
+    user_id        BIGINT      NOT NULL REFERENCES biz.wa_user(id) ON DELETE CASCADE,
+    module         TEXT        NOT NULL DEFAULT 'contact_subscription', -- 功能模块标识
+    contact_id     BIGINT,                           -- 本模块关联联系人 (其他模块可空)
+    platform       SMALLINT,                         -- 1=Google 2=Apple
+    store_order_id TEXT,                             -- Google/Apple 原始订单 id
+    order_type     TEXT        NOT NULL DEFAULT 'initial_purchase', -- initial_purchase / renewal
+    status         TEXT        NOT NULL DEFAULT 'pending', -- pending/active/cancelled/expired/refunded
+    plan           TEXT,                             -- 套餐
+    amount         NUMERIC(10,2),                    -- 金额
+    currency       TEXT,                             -- 币种
+    purchased_at   TIMESTAMPTZ,                      -- 购买时间
+    expires_at     TIMESTAMPTZ,                      -- 到期时间
+    receipt_raw    TEXT,                             -- 商店原始回执 JSON (服务端校验留存)
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_sub_order_user ON biz.subscription_order (user_id);
+CREATE INDEX idx_sub_order_contact ON biz.subscription_order (contact_id);
+CREATE INDEX idx_sub_order_store ON biz.subscription_order (platform, store_order_id);
+CREATE INDEX idx_sub_order_status ON biz.subscription_order (status);

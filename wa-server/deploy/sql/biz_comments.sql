@@ -35,3 +35,29 @@ COMMENT ON COLUMN biz.pair_history.action IS '动作: pair/logout/stream_replace
 COMMENT ON COLUMN biz.pair_history.pair_code IS '8 位配对码';
 COMMENT ON COLUMN biz.pair_history.detail IS '详情: 退出原因/换卡说明等';
 COMMENT ON COLUMN biz.pair_history.created_at IS '创建时间';
+
+COMMENT ON TABLE biz.contact IS '联系人表。用户添加的联系人号码, 每个用户对每个号码一条记录; 不同用户可添加同一联系人且订单独立';
+COMMENT ON COLUMN biz.contact.id IS '主键';
+COMMENT ON COLUMN biz.contact.user_id IS '用户 id (外键 wa_user.id)';
+COMMENT ON COLUMN biz.contact.phone_number IS '联系人号码';
+COMMENT ON COLUMN biz.contact.order_id IS '当前生效订单 id (客户端提交最新 或 检测到续费后的最新), 指向 biz.subscription_order.id';
+COMMENT ON COLUMN biz.contact.created_at IS '创建时间';
+COMMENT ON COLUMN biz.contact.updated_at IS '更新时间';
+
+COMMENT ON TABLE biz.subscription_order IS '订阅订单表 (通用订单, 各功能模块共用)。记录初始购买 + 续费订单, 含商店原始订单 id 与回执';
+COMMENT ON COLUMN biz.subscription_order.id IS '订单 id (自增), 联系人表 order_id 指向这里';
+COMMENT ON COLUMN biz.subscription_order.user_id IS '下单用户 id (外键 wa_user.id)';
+COMMENT ON COLUMN biz.subscription_order.module IS '功能模块标识, 默认 contact_subscription';
+COMMENT ON COLUMN biz.subscription_order.contact_id IS '本模块关联的联系人 (其他模块可空)';
+COMMENT ON COLUMN biz.subscription_order.platform IS '商店平台: 1=Google 2=Apple';
+COMMENT ON COLUMN biz.subscription_order.store_order_id IS 'Google/Apple 原始订单 id';
+COMMENT ON COLUMN biz.subscription_order.order_type IS '订单类型: initial_purchase / renewal';
+COMMENT ON COLUMN biz.subscription_order.status IS '状态: pending/active/cancelled/expired/refunded';
+COMMENT ON COLUMN biz.subscription_order.plan IS '套餐';
+COMMENT ON COLUMN biz.subscription_order.amount IS '金额';
+COMMENT ON COLUMN biz.subscription_order.currency IS '币种';
+COMMENT ON COLUMN biz.subscription_order.purchased_at IS '购买时间';
+COMMENT ON COLUMN biz.subscription_order.expires_at IS '到期时间';
+COMMENT ON COLUMN biz.subscription_order.receipt_raw IS '商店原始回执 JSON (服务端校验留存)';
+COMMENT ON COLUMN biz.subscription_order.created_at IS '创建时间';
+COMMENT ON COLUMN biz.subscription_order.updated_at IS '更新时间';
