@@ -71,9 +71,11 @@ impl Client {
     /// promise — that a stanza's events all come from its receive task.
     ///
     /// Deliberately *not* deduplicated: `UndecryptableMessage` is single-flight
-    /// per `(chat, id)` because a UI must not show two placeholders for one
+    /// per [`SenderMessageId`] because a UI must not show two placeholders for one
     /// message, and that is exactly what makes it silent on the second delivery
     /// of a stanza that keeps failing. This one reports each delivery.
+    ///
+    /// [`SenderMessageId`]: wacore::types::message::SenderMessageId
     pub(crate) fn report_enc_decrypt_failure(
         &self,
         info: &Arc<MessageInfo>,
@@ -131,11 +133,14 @@ impl Client {
         ));
     }
 
-    /// Dispatch an `UndecryptableMessage` event at most once per `(chat, id)`
-    /// via the single-flight `get_with` semantic on `undecryptable_dispatched`.
+    /// Dispatch an `UndecryptableMessage` event at most once per
+    /// [`SenderMessageId`] via the single-flight `get_with` semantic on
+    /// `undecryptable_dispatched`.
     /// The atomic arm avoids the get-then-insert race where two concurrent
     /// callers would both dispatch. Mirrors WA Web's DB-level placeholder
     /// uniqueness in `WAWebMessageProcessPlaceholder`.
+    ///
+    /// [`SenderMessageId`]: wacore::types::message::SenderMessageId
     ///
     /// Returns `true` if this call dispatched the event, `false` if a
     /// previous call already did.
@@ -147,8 +152,32 @@ impl Client {
         unavailable_type: crate::types::events::UnavailableType,
         decrypt_fail_mode: crate::types::events::DecryptFailMode,
     ) -> bool {
-        let dedup_key =
-            wacore::types::message::ChatMessageId::new(info.source.chat.clone(), info.id.clone());
+        // Keyed by sender as well as id: an id is the sending client's to
+        // choose, and one that two participants happen to share names two
+        // messages, not one. See `SenderMessageId`.
+        // Keyed on the wire spelling, deliberately unresolved.
+        //
+        // Resolving the sender to its encryption namespace looks like the
+        // careful thing to do, and it is a trap: the resolution depends on a
+        // LID mapping that is learned at runtime, so the key moves when the
+        // mapping appears. Chasing that with a second alias key spawns a
+        // problem per direction it can move — the chat migrates too in a 1:1,
+        // hosted namespaces are outside `swap_pn_lid_namespace`, two keys
+        // cannot be claimed under one atomic reservation, and every entry
+        // costs two slots of a bounded cache.
+        //
+        // So this key does not move at all, at a cost stated plainly: a
+        // redelivery that switches namespace mid-flight dispatches a second
+        // `UndecryptableMessage` for one message. That is the lesser harm.
+        // A duplicate placeholder is visible and recoverable; the alternative
+        // this replaced — one sender's message swallowing another's because
+        // they share an id — loses a message with nothing to say so.
+        let dedup_key = wacore::types::message::SenderMessageId::new(
+            info.source.chat.clone(),
+            info.id.clone(),
+            info.source.sender.clone(),
+        );
+
         // The init future only runs for the winning caller. Others receive
         // the cached `()` and leave the flag as false.
         let fresh = Arc::new(std::sync::atomic::AtomicBool::new(false));

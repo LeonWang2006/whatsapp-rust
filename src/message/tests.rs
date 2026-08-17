@@ -14843,3 +14843,115 @@ fn a_local_key_agreement_failure_is_not_the_peers() {
         EncDecryptFailureReason::LocalCryptoFailure,
     );
 }
+
+/// Two senders in one group can use the same message id, and each of their
+/// messages is its own message. See `SenderMessageId` for why.
+#[tokio::test]
+async fn undecryptable_events_are_per_sender_not_per_id() {
+    let client = crate::test_utils::create_test_client().await;
+    let chat: Jid = "120363000000000001@g.us".parse().expect("group jid");
+    let shared_id = "3EB0SHAREDID0001";
+
+    let info_for = |sender: &str| {
+        let sender: Jid = sender.parse().expect("sender jid");
+        Arc::new(MessageInfo {
+            id: shared_id.into(),
+            source: crate::types::message::MessageSource {
+                sender,
+                chat: chat.clone(),
+                is_group: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    };
+
+    let first = client
+        .dispatch_undecryptable_event(
+            info_for("111111111111111@lid"),
+            false,
+            crate::types::events::UnavailableType::Unknown,
+            DecryptFailMode::Show,
+        )
+        .await;
+    let second = client
+        .dispatch_undecryptable_event(
+            info_for("222222222222222@lid"),
+            false,
+            crate::types::events::UnavailableType::Unknown,
+            DecryptFailMode::Show,
+        )
+        .await;
+    let repeat = client
+        .dispatch_undecryptable_event(
+            info_for("111111111111111@lid"),
+            false,
+            crate::types::events::UnavailableType::Unknown,
+            DecryptFailMode::Show,
+        )
+        .await;
+
+    assert!(first, "the first sender's message is dispatched");
+    assert!(
+        second,
+        "a different sender reusing the id is a different message, not a duplicate"
+    );
+    assert!(
+        !repeat,
+        "the same sender redelivering the same id is still a duplicate"
+    );
+}
+
+/// The accepted cost of an unresolved key: a redelivery that switches
+/// namespace mid-flight is seen as a second message.
+///
+/// Documented rather than fixed. Every attempt to make the key follow the
+/// mapping introduced a way for it to move — the chat migrates too in a 1:1,
+/// hosted namespaces fall outside the swap, two keys cannot be claimed
+/// atomically, and each entry costs two slots of a bounded cache. A duplicate
+/// placeholder is visible and recoverable; swallowing another sender's message
+/// is not.
+#[tokio::test]
+async fn a_namespace_switch_mid_flight_is_seen_as_a_second_message() {
+    let client = crate::test_utils::create_test_client().await;
+    let chat: Jid = "120363000000000002@g.us".parse().expect("group jid");
+    let pn: Jid = "15550001234@s.whatsapp.net".parse().expect("pn jid");
+    let lid: Jid = "444444444444444@lid".parse().expect("lid jid");
+
+    let info_for = |sender: Jid| {
+        Arc::new(MessageInfo {
+            id: "3EB0NAMESPACE001".into(),
+            source: crate::types::message::MessageSource {
+                sender,
+                chat: chat.clone(),
+                is_group: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    };
+
+    let first = client
+        .dispatch_undecryptable_event(
+            info_for(pn),
+            false,
+            crate::types::events::UnavailableType::Unknown,
+            DecryptFailMode::Show,
+        )
+        .await;
+    let switched = client
+        .dispatch_undecryptable_event(
+            info_for(lid),
+            false,
+            crate::types::events::UnavailableType::Unknown,
+            DecryptFailMode::Show,
+        )
+        .await;
+
+    assert!(first, "the first delivery is dispatched");
+    assert!(
+        switched,
+        "an unresolved key cannot tell this from a new sender, and the duplicate \
+         placeholder is the cost this design accepts"
+    );
+}
