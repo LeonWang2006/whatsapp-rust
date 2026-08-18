@@ -789,6 +789,7 @@ struct SubframeScratch {
     wtgt_tmp: Vec<f32>,
     wtgt: Vec<f32>,
     exc_fcb: Vec<f32>,
+    exc_fcb_raw: Vec<f32>,
 }
 
 impl SubframeScratch {
@@ -2088,9 +2089,17 @@ impl CelpEncoder {
         let mut gain_idx = [-1i16; SMPL_CELP_MAX_RATES];
         let mut fcbgain = 0.0f32;
         let mut exc_fcb = SubframeScratch::zeroed(&mut self.sf.exc_fcb, SMPL_MAX_SF_LEN);
+        // Pooled twin of `exc_fcb`, hoisted out of the rate loop below, which used to allocate a
+        // fresh `vec![0.0f32; SMPL_MAX_SF_LEN]` per rate. It stays a SEPARATE buffer rather than
+        // having `fcb_synthesize` write into `exc_fcb` directly: `fcb_synthesize` does fully define
+        // the region it writes, so writing in place is bit-identical and drops a copy, but it also
+        // puts the synthesis on the same memory the rest of the iteration reads and rewrites
+        // (`smpl_pitch_sharp`, `smpl_scale_vec_inplace`, `calc_gains_v`), and that loop-carried
+        // dependency measured 12.6% SLOWER on `celp_subframes_frame` at 0.36% FEWER instructions.
+        // Keeping the buffers apart preserves the codegen and still removes the allocation.
+        let mut exc_fcb_raw = SubframeScratch::zeroed(&mut self.sf.exc_fcb_raw, SMPL_MAX_SF_LEN);
         let tbl = celp_tables();
         for r in 0..SMPL_CELP_MAX_RATES {
-            let mut exc_fcb_raw = vec![0.0f32; SMPL_MAX_SF_LEN];
             fcb_synthesize(
                 fcb_subfrlen,
                 &pulses[r],
@@ -2203,6 +2212,7 @@ impl CelpEncoder {
         self.sf.wtgt_tmp = wtgt_tmp;
         self.sf.wtgt = wtgt;
         self.sf.exc_fcb = exc_fcb;
+        self.sf.exc_fcb_raw = exc_fcb_raw;
 
         CelpSubframeOut {
             pulses: [pulses_fec, pulses_main],
