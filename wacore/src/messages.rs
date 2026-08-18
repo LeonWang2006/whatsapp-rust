@@ -2,6 +2,7 @@ use crate::libsignal::crypto::CryptographicHash;
 use anyhow::{Result, anyhow};
 use base64::Engine as _;
 use buffa::MessageView;
+use compact_str::CompactString;
 // Encode/decode of proto trees is routed through `waproto::codec` so the tree is
 // instantiated once in waproto; tests still call the trait methods directly.
 #[cfg(test)]
@@ -456,32 +457,67 @@ impl MessageUtils {
         }
     }
 
+    /// The participant hash: `2:` plus the eight base64 characters of six hash
+    /// bytes, so ten bytes in total, which is why it is a `CompactString` and
+    /// not a `String` -- that width lives inline, and every holder of a phash
+    /// (the group and DM memos, the stanza attribute, the group query) carries
+    /// it as one, so the value never needs the heap on its way to the wire.
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(name = "wa.send.participant_hash", level = "debug", skip_all)
     )]
     pub fn participant_list_hash<'a>(
         devices: impl IntoIterator<Item = &'a wacore_binary::Jid>,
-    ) -> Result<String> {
+    ) -> Result<CompactString> {
         // Format every device into one shared arena and sort range views over
-        // it: two allocations total instead of a heap String per device (this
-        // runs over the full device set on every group send). Sorting the
-        // slices is the same lexicographic order as sorting the individual
-        // ad_strings, so the hashed concatenation is byte-identical.
+        // it instead of a heap String per device (this runs over the full
+        // device set of a send). Sorting the slices is the same lexicographic
+        // order as sorting the individual ad_strings, so the hashed
+        // concatenation is byte-identical.
+        //
+        // The ranges are `u32` pairs, so the sort moves half the bytes per
+        // element that `usize` pairs would. They stay a plain `Vec`: an inline
+        // `SmallVec` would spare the small shape its one allocation, but this
+        // hash is memoised per resolved device set rather than run per message,
+        // and instantiating `SmallVec` for a new element type stamps its whole
+        // used surface into the binary -- measured at ~11 KiB of `.text` for no
+        // measurable time, on a crate that also builds for ESP32.
         let devices = devices.into_iter();
-        let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(devices.size_hint().0);
-        let mut arena = String::with_capacity(ranges.capacity() * 36);
+        let hint = devices.size_hint().0;
+        let mut ranges: Vec<(u32, u32)> = Vec::with_capacity(hint);
+        let mut arena = String::with_capacity(hint * 36);
         for jid in devices {
             let start = arena.len();
             jid.push_phash_form_to(&mut arena);
-            ranges.push((start, arena.len()));
+            ranges.push((start as u32, arena.len() as u32));
         }
-        ranges.sort_unstable_by(|a, b| arena[a.0..a.1].cmp(&arena[b.0..b.1]));
+        // The offsets above only ever grow, so one check on the finished arena
+        // covers every one of them: if the whole arena addresses in a `u32`,
+        // then so did each `start` and `end` recorded from it. A device set
+        // that large cannot come from a group -- it would need ~100M JIDs --
+        // but this is a public entry point, and a silently truncated offset
+        // would hash the wrong bytes or invert a range, so it is refused
+        // rather than trusted. Checking here instead of per JID keeps it to a
+        // single comparison, and the ranges are not read before this point.
+        if u32::try_from(arena.len()).is_err() {
+            return Err(anyhow!(
+                "participant list is too large to hash: {} bytes of rendered JIDs",
+                arena.len()
+            ));
+        }
+        // Compare and hash over the bytes, not the `String`: indexing a `str`
+        // re-checks a UTF-8 boundary at both ends of every probe, and the sort
+        // makes O(n log n) of them. The ranges are boundaries the arena was
+        // written at, so the slices are the same either way.
+        let arena = arena.as_bytes();
+        ranges.sort_unstable_by(|a, b| {
+            arena[a.0 as usize..a.1 as usize].cmp(&arena[b.0 as usize..b.1 as usize])
+        });
 
         let mut h = CryptographicHash::new("SHA-256")
             .map_err(|e| anyhow!("failed to initialize SHA-256 hasher: {:?}", e))?;
         for &(start, end) in &ranges {
-            h.update(&arena.as_bytes()[start..end]);
+            h.update(&arena[start as usize..end as usize]);
         }
 
         let full_hash = h
@@ -491,10 +527,19 @@ impl MessageUtils {
         // Standard base64 ('+'/'/'), matching whatsmeow (`base64.RawStdEncoding`)
         // and WA Web (`WABase64.encodeB64`). URL-safe ('-'/'_') diverges from the
         // server on ~22% of phashes (any output hitting base64 index 62/63).
-        let mut out = String::with_capacity(10);
-        out.push_str("2:");
-        base64::prelude::BASE64_STANDARD_NO_PAD.encode_string(&full_hash[..6], &mut out);
-        Ok(out)
+        //
+        // Six input bytes are exactly eight base64 characters, so the whole
+        // `2:XXXXXXXX` result is ten bytes and lives inline in the returned
+        // `CompactString`. Every caller memoises it as one, so a `String` here
+        // would be a heap allocation made only to be copied into one.
+        let mut out = [0u8; 10];
+        out[..2].copy_from_slice(b"2:");
+        let encoded = base64::prelude::BASE64_STANDARD_NO_PAD
+            .encode_slice(&full_hash[..6], &mut out[2..])
+            .map_err(|e| anyhow!("failed to encode phash: {:?}", e))?;
+        let out = std::str::from_utf8(&out[..2 + encoded])
+            .map_err(|e| anyhow!("phash is not valid utf-8: {:?}", e))?;
+        Ok(CompactString::from(out))
     }
 
     /// Validate a broadcast-contact-list hash from an incoming `deviceSentMessage`
