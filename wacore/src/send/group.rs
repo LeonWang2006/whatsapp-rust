@@ -37,6 +37,9 @@ pub struct PreparedGroupStanza {
     /// so msmsg bot replies referencing this msg_id hit the same row that
     /// `<meta target_sender_jid>` echoes back at lookup time.
     pub sender_identity: Jid,
+    /// The phash on the stanza, so the caller can compare it against the one the
+    /// server echoes on the ack without re-reading the built node.
+    pub phash: Option<CompactString>,
 }
 
 /// A required sender-key distribution that could not reach every target.
@@ -578,8 +581,8 @@ pub async fn prepare_group_stanza(
     }
 
     // Groups carry a phash on every send, distribution or not (see above).
-    if let Some(phash) = phash_for_stanza {
-        stanza_builder = stanza_builder.attr("phash", phash);
+    if let Some(phash) = phash_for_stanza.as_ref() {
+        stanza_builder = stanza_builder.attr("phash", phash.as_str());
     }
 
     // Add any extra stanza nodes provided by the caller
@@ -595,16 +598,38 @@ pub async fn prepare_group_stanza(
         group_info,
     );
 
+    let mut skdm_devices = distribution_list.unwrap_or_default();
+    retain_reportable_sender_key_devices(&mut skdm_devices, &skdm_encrypted_devices);
+
     Ok(PreparedGroupStanza {
         node: stanza,
-        // Mark the full target set (matches WA Web `markHasSenderKey(x, M)`), not
-        // just `skdm_encrypted_devices`. `stale_users` above already used the
-        // encrypted subset to find which devices to re-resolve.
-        skdm_devices: distribution_list.unwrap_or_default(),
+        skdm_devices,
         stale_device_users: stale_users,
         message_secret: reporting_result.map(|r| r.message_secret),
         sender_identity: own_sending_jid,
+        phash: phash_for_stanza,
     })
+}
+
+/// Reduce a distribution list to the devices a send may report as keyed.
+///
+/// The whole target set is reported rather than the encrypted subset, matching
+/// WA Web `markHasSenderKey(x, M)`, so a companion with no bundle is not
+/// re-targeted every send. WA Web can afford that only because it never reaches
+/// the marking with a failed primary: `getKeyDistributionMsg` rejects the whole
+/// send on `isPrimaryDevice(e)` and swallows companions alone. A best-effort
+/// send here carries on instead of failing a group over one member, so it holds
+/// the same guarantee directly. A primary reported keyed without its
+/// distribution hides its user behind the `device_and_primary_warm` gate until
+/// that member's own retry receipt arrives, which in a closed group is never.
+///
+/// Costs one length comparison on a send that keyed everyone.
+fn retain_reportable_sender_key_devices(devices: &mut Vec<Jid>, encrypted: &[Jid]) {
+    if devices.len() == encrypted.len() {
+        return;
+    }
+    let encrypted: HashSet<&Jid> = encrypted.iter().collect();
+    devices.retain(|device| device.device != 0 || encrypted.contains(device));
 }
 
 /// Build the device set hashed into a group `phash`, matching WA Web
