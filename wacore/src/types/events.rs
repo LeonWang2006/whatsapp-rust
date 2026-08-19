@@ -284,6 +284,7 @@ pub enum EventKind {
     ContactRemoved,
     EncDecryptFailed,
     CallLogSync,
+    ReceivedTcToken,
     // When adding a variant, mind the 128-kind ceiling below (EventInterest packs
     // each discriminant as a bit in a u128) and keep the guard pointing at the
     // last variant.
@@ -1045,6 +1046,36 @@ pub enum Event {
 
     /// A call-history record synced from the primary device.
     CallLogSync(CallLogSync),
+
+    /// A trusted-contact privacy token was received for a peer and stored.
+    ///
+    /// Library extension (no WA Web event equivalent): dispatched from
+    /// `handle_privacy_token_notification` after a `privacy_token` notification
+    /// lands and is persisted, so a host that mirrors tc tokens into its own
+    /// store (e.g. the multi-pod server) can observe arrivals instead of
+    /// re-deriving them from message traffic.
+    ///
+    /// Last, like every new variant: a binary `Serialize` format writes the
+    /// variant index, so inserting in the middle renumbers everything after it.
+    ReceivedTcToken(ReceivedTcToken),
+}
+
+/// A trusted-contact privacy token received for a peer.
+///
+/// Carries the resolved account LID user (the same key the library stores the
+/// token under) plus the raw bytes and the server-provided timestamp, so a
+/// consumer can write it to its own per-relationship store.
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+#[allow(clippy::exhaustive_structs)]
+pub struct ReceivedTcToken {
+    /// The peer's account LID user (e.g. `100000012345678`), matching the
+    /// `tc_tokens.jid` storage key.
+    pub lid: String,
+    /// Raw token bytes.
+    pub token: Vec<u8>,
+    /// Unix timestamp (seconds) when the token was issued.
+    pub token_timestamp: i64,
 }
 
 /// Payload for [`Event::PairPasskeyRequest`].
@@ -1160,6 +1191,7 @@ impl Event {
             Event::PairPasskeyConfirmation(_) => EventKind::PairPasskeyConfirmation,
             Event::PairPasskeyError(_) => EventKind::PairPasskeyError,
             Event::ServerAck(_) => EventKind::ServerAck,
+            Event::ReceivedTcToken(_) => EventKind::ReceivedTcToken,
         }
     }
 
@@ -2483,6 +2515,7 @@ mod tests {
         assert_eq!(EventKind::AppStateSyncFailed as u8, 60);
         assert_eq!(EventKind::EncDecryptFailed as u8, 67);
         assert_eq!(EventKind::CallLogSync as u8, 68);
+        assert_eq!(EventKind::ReceivedTcToken as u8, 69);
     }
 
     /// Every rejection a consumer can be handed must survive being persisted

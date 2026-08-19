@@ -4189,6 +4189,7 @@ dependencies = [
  "dashmap",
  "env_logger",
  "futures",
+ "hex",
  "http 1.5.0",
  "hyper 0.14.32",
  "log",

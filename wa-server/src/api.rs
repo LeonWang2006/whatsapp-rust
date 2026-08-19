@@ -13,6 +13,9 @@
 //!   Redis key (`{link_prefix}:{phone}`): `{status: pairing|success|failed}`,
 //!   with `code` while pairing and `error` on failure. 404 when no flow is
 //!   known for the phone. `?jid=...` is also accepted.
+//! - `GET /presence?phone=...&contact=...&start=&end=` — contact online/offline
+//!   events within a time window (Unix secs, defaults 24h), plus derived online
+//!   intervals and total online seconds. Backed by PG `biz.presence_event`.
 //! - `POST /send`  — build a `send_message` task and dispatch it.
 //! - `POST /react` — build a `react` task and dispatch it.
 //! - `POST /pair`  — build a `pair_code` task and dispatch it.
@@ -35,8 +38,8 @@ use std::net::SocketAddr;
 
 use crate::session::ServerContext;
 use crate::task::{
-    LinkStatus, LinkStatusKind, PairCodePayload, ReactPayload, SendMessagePayload, TaskEnvelope,
-    TaskType, shard_for_jid,
+    LinkStatus, LinkStatusKind, PairCodePayload, PresenceEvent, ReactPayload, SendMessagePayload,
+    TaskEnvelope, TaskType, shard_for_jid,
 };
 
 #[derive(Clone)]
@@ -158,6 +161,7 @@ impl Api {
             ("GET", "/status") => Self::handle_status(&ctx),
             ("GET", "/pair-code") => Self::handle_pair_code(ctx, req).await,
             ("GET", "/link-status") => Self::handle_link_status(ctx, req).await,
+            ("GET", "/presence") => Self::handle_presence(ctx, req).await,
             ("POST", "/send") => Self::handle_send(ctx, req).await,
             ("POST", "/react") => Self::handle_react(ctx, req).await,
             ("POST", "/pair") => Self::handle_pair(ctx, req).await,
@@ -443,6 +447,87 @@ impl Api {
         Self::error_to_response(ApiError::NotFound)
     }
 
+    /// Query a contact's online/offline presence events for an owner within a
+    /// `[start, end]` time window (Unix seconds), and derive online intervals.
+    ///
+    /// Params: `phone` (owner, required), `contact` (required), `start`/`end`
+    /// (optional, default 24h back to now). Response:
+    ///
+    /// ```json
+    /// {
+    ///   "phone": "...", "contact": "...", "start": ..., "end": ...,
+    ///   "events": [{ "type": "online", "ts": ..., "last_seen": null }],
+    ///   "intervals": [{ "online_ts": ..., "offline_ts": ..., "duration_secs": ... }],
+    ///   "total_online_secs": ...
+    /// }
+    /// ```
+    ///
+    /// Intervals are paired by scanning events oldest-first: an `online` opens
+    /// a window, the next `offline` closes it. A leading `offline` is ignored
+    /// (window started before the query range); a trailing `online` with no
+    /// `offline` is reported with `offline_ts: null` and excluded from
+    /// `total_online_secs` (the contact may still be online).
+    async fn handle_presence(ctx: ServerContext, req: Request<Body>) -> Response<Body> {
+        let query = req.uri().query().unwrap_or_default();
+        let phone = query_param(query, "phone").filter(|p| !p.is_empty());
+        let contact = query_param(query, "contact").filter(|p| !p.is_empty());
+        let Some(phone) = phone else {
+            return Self::error_to_response(ApiError::BadRequest(
+                "missing required query param: phone".to_string(),
+            ));
+        };
+        let Some(contact) = contact else {
+            return Self::error_to_response(ApiError::BadRequest(
+                "missing required query param: contact".to_string(),
+            ));
+        };
+        let now = wacore::time::now_secs().max(0);
+        let start = query_param(query, "start")
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(now - 24 * 3600);
+        let end = query_param(query, "end")
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(now);
+        if start > end {
+            return Self::error_to_response(ApiError::BadRequest(
+                "start must be <= end".to_string(),
+            ));
+        }
+        let events = match ctx
+            .storage_factory
+            .query_presence_events(&phone, &contact, start, end)
+            .await
+        {
+            Ok(e) => e,
+            Err(e) => {
+                error!("presence: query failed phone={phone} contact={contact}: {e}");
+                return Self::error_to_response(ApiError::InternalServerError);
+            }
+        };
+
+        // Pair online/offline events into intervals.
+        let (intervals, total_online_secs) = pair_presence_intervals(&events);
+
+        let event_json: Vec<serde_json::Value> = events
+            .iter()
+            .map(|e| {
+                serde_json::json!({ "type": e.event_type, "ts": e.ts, "last_seen": e.last_seen })
+            })
+            .collect();
+        json_response(
+            StatusCode::OK,
+            &serde_json::json!({
+                "phone": phone,
+                "contact": contact,
+                "start": start,
+                "end": end,
+                "events": event_json,
+                "intervals": intervals,
+                "total_online_secs": total_online_secs,
+            }),
+        )
+    }
+
     fn error_to_response(error: ApiError) -> Response<Body> {
         let (status, message) = match error {
             ApiError::NotFound => (StatusCode::NOT_FOUND, "Endpoint not found".to_string()),
@@ -554,5 +639,132 @@ fn json_response<T: Serialize>(status: StatusCode, body: &T) -> Response<Body> {
                 .body(Body::from("{\"error\":\"serialization failure\"}"))
                 .unwrap_or_else(|_| Response::new(Body::from("{}")))
         }
+    }
+}
+
+/// A paired online/offline window for one contact.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+struct PresenceInterval {
+    online_ts: i64,
+    /// `None` when the contact was still online at the end of the window.
+    offline_ts: Option<i64>,
+    /// `None` (like `offline_ts`) when the window never closed.
+    duration_secs: Option<i64>,
+}
+
+/// Pair a contact's online/offline events (already sorted by `ts` ascending)
+/// into online windows, and sum the closed windows' duration.
+///
+/// An `online` opens a window, the next `offline` closes it. A leading
+/// `offline` is dropped (the window started before the query range); a
+/// trailing `online` with no closer is returned with `offline_ts`/`duration`
+/// `None` and excluded from the total (the contact may still be online). A
+/// duplicate `online` while a window is open keeps the earliest start.
+fn pair_presence_intervals(events: &[PresenceEvent]) -> (Vec<PresenceInterval>, i64) {
+    let mut intervals: Vec<PresenceInterval> = Vec::new();
+    let mut open_online: Option<i64> = None;
+    for ev in events {
+        match ev.event_type.as_str() {
+            "online" => {
+                open_online.get_or_insert(ev.ts);
+            }
+            "offline" => {
+                if let Some(started) = open_online.take() {
+                    intervals.push(PresenceInterval {
+                        online_ts: started,
+                        offline_ts: Some(ev.ts),
+                        duration_secs: Some((ev.ts - started).max(0)),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(started) = open_online {
+        intervals.push(PresenceInterval {
+            online_ts: started,
+            offline_ts: None,
+            duration_secs: None,
+        });
+    }
+    let total = intervals.iter().filter_map(|i| i.duration_secs).sum();
+    (intervals, total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ev(event_type: &str, ts: i64) -> PresenceEvent {
+        PresenceEvent {
+            owner_phone: "owner".into(),
+            contact_phone: "contact".into(),
+            event_type: event_type.into(),
+            ts,
+            last_seen: None,
+        }
+    }
+
+    #[test]
+    fn pairs_online_offline_into_intervals() {
+        let events = vec![ev("online", 100), ev("offline", 200)];
+        let (intervals, total) = pair_presence_intervals(&events);
+        assert_eq!(
+            intervals,
+            vec![PresenceInterval {
+                online_ts: 100,
+                offline_ts: Some(200),
+                duration_secs: Some(100),
+            }]
+        );
+        assert_eq!(total, 100);
+    }
+
+    #[test]
+    fn leading_offline_is_ignored() {
+        // offline before any online means the window started outside the range.
+        let events = vec![ev("offline", 50), ev("online", 100), ev("offline", 200)];
+        let (intervals, total) = pair_presence_intervals(&events);
+        assert_eq!(intervals.len(), 1);
+        assert_eq!(intervals[0].online_ts, 100);
+        assert_eq!(intervals[0].offline_ts, Some(200));
+        assert_eq!(total, 100);
+    }
+
+    #[test]
+    fn trailing_online_has_no_closer() {
+        let events = vec![ev("online", 100), ev("offline", 200), ev("online", 300)];
+        let (intervals, total) = pair_presence_intervals(&events);
+        assert_eq!(intervals.len(), 2);
+        assert_eq!(
+            intervals[1],
+            PresenceInterval {
+                online_ts: 300,
+                offline_ts: None,
+                duration_secs: None,
+            }
+        );
+        // Closed window only.
+        assert_eq!(total, 100);
+    }
+
+    #[test]
+    fn duplicate_online_keeps_earliest_start() {
+        let events = vec![ev("online", 100), ev("online", 150), ev("offline", 200)];
+        let (intervals, _) = pair_presence_intervals(&events);
+        assert_eq!(intervals.len(), 1);
+        assert_eq!(intervals[0].online_ts, 100);
+        assert_eq!(intervals[0].duration_secs, Some(100));
+    }
+
+    #[test]
+    fn empty_and_all_offline() {
+        let (intervals, total) = pair_presence_intervals(&[]);
+        assert!(intervals.is_empty());
+        assert_eq!(total, 0);
+
+        let (intervals, total) = pair_presence_intervals(&[ev("offline", 100)]);
+        assert!(intervals.is_empty());
+        assert_eq!(total, 0);
     }
 }

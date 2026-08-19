@@ -104,3 +104,26 @@ CREATE INDEX idx_sub_order_user ON biz.subscription_order (user_id);
 CREATE INDEX idx_sub_order_contact ON biz.subscription_order (contact_id);
 CREATE INDEX idx_sub_order_store ON biz.subscription_order (platform, store_order_id);
 CREATE INDEX idx_sub_order_status ON biz.subscription_order (status);
+
+-- ------------------------------------------------------------
+-- 联系人上下线事件表 (presence 在线时长追踪)
+--   订阅联系人 presence 后, 上线/下线各记一行, 形成时间对。
+--   客户端通过 GET /presence 查询指定范围内的上下线记录并计算在线时长。
+-- ------------------------------------------------------------
+CREATE TABLE biz.presence_event (
+    id            BIGSERIAL PRIMARY KEY,
+    owner_phone   TEXT        NOT NULL,              -- 归属账号手机号(哪个用户在观察联系人)
+    contact_phone TEXT        NOT NULL,              -- 联系人手机号(LID 已归一化为 PN)
+    event_type    TEXT        NOT NULL,              -- online / offline
+    ts            BIGINT      NOT NULL,              -- 事件时间(Unix 秒)
+    last_seen     BIGINT,                            -- 下线时携带的 last_seen
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_presence_event_lookup
+    ON biz.presence_event (owner_phone, contact_phone, ts);
+
+-- 幂等: 同一 (owner, contact, type, ts) 只保留一行 (重投/重连竞争去重), 配合插入的 ON CONFLICT DO NOTHING
+ALTER TABLE biz.presence_event
+    ADD CONSTRAINT uq_presence_event_unique
+    UNIQUE (owner_phone, contact_phone, event_type, ts);

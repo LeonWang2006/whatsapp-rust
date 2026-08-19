@@ -5,9 +5,11 @@
 //! database. Unlike the SQLite backend, PG handles concurrent writes natively
 //! so there is no process-wide serialization semaphore.
 
+pub mod biz;
 pub mod postgres_store;
 pub mod schema;
 pub mod storage_factory;
 
+pub use biz::BizUser;
 pub use postgres_store::PostgresStore;
 pub use storage_factory::PostgresStorageFactory;

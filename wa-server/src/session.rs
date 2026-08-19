@@ -27,6 +27,24 @@ use crate::task::{
     PairCodePayload, ReactPayload, SendMessagePayload, SessionCommand, TaskEnvelope, TaskType,
 };
 
+/// TTL for the Redis key that shares a contact's tc token across pods
+/// ([`tc_token_key`]). Long enough that a restarting pod re-finds tokens its
+/// peer collected while it was down, short enough that a revoked token does not
+/// linger forever. Refreshed whenever a token is mirrored.
+pub const TC_TOKEN_TTL_SECS: u64 = 24 * 3600;
+
+/// Redis key under which a contact's tc token is shared across pods.
+///
+/// Keyed by the contact's LID user (the same key the library persists the
+/// token under), hex-encoded token bytes as the value. This is a cache of the
+/// already-persisted `public.tc_tokens` row — PG is the source of truth and
+/// survives restarts, the Redis copy exists so a pod that only holds the token
+/// in memory still recovers from a peer's copy after a restart. Kept keyed by
+/// LID because the library's `lookup_tc_token_for_jid` resolves LID first.
+pub fn tc_token_key(lid: &str) -> String {
+    format!("wa-tc-token:{lid}")
+}
+
 /// Shared server context handed to every session worker.
 #[derive(Clone)]
 pub struct ServerContext {
@@ -99,9 +117,8 @@ pub async fn run_session(ctx: ServerContext, jid: String, first_task: Option<Tas
     let event_pair_phone = pair_phone_from_task(first_task.as_ref())
         .or_else(|| crate::task::phone_from_jid(&jid).map(str::to_owned));
 
-    let mut builder = Bot::builder()
-        .with_backend_arc(backend)
-        .on_event(move |event, _client| {
+    let mut builder = Bot::builder().with_backend_arc(backend).on_event(
+        move |event, event_client| {
             let mut redis = event_redis.clone();
             let jid = event_jid.clone();
             let pod = event_pod.clone();
@@ -112,6 +129,7 @@ pub async fn run_session(ctx: ServerContext, jid: String, first_task: Option<Tas
             let link_status_prefix = event_link_status_prefix.clone();
             let pair_phone = event_pair_phone.clone();
             let device_existed = event_device_existed;
+            let event_client = event_client;
             async move {
                 // Forward every event to the Redis event stream first so the
                 // business system learns about the logout/replacement and the
@@ -129,6 +147,55 @@ pub async fn run_session(ctx: ServerContext, jid: String, first_task: Option<Tas
                     &event,
                 )
                 .await;
+
+                // Mirror newly received tc tokens into the shared Redis cache so
+                // any pod (including one that restarted while the token arrived)
+                // can look it up without re-deriving it from message traffic.
+                if let Event::ReceivedTcToken(t) = &*event {
+                    let key = tc_token_key(&t.lid);
+                    let val = hex::encode(&t.token);
+                    if let Err(e) = redis::Cmd::set_ex(&key, val, TC_TOKEN_TTL_SECS)
+                        .query_async::<()>(&mut redis)
+                        .await
+                    {
+                        warn!("failed to mirror tc token for lid={}: {e}", t.lid);
+                    }
+                }
+
+                // Record presence online/offline events so the API can answer
+                // range queries per contact. `from` is often a LID, so resolve
+                // it to the contact's phone number (falling back to the raw
+                // user part when no LID↔PN mapping is known yet).
+                if let Event::Presence(p) = &*event {
+                    let owner_phone = match crate::task::phone_from_jid(&jid) {
+                        Some(p) => p.to_string(),
+                        None => jid.clone(),
+                    };
+                    let contact_phone = {
+                        let entry = event_client.get_lid_pn_entry(&p.from).await.ok().flatten();
+                        match entry {
+                            Some(e) => e.phone_number.to_string(),
+                            None => p.from.user.to_string(),
+                        }
+                    };
+                    let event_type = if p.unavailable { "offline" } else { "online" };
+                    let last_seen = p.last_seen.map(|t| t.timestamp());
+                    let ts = wacore::time::now_secs().max(0);
+                    if let Err(e) = factory
+                        .record_presence_event(
+                            &owner_phone,
+                            &contact_phone,
+                            event_type,
+                            ts,
+                            last_seen,
+                        )
+                        .await
+                    {
+                        warn!(
+                            "failed to record presence event jid={jid} contact={contact_phone}: {e}"
+                        );
+                    }
+                }
 
                 // Lifecycle events trigger session teardown.
                 let (should_delete, label) = match &*event {
@@ -167,7 +234,8 @@ pub async fn run_session(ctx: ServerContext, jid: String, first_task: Option<Tas
                 unregister_in_redis(&mut r, &jid, &pod).await;
                 cancel.cancel();
             }
-        });
+        },
+    );
 
     // A pairing task that *creates* this session configures the library to
     // request the code automatically once the socket is up, instead of us
@@ -211,6 +279,110 @@ pub async fn run_session(ctx: ServerContext, jid: String, first_task: Option<Tas
         cancel: cancel.clone(),
     });
     ctx.registry.insert(session_handle.clone());
+
+    // Auto-subscribe: once the session connects, re-subscribe presence for the
+    // account's contacts so the pod starts receiving their presence/status
+    // updates without waiting for an external task. Contact numbers come from
+    // the biz tables (PG-backed factory) and the library attaches each contact's
+    // stored tc token to the subscription automatically — the token is shared
+    // cross-pod via PG + the Redis cache, so a pod that restarts re-subscribes
+    // with the same tokens it held before.
+    let auto_subscribe_ctx = ctx.clone();
+    let auto_subscribe_jid = jid.clone();
+    let auto_subscribe_cancel = cancel.clone();
+    let auto_subscribe_client = client.clone();
+    tokio::spawn(async move {
+        // Waits through the resume handshake + critical sync; be generous. A
+        // logout/cancel lands as a cancel, which aborts this wait.
+        match auto_subscribe_client
+            .wait_for_connected(Duration::from_secs(60))
+            .await
+        {
+            Ok(()) => {}
+            Err(e) => {
+                info!(
+                    "auto-subscribe: not connected for jid={auto_subscribe_jid} within 60s: {e}; skipping"
+                );
+                return;
+            }
+        }
+        if auto_subscribe_cancel.is_cancelled() {
+            return;
+        }
+
+        // Resolve the owning biz user (if any) and their contact list.
+        let phone = match crate::task::phone_from_jid(&auto_subscribe_jid) {
+            Some(p) => p.to_string(),
+            None => {
+                info!("auto-subscribe: jid={auto_subscribe_jid} has no phone number; skipping");
+                return;
+            }
+        };
+        let user_id = match auto_subscribe_ctx
+            .storage_factory
+            .biz_user_id_by_phone(&phone)
+            .await
+        {
+            Ok(Some(id)) => id,
+            Ok(None) => {
+                info!("auto-subscribe: no biz user for phone={phone}; skipping");
+                return;
+            }
+            Err(e) => {
+                warn!("auto-subscribe: biz user lookup failed for phone={phone}: {e}");
+                return;
+            }
+        };
+        let contacts = match auto_subscribe_ctx
+            .storage_factory
+            .biz_contacts_for_user(user_id)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("auto-subscribe: contact lookup failed for user={user_id}: {e}");
+                return;
+            }
+        };
+
+        let mut redis = auto_subscribe_ctx.redis.clone();
+        for contact in &contacts {
+            if auto_subscribe_cancel.is_cancelled() {
+                break;
+            }
+            let contact_jid = Jid::pn(contact);
+            match auto_subscribe_client
+                .presence()
+                .subscribe(&contact_jid)
+                .await
+            {
+                Ok(()) => info!(
+                    "auto-subscribe: jid={auto_subscribe_jid} subscribed presence for contact={contact}"
+                ),
+                Err(e) => {
+                    warn!("auto-subscribe: subscribe presence for contact={contact} failed: {e}");
+                    // Track the failed subscription too so the API surfaces what
+                    // the pod attempted, and the library can retry on reconnect.
+                }
+            }
+            let status = serde_json::json!({
+                "status": "subscribed",
+                "updated_at": wacore::time::now_secs().max(0),
+            });
+            let key = format!("wa-presence:{phone}:{contact}");
+            if let Err(e) =
+                redis::Cmd::set(&key, serde_json::to_string(&status).unwrap_or_default())
+                    .query_async::<()>(&mut redis)
+                    .await
+            {
+                warn!("auto-subscribe: failed to write presence key {key}: {e}");
+            }
+        }
+        info!(
+            "auto-subscribe: done for jid={auto_subscribe_jid} ({} contact(s))",
+            contacts.len()
+        );
+    });
 
     // Deliver the task that triggered session creation, UNLESS it was a
     // `pair_code` task. For a fresh device the task was consumed above to

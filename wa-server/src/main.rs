@@ -69,6 +69,63 @@ impl StorageFactory for PostgresStorageFactoryAdapter {
     async fn delete_for_jid(&self, jid: &str) -> anyhow::Result<()> {
         self.0.delete_for_jid(jid).await
     }
+
+    async fn all_jids(&self) -> anyhow::Result<Vec<String>> {
+        self.0.all_jids().await.map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    async fn biz_user_id_by_phone(&self, phone: &str) -> anyhow::Result<Option<i64>> {
+        self.0
+            .biz_user_by_phone(phone)
+            .await
+            .map(|u| u.map(|u| u.id))
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    async fn biz_contacts_for_user(&self, user_id: i64) -> anyhow::Result<Vec<String>> {
+        self.0
+            .biz_contacts_for_user(user_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    async fn record_presence_event(
+        &self,
+        owner_phone: &str,
+        contact_phone: &str,
+        event_type: &str,
+        ts: i64,
+        last_seen: Option<i64>,
+    ) -> anyhow::Result<()> {
+        self.0
+            .record_presence_event(owner_phone, contact_phone, event_type, ts, last_seen)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    async fn query_presence_events(
+        &self,
+        owner_phone: &str,
+        contact_phone: &str,
+        start: i64,
+        end: i64,
+    ) -> anyhow::Result<Vec<wa_server::task::PresenceEvent>> {
+        self.0
+            .query_presence_events(owner_phone, contact_phone, start, end)
+            .await
+            .map(|evts| {
+                evts.into_iter()
+                    .map(|e| wa_server::task::PresenceEvent {
+                        owner_phone: e.owner_phone,
+                        contact_phone: e.contact_phone,
+                        event_type: e.event_type,
+                        ts: e.ts,
+                        last_seen: e.last_seen,
+                    })
+                    .collect()
+            })
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
 }
 
 #[tokio::main]
@@ -81,9 +138,10 @@ async fn main() {
     let max_sessions = env_or_parse("MAX_SESSIONS", 0usize);
     let pair_code_key_prefix = env_or("PAIR_CODE_KEY_PREFIX", PAIR_CODE_KEY_PREFIX);
     let link_status_key_prefix = env_or("LINK_STATUS_KEY_PREFIX", LINK_STATUS_KEY_PREFIX);
+    let restore_on_start = env_or_parse("RESTORE_ON_START", true);
 
     info!(
-        "starting wa-server pod={pod_id} api={api_addr} max_sessions={max_sessions} redis={redis_url}"
+        "starting wa-server pod={pod_id} api={api_addr} max_sessions={max_sessions} redis={redis_url} restore_on_start={restore_on_start}"
     );
 
     // Connect to Redis.
@@ -148,6 +206,41 @@ async fn main() {
     let server_task = tokio::spawn(async move {
         server.run().await;
     });
+
+    // Restore previously-paired devices so a freshly-started pod reconnects
+    // without waiting for an external task to target them. Spawned *before* the
+    // API so sessions are already coming online when the pod reports ready.
+    // `run_session` registers each JID in `wa-registry` first and aborts when
+    // another pod holds the lease, so multi-pod double-connection is prevented
+    // by construction. Disabled with RESTORE_ON_START=false (e.g. a fresh pod
+    // that must not grab every device in the fleet on startup).
+    let restore_ctx = wa_server::session::ServerContext {
+        registry: api_registry.clone(),
+        storage_factory: storage_factory.clone(),
+        redis: redis.clone(),
+        redis_client: client.clone(),
+        pod_id: pod_id.clone(),
+        max_sessions,
+        pair_code_key_prefix: pair_code_key_prefix.clone(),
+        link_status_key_prefix: link_status_key_prefix.clone(),
+    };
+    if restore_on_start {
+        match storage_factory.all_jids().await {
+            Ok(jids) => {
+                info!("restore: {} paired device(s)", jids.len());
+                for jid in jids {
+                    info!("restore: respawning session for jid={jid}");
+                    let ctx = restore_ctx.clone();
+                    tokio::spawn(async move {
+                        wa_server::session::run_session(ctx, jid, None).await;
+                    });
+                }
+            }
+            Err(e) => warn!("restore: failed to enumerate paired devices: {e}"),
+        }
+    } else {
+        info!("restore: disabled (RESTORE_ON_START=false)");
+    }
 
     // Run the API on its own task, sharing the server's registry so `/status`
     // reflects live sessions and local dispatch hits the same command channels.

@@ -213,6 +213,25 @@ pub struct PairCodePayload {
     pub phone_number: String,
 }
 
+/// A contact's online/offline presence event, as persisted in
+/// `biz.presence_event` and served by `GET /presence`.
+///
+/// Storage-agnostic: the PG factory maps its own `biz` row type onto this so
+/// the server trait stays decoupled from any one backend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PresenceEvent {
+    /// Owning account phone number (whose session observed the contact).
+    pub owner_phone: String,
+    /// Contact phone number (LID already normalized to PN where known).
+    pub contact_phone: String,
+    /// `online` or `offline`.
+    pub event_type: String,
+    /// Unix seconds when the event occurred.
+    pub ts: i64,
+    /// `last_seen` carried by an offline event (absent for online).
+    pub last_seen: Option<i64>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

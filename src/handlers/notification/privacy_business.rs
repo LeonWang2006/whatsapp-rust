@@ -3,7 +3,9 @@ use crate::types::events::Event;
 use log::{debug, info, warn};
 use std::sync::Arc;
 use wacore::stanza::business::BusinessNotification;
-use wacore::types::events::{BusinessStatusUpdate, BusinessUpdateType};
+use wacore::types::events::{
+    BusinessStatusUpdate, BusinessUpdateType, ReceivedTcToken as ReceivedTcTokenEvent,
+};
 use wacore_binary::NodeRef;
 
 /// Handle incoming privacy_token notification.
@@ -138,6 +140,23 @@ pub(crate) async fn handle_privacy_token_notification(client: &Arc<Client>, node
         && let Err(e) = client.presence().re_subscribe_when_active(from).await
     {
         debug!(target: "Client/TcToken", "Failed to re-subscribe presence for {}: {e}", from.observe());
+    }
+
+    // Mirror each newly stored token as an event so a host (e.g. the multi-pod
+    // server) can observe token arrivals without re-deriving them from message
+    // traffic. Only emitted for genuinely new tokens — a timestamp-only refresh
+    // re-dispatches nothing new.
+    if token_stored {
+        for received in &received_tokens {
+            let event = Event::ReceivedTcToken(
+                ReceivedTcTokenEvent::builder()
+                    .lid(sender_lid.to_string())
+                    .token(received.token.clone())
+                    .token_timestamp(received.timestamp)
+                    .build(),
+            );
+            client.core.event_bus.dispatch(event);
+        }
     }
 }
 

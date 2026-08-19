@@ -204,4 +204,75 @@ impl PostgresStorageFactory {
         .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))??;
         Ok(())
     }
+
+    /// Return every JID that has a device row, for startup restore.
+    ///
+    /// Lets a freshly-started pod enumerate previously-paired devices so it can
+    /// reconnect them without waiting for an external task. A pod must still
+    /// win the registry lease per JID before connecting (see
+    /// [`crate::redis_registry::register_in_redis`]) to avoid double-connecting
+    /// a device already live on another pod.
+    pub async fn all_jids(&self) -> anyhow::Result<Vec<String>> {
+        let url = self.database_url.clone();
+        let jids = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<String>> {
+            let mut conn =
+                PgConnection::establish(&url).map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+            let jids: Vec<String> = jid_device_map::table
+                .select(jid_device_map::jid)
+                .load(&mut conn)
+                .map_err(|e| anyhow::anyhow!("load jids: {e}"))?;
+            Ok(jids)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))??;
+        Ok(jids)
+    }
+
+    /// Look up a `biz.wa_user` by its current phone number.
+    pub async fn biz_user_by_phone(&self, phone: &str) -> StoreResult<Option<crate::biz::BizUser>> {
+        crate::biz::biz_user_by_phone(&self.database_url, phone).await
+    }
+
+    /// Return the contact phone numbers a user has added, in insertion order.
+    pub async fn biz_contacts_for_user(&self, user_id: i64) -> StoreResult<Vec<String>> {
+        crate::biz::biz_contacts_for_user(&self.database_url, user_id).await
+    }
+
+    /// Persist a presence (online/offline) event for one owner + contact.
+    pub async fn record_presence_event(
+        &self,
+        owner_phone: &str,
+        contact_phone: &str,
+        event_type: &str,
+        ts: i64,
+        last_seen: Option<i64>,
+    ) -> StoreResult<()> {
+        crate::biz::record_presence_event(
+            &self.database_url,
+            owner_phone,
+            contact_phone,
+            event_type,
+            ts,
+            last_seen,
+        )
+        .await
+    }
+
+    /// Query presence events for one owner + contact in a time window.
+    pub async fn query_presence_events(
+        &self,
+        owner_phone: &str,
+        contact_phone: &str,
+        start: i64,
+        end: i64,
+    ) -> StoreResult<Vec<crate::biz::PresenceEvent>> {
+        crate::biz::query_presence_events(
+            &self.database_url,
+            owner_phone,
+            contact_phone,
+            start,
+            end,
+        )
+        .await
+    }
 }
