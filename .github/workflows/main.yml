@@ -177,29 +177,22 @@ jobs:
         run: cargo build --workspace --exclude e2e-tests --all-features --all-targets --verbose
       - name: Clippy (all features)
         run: cargo clippy --workspace --exclude e2e-tests --all-features --all-targets -- -D warnings
-      # No `cargo test --all-features`: it enables the `danger-skip-*-verify` flags, which disable
-      # security verification (the cert-chain negative test is even cfg'd out), so the suite would
-      # change behavior rather than catch rot; build + clippy cover that. The voip suite runs under
-      # the explicit `voip` feature set instead, never `--all-features`.
-      - name: Test (voip)
+      # There is no `cargo test --all-features` because a few features cannot
+      # share a build with the rest. `scripts/ci/test_features.sh` derives the
+      # set that can from cargo metadata and carries the exclusions with their
+      # reasons, so a feature added tomorrow is tested without editing CI.
+      # Compiling a test is not running it: the two `--all-features` steps above
+      # build the codec suite, its golden checksums and every C/Go ground-truth
+      # vector among them, but nothing executed them until a step actually
+      # enabled `voip-mlow` and ran it. That is what this loop does.
+      - name: Test (every shareable feature)
         run: |
-          cargo nextest run --profile ci -p wacore --features voip --lib
-          cargo nextest run --profile ci -p whatsapp-rust --features "voip tokio-native tokio-transport" --lib
-      # `voip` does NOT imply `voip-mlow`, and wacore has no default features, so the `Test (voip)`
-      # step above compiles `voip::mlow` away entirely. The two `--all-features` steps at the top of
-      # this job do compile it, tests and all, but compiling a test is not running it: the codec's
-      # tests, the golden checksums and every C/Go ground-truth vector among them, executed nowhere
-      # in CI before this step.
-      - name: Test (voip-mlow)
-        run: cargo nextest run --profile ci -p wacore --features voip-mlow --lib -E 'test(voip::mlow)'
-      # legacy-session-interop is off by default, so every other test job
-      # compiles its module away and never runs a single one of its tests.
-      - name: Test (legacy-session-interop)
-        run: cargo nextest run --profile ci -p wacore-libsignal --features legacy-session-interop
-      # `tracing` is off by default, so span-scope assertions compile to nothing
-      # everywhere else. They are the only gate on which work a span owns.
-      - name: Test (tracing)
-        run: cargo nextest run --profile ci -p whatsapp-rust --features tracing --test handshake_span_scope
+          for package in wacore wacore-libsignal whatsapp-rust; do
+            features="$(./scripts/ci/test_features.sh "$package")"
+            echo "::group::$package [$features]"
+            cargo nextest run --profile ci -p "$package" --features "$features" --lib --tests
+            echo "::endgroup::"
+          done
 
   rustdoc:
     name: Rustdoc

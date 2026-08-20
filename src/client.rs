@@ -20,7 +20,8 @@ mod node_io;
 pub(crate) mod offline_resume;
 mod sender_keys;
 mod sessions;
-mod voip;
+pub(crate) mod subsystem;
+pub(crate) mod voip;
 use builder::{ClientAssembly, ClientExtensions};
 pub use builder::{ClientBuild, ClientBuilder, ClientBuilderError};
 pub(crate) use device_memo_stats::{
@@ -516,16 +517,11 @@ pub struct MemoryReport {
     pub signal_sessions: CollectionStats,
     pub signal_identities: CollectionStats,
     pub signal_sender_keys: CollectionStats,
-    /// Admission snapshots retained while a call-link join ACK is in flight.
-    #[cfg(feature = "voip-runtime")]
-    pub pending_call_link_updates: CollectionStats,
-    /// Active/ringing calls and bounded pre-offer group controls, including their snapshots/queues.
-    #[cfg(feature = "voip-runtime")]
-    pub active_calls: CollectionStats,
-    /// Outgoing calls parked until the server sends the relay that owns them.
-    /// Each entry retains the material needed to spawn one media engine.
-    #[cfg(feature = "voip-runtime")]
-    pub pending_outgoing_calls: u64,
+    /// What the optional subsystems attached to this build retain. Empty when
+    /// none is attached. One field rather than a `cfg`'d field per subsystem,
+    /// so the report has one shape whatever was compiled; see
+    /// `agent_docs/subsystem_boundary.md`.
+    pub subsystems: Vec<SubsystemMemory>,
     #[cfg(feature = "plugins")]
     pub plugins: u64,
     #[cfg(feature = "plugins")]
@@ -556,6 +552,42 @@ pub struct MemoryReport {
     pub stanza_interceptors: usize,
 }
 
+/// Names one collection an attached subsystem reports.
+///
+/// A subsystem exports these as constants (see `voip::collections`), so looking
+/// a figure up in [`MemoryReport`] is a name the compiler checks rather than two
+/// string literals a caller has to spell the way the report happens to print
+/// them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubsystemCollection {
+    pub subsystem: &'static str,
+    pub collection: &'static str,
+}
+
+impl SubsystemCollection {
+    pub const fn new(subsystem: &'static str, collection: &'static str) -> Self {
+        Self {
+            subsystem,
+            collection,
+        }
+    }
+}
+
+/// One collection an attached subsystem retains, as `MemoryReport` carries it.
+///
+/// The subsystem and the collection stay separate fields rather than one fused
+/// display string, so a caller looks a figure up by what it is instead of by
+/// how the report happens to print it.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct SubsystemMemory {
+    /// The subsystem that reported it, e.g. `"voip"`.
+    pub subsystem: &'static str,
+    /// The collection within that subsystem, e.g. `"active_calls"`.
+    pub collection: &'static str,
+    pub stats: CollectionStats,
+}
+
 impl MemoryReport {
     /// Common byte-carrying collections used by both totals and `Display`.
     /// Feature-specific collections stay beside their gated report section.
@@ -577,13 +609,23 @@ impl MemoryReport {
         ]
     }
 
+    /// One collection of one attached subsystem. `None` when that subsystem is
+    /// not attached to this build, or does not report that collection.
+    pub fn subsystem(&self, which: SubsystemCollection) -> Option<CollectionStats> {
+        self.subsystems
+            .iter()
+            .find(|retained| {
+                retained.subsystem == which.subsystem && retained.collection == which.collection
+            })
+            .map(|retained| retained.stats)
+    }
+
     /// Sum of every estimated byte figure in the report.
     pub fn total_estimated_bytes(&self) -> u64 {
         let total: u64 = self.collections().iter().map(|(_, c)| c.bytes).sum();
-        #[cfg(feature = "voip-runtime")]
-        let total = total
-            .saturating_add(self.pending_call_link_updates.bytes)
-            .saturating_add(self.active_calls.bytes);
+        let total = self.subsystems.iter().fold(total, |sum, retained| {
+            sum.saturating_add(retained.stats.bytes)
+        });
         #[cfg(feature = "plugins")]
         let total = total.saturating_add(self.plugin_event_queue.bytes);
         total
@@ -681,16 +723,12 @@ impl std::fmt::Display for MemoryReport {
         for (name, c) in &collections[TTL_BOUNDED..TTL_BOUNDED + SIGNAL_CACHES] {
             line(f, name, c)?;
         }
-        #[cfg(feature = "voip-runtime")]
-        {
-            writeln!(f, "--- VoIP state ---")?;
-            line(f, "pending_link_updates:", &self.pending_call_link_updates)?;
-            line(f, "active_calls:", &self.active_calls)?;
-            writeln!(
-                f,
-                "  pending_outgoing_calls: {}",
-                self.pending_outgoing_calls
-            )?;
+        if !self.subsystems.is_empty() {
+            writeln!(f, "--- Optional subsystems ---")?;
+            for retained in &self.subsystems {
+                let name = format!("{} {}:", retained.subsystem, retained.collection);
+                line(f, &name, &retained.stats)?;
+            }
         }
         writeln!(f, "--- In-flight history sync ---")?;
         line(f, collections[HISTORY_SYNC].0, &self.history_sync_tasks)?;
@@ -1544,14 +1582,11 @@ pub struct Client {
     /// Tracks the pending pair code request and ephemeral keys.
     pub(crate) pair_code_state: Arc<Mutex<wacore::pair_code::PairCodeState>>,
 
-    /// SHORTCAKE_PASSKEY linking flow state: the pending handoff key, the
-    /// per-attempt ephemeral linking cache, and the optional host authenticator.
-    pub(crate) passkey_state: Arc<Mutex<crate::passkey::flow::PasskeyFlowState>>,
-
-    /// Wait-free "an open is in flight" reservation for the passkey flow. Kept
-    /// outside `passkey_state` so it can be released synchronously on drop (a
-    /// cancelled open can't leave it stuck), unlike a flag behind the async lock.
-    pub(crate) passkey_opening: AtomicBool,
+    /// Per-client state of every optional subsystem attached to this build,
+    /// each under its own type, in one field rather than one field per
+    /// subsystem. Empty, and zero-sized, in a build with none attached; see
+    /// `agent_docs/subsystem_boundary.md`.
+    pub(crate) subsystems: subsystem::Subsystems,
 
     /// Custom handlers for encrypted message types. Set once at `Bot::build` and
     /// immutable afterward, so the receive hot path reads it with a plain
@@ -1750,38 +1785,6 @@ pub struct Client {
     /// are registered.
     stanza_interceptor_count: AtomicUsize,
     next_interceptor_id: AtomicU64,
-
-    /// Active VoIP calls and their media-task abort handles. `abort_all` runs from the
-    /// connection-cleanup path so a disconnect/reconnect tears down every in-flight call. Behind the
-    /// `voip` feature: it is populated only by the `voip` media facade.
-    #[cfg(feature = "voip-runtime")]
-    pub(crate) call_registry: Arc<wacore::voip::CallRegistry>,
-
-    /// Admission snapshots that can race a call-link join ACK before its call id is registered.
-    /// Kept beside the client-side join lifecycle so `wacore` does not authorize unknown calls.
-    #[cfg(feature = "voip-runtime")]
-    pending_call_link_joins: Arc<std::sync::Mutex<voip::PendingCallLinkJoins>>,
-
-    /// Serializes call-link joins until the ACK reveals which call id owns any admission state
-    /// buffered during the request. This keeps a bounded overflow tied to one join instead of
-    /// letting it reject an unrelated concurrent join.
-    #[cfg(feature = "voip-runtime")]
-    pending_call_link_join_lane: Arc<Mutex<()>>,
-
-    /// Serializes incoming-answer registration with generation-aware teardown. A failed answer holds
-    /// its call-id lane until `<terminate>` has been written, so a same-call-id re-offer cannot become
-    /// current in the removal-before-send window. Stripes bound storage while allowing independent
-    /// lanes to progress concurrently.
-    #[cfg(feature = "voip-runtime")]
-    pub(crate) answer_transition_locks: [Arc<Mutex<()>>; 16],
-
-    /// Outgoing calls awaiting their relay. The initiator's relay is not in the offer; it arrives
-    /// from the server AFTER the offer (live-only), so each `voip().call()` parks the material needed
-    /// to spawn the engine here, keyed by call-id, until a `<call>` carrying a `<relay>` for that id
-    /// arrives. Behind the `voip` feature; populated only by the media facade.
-    #[cfg(feature = "voip-runtime")]
-    pub(crate) pending_outgoing_calls:
-        Arc<std::sync::Mutex<HashMap<String, crate::voip::facade::PendingOutgoing>>>,
 }
 
 /// Builds a pong response node for a server-initiated ping.
