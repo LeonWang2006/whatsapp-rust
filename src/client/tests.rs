@@ -6730,3 +6730,313 @@ mod ensure_sessions_concurrency {
         assert_eq!(client.ensure_inflight.len(), 0);
     }
 }
+
+/// Reproduction: a client between connections and a client that is finished
+/// refuse the same public call with the same error, so nothing in what the
+/// caller gets back separates "this comes back on its own" from "stop trying".
+///
+/// The two clients differ only in the state the reconnect loop reads, which is
+/// exactly what [`Client::reachability`] reports and the error does not.
+#[tokio::test]
+async fn a_reconnecting_client_and_a_finished_one_refuse_a_call_identically() {
+    let reconnecting = crate::test_utils::create_test_client().await;
+    reconnecting.is_running.store(true, Ordering::Relaxed);
+
+    let finished = crate::test_utils::create_test_client().await;
+    finished.is_running.store(true, Ordering::Relaxed);
+    finished
+        .enable_auto_reconnect
+        .store(false, Ordering::Relaxed);
+    finished.expected_disconnect.store(true, Ordering::Relaxed);
+
+    let jid = Jid::pn("12025550111");
+    let transient = reconnecting
+        .contacts()
+        .get_user_info(std::slice::from_ref(&jid))
+        .await
+        .expect_err("a client with no socket cannot answer a usync");
+    let terminal = finished
+        .contacts()
+        .get_user_info(std::slice::from_ref(&jid))
+        .await
+        .expect_err("nor can one that is finished");
+
+    assert_eq!(
+        transient.to_string(),
+        terminal.to_string(),
+        "the error is the same on both, which is the gap being closed"
+    );
+
+    assert_eq!(
+        reconnecting.reachability(),
+        Reachability::Reconnecting,
+        "a client whose loop is still trying is worth waiting for"
+    );
+    assert_eq!(
+        finished.reachability(),
+        Reachability::Finished,
+        "a finished one never is"
+    );
+}
+
+/// A client whose flags say `<success>` finished publishing: connected,
+/// authenticated, and with a reader running.
+async fn create_reachable_wait_test_client(name: &str) -> Arc<Client> {
+    let client = crate::test_utils::create_test_client_with_name(name).await;
+    client.is_running.store(true, Ordering::Relaxed);
+    client.set_connected_for_test(true);
+    client.is_logged_in.store(true, Ordering::Relaxed);
+    client.authenticated_generation.store(
+        client.connection_generation.load(Ordering::SeqCst),
+        Ordering::SeqCst,
+    );
+    assert_eq!(client.reachability(), Reachability::Reachable);
+    client
+}
+
+/// The other half of the reproduction: the call the reconnecting client refused
+/// is one the caller can wait out, and the wait ends the moment the replacement
+/// connection finishes authenticating.
+#[tokio::test]
+async fn the_wait_ends_when_the_replacement_connection_authenticates() {
+    let client = crate::test_utils::create_test_client_with_name("wait-release").await;
+    client.is_running.store(true, Ordering::Relaxed);
+    assert_eq!(client.reachability(), Reachability::Reconnecting);
+
+    let waiter = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move { client.wait_until_reachable().await })
+    };
+    crate::test_utils::wait_for_notifier_listeners(&client.session_state_notifier, 1).await;
+
+    // What `handle_success` publishes, in its order: the session, then the
+    // generation it is authenticated under, then the announcement.
+    client.set_connected_for_test(true);
+    client.is_logged_in.store(true, Ordering::Relaxed);
+    client.authenticated_generation.store(
+        client.connection_generation.load(Ordering::SeqCst),
+        Ordering::SeqCst,
+    );
+    client.notify_session_state();
+
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("the wait must end on the new connection")
+            .expect("the waiter should not panic"),
+        Reachability::Reachable
+    );
+}
+
+/// Terminal beats reachability. Every one of these sets its terminal flags
+/// before it clears the session and closes the transport, so a wait that asked
+/// about the socket first would be handed a connection that is already ending.
+///
+/// The ordering is asserted on a client that is still connected and still
+/// authenticated, because that is the window it exists for. The release is
+/// asserted from a wait that is already parked, so what ends it is the terminal
+/// transition and not the state the waiter happened to start in.
+#[tokio::test]
+async fn a_terminal_session_ends_the_wait_however_it_became_terminal() {
+    for code in ["401", "409", "516"] {
+        let client = create_reachable_wait_test_client(&format!("terminal-{code}")).await;
+        let error = NodeBuilder::new("stream:error").attr("code", code).build();
+        client.handle_stream_error(&error.as_node_ref()).await;
+
+        assert!(client.is_terminal(), "{code} ends the session for good");
+        assert_eq!(
+            client.reachability(),
+            Reachability::Finished,
+            "and that outranks whatever the socket still says"
+        );
+    }
+
+    // Parked first, on a client that is merely between connections, so the only
+    // thing that can end this wait is the transition under test.
+    let client = crate::test_utils::create_test_client_with_name("terminal-parked").await;
+    client.is_running.store(true, Ordering::Relaxed);
+    let waiter = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move { client.wait_until_reachable().await })
+    };
+    crate::test_utils::wait_for_notifier_listeners(&client.session_state_notifier, 1).await;
+    assert!(!waiter.is_finished(), "parked, with no verdict yet");
+
+    // A shutdown is terminal without any stream error, and reaches the parked
+    // wait through the same notifier.
+    client.signal_shutdown_sync();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("a shutdown must release the wait")
+            .expect("the waiter should not panic"),
+        Reachability::Finished,
+        "reporting that no connection is coming, rather than that none arrived yet"
+    );
+}
+
+/// A 429 clears the session and leaves everything else standing: the socket is
+/// open, the generation unchanged, `is_connected` still true. Reading it as
+/// ready would send the very traffic the server just penalised straight back
+/// down the same connection.
+#[tokio::test]
+async fn a_rate_limited_session_is_not_a_reachable_one() {
+    let client = create_reachable_wait_test_client("rate-limited").await;
+
+    let error = NodeBuilder::new("stream:error").attr("code", "429").build();
+    client.handle_stream_error(&error.as_node_ref()).await;
+
+    assert!(
+        client.is_connected(),
+        "the socket the rate limit arrived on is still open"
+    );
+    assert!(!client.is_terminal(), "and the session is not over");
+    assert_eq!(
+        client.reachability(),
+        Reachability::Reconnecting,
+        "but nothing sent on it is worth sending"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), client.wait_until_reachable())
+            .await
+            .is_err(),
+        "so the wait carries on to the connection that follows the penalty"
+    );
+}
+
+/// A client nothing is reading answers no IQ and reconnects from nothing, so
+/// the wait says that instead of parking for the life of the process. Its
+/// caller holds the `Arc` whose drop would have been the only other way out.
+#[tokio::test]
+async fn a_client_with_no_reader_is_told_rather_than_parked() {
+    let client = crate::test_utils::create_test_client_with_name("no-reader").await;
+    client.set_connected_for_test(true);
+    client.is_logged_in.store(true, Ordering::Relaxed);
+    client.authenticated_generation.store(
+        client.connection_generation.load(Ordering::SeqCst),
+        Ordering::SeqCst,
+    );
+
+    assert!(
+        !client.is_terminal(),
+        "a connection nobody drives is not a finished session"
+    );
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), client.wait_until_reachable())
+            .await
+            .expect("waiting cannot be what fixes this, so it must not wait"),
+        Reachability::Unsupervised
+    );
+}
+
+/// The two waits differ by exactly one policy. Work the client re-issues for
+/// itself sits through a pause, because nothing on the next connection asks for
+/// it again; a caller waiting on its own behalf is the side that calls
+/// `resume`, so it is told and can decide.
+#[tokio::test]
+async fn a_pause_ends_the_public_wait_and_not_the_internal_one() {
+    let client = create_reachable_wait_test_client("paused").await;
+
+    // Paused before the internal waiter starts, so it parks on the pause rather
+    // than racing the connection this call tears down.
+    client.pause().await;
+    assert_eq!(client.reachability(), Reachability::Paused);
+
+    let internal = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move { client.await_connection().await })
+    };
+    crate::test_utils::wait_for_notifier_listeners(&client.session_state_notifier, 1).await;
+
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), client.wait_until_reachable())
+            .await
+            .expect("the public wait must not sit through an offline the caller asked for"),
+        Reachability::Paused
+    );
+    assert!(
+        !internal.is_finished(),
+        "while the internal one waits for the connection the resume brings back"
+    );
+
+    client.resume();
+    client.set_connected_for_test(true);
+    client.is_logged_in.store(true, Ordering::Relaxed);
+    client.authenticated_generation.store(
+        client.connection_generation.load(Ordering::SeqCst),
+        Ordering::SeqCst,
+    );
+    client.notify_session_state();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), internal)
+            .await
+            .expect("and ends on it")
+            .expect("the waiter should not panic"),
+        "reporting the connection it was waiting for"
+    );
+}
+
+/// The wait ends on the state, never on one event. A notification that does not
+/// settle the question loops, so a wake that lands just before a teardown does
+/// not hand the caller the connection that teardown is taking away.
+#[tokio::test]
+async fn a_wake_that_settles_nothing_leaves_the_wait_parked() {
+    let client = crate::test_utils::create_test_client_with_name("relooping-wait").await;
+    client.is_running.store(true, Ordering::Relaxed);
+
+    let waiter = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move { client.wait_until_reachable().await })
+    };
+    crate::test_utils::wait_for_notifier_listeners(&client.session_state_notifier, 1).await;
+
+    // The socket is up, which is what `socket_ready_notifier` announces, and
+    // `<success>` has not arrived: a one-shot wait would return here, on a
+    // connection that answers nothing.
+    client.set_connected_for_test(true);
+    client.socket_ready_notifier.notify(usize::MAX);
+    // Yielded rather than polled for a condition, because the condition being
+    // proved is that nothing happens: the waiter has to be given the chance to
+    // run and to have taken it before "still parked" means anything.
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !waiter.is_finished(),
+        "a socket with no session behind it is not something to release work onto"
+    );
+
+    // And the teardown that follows is what it ends on.
+    client.signal_shutdown_sync();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("the teardown must release the wait")
+            .expect("the waiter should not panic"),
+        Reachability::Finished
+    );
+}
+
+/// The happy path pays nothing: a reachable client resolves the wait on its
+/// first poll, without yielding and without registering the two listeners a
+/// park costs.
+#[tokio::test]
+async fn a_reachable_client_completes_the_wait_without_parking() {
+    use futures::FutureExt;
+
+    let client = create_reachable_wait_test_client("no-park").await;
+
+    let allocations = crate::test_alloc::min_allocs(0, || {
+        assert_eq!(
+            client
+                .wait_until_reachable()
+                .now_or_never()
+                .expect("a ready client must not yield"),
+            Reachability::Reachable
+        );
+    });
+    assert_eq!(
+        allocations, 0,
+        "and must not register a listener on the way through"
+    );
+}
