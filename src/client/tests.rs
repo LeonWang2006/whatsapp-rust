@@ -7040,3 +7040,118 @@ async fn a_reachable_client_completes_the_wait_without_parking() {
         "and must not register a listener on the way through"
     );
 }
+
+/// Reproduction: the two clients [`Reachability`] does not separate are one
+/// whose first connection has not landed and one restoring a session it lost.
+/// Every marker that could tell them apart is set on the second and not the
+/// first, and both report the same state, so a caller holding work until the
+/// client is reachable holds both the same way.
+#[tokio::test]
+async fn a_first_connection_and_a_restored_one_report_the_same_state() {
+    let first = crate::test_utils::create_test_client_with_name("never-connected").await;
+    first.is_running.store(true, Ordering::Relaxed);
+
+    let restoring = crate::test_utils::create_test_client_with_name("lost-session").await;
+    restoring.is_running.store(true, Ordering::Relaxed);
+    // What one authenticated-then-lost cycle leaves standing: the persistent
+    // record of a login, and the generations `<success>` and the teardown bump.
+    restoring
+        .persistence_manager
+        .process_command(DeviceCommand::IncrementLoginCounter)
+        .await;
+    restoring
+        .connection_generation
+        .fetch_add(2, Ordering::SeqCst);
+
+    assert_eq!(first.connection_generation.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        first
+            .persistence_manager
+            .get_device_snapshot()
+            .login_counter,
+        0,
+        "the first client has never authenticated, in this process or any other"
+    );
+    assert!(restoring.connection_generation.load(Ordering::SeqCst) > 0);
+    assert!(
+        restoring
+            .persistence_manager
+            .get_device_snapshot()
+            .login_counter
+            > 0,
+        "and the second has, which is the whole of the difference between them"
+    );
+
+    assert_eq!(
+        first.reachability(),
+        restoring.reachability(),
+        "yet nothing reachability reads separates them"
+    );
+    assert_eq!(first.reachability(), Reachability::Reconnecting);
+    assert!(first.reachability().recovers_on_its_own());
+    assert!(restoring.reachability().recovers_on_its_own());
+
+    for client in [&first, &restoring] {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), client.wait_until_reachable())
+                .await
+                .is_err(),
+            "so a wait sits through both alike"
+        );
+    }
+}
+
+/// A client that has never connected is the state every healthy start passes
+/// through, so it is waited out like any other and ends on the connection
+/// rather than on a verdict about the past. A state that reported "no
+/// connection has ever landed" and settled the wait would hand that verdict to
+/// every caller that waits right after starting the loop.
+#[tokio::test]
+async fn a_first_connection_is_waited_out_like_any_other() {
+    let client = crate::test_utils::create_test_client_with_name("first-connect-wait").await;
+    client.is_running.store(true, Ordering::Relaxed);
+    assert_eq!(
+        client.connection_generation.load(Ordering::SeqCst),
+        0,
+        "no connection of this client was ever driven or torn down"
+    );
+
+    let waiter = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move { client.wait_until_reachable().await })
+    };
+    crate::test_utils::wait_for_notifier_listeners(&client.session_state_notifier, 1).await;
+    assert!(
+        !waiter.is_finished(),
+        "having never connected is not a reason to stop waiting"
+    );
+
+    client.set_connected_for_test(true);
+    client.is_logged_in.store(true, Ordering::Relaxed);
+    client.authenticated_generation.store(
+        client.connection_generation.load(Ordering::SeqCst),
+        Ordering::SeqCst,
+    );
+    client.notify_session_state();
+
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("the first connection must end the wait")
+            .expect("the waiter should not panic"),
+        Reachability::Reachable
+    );
+}
+
+/// The gate an embedder reads before every call stays flag loads and a match,
+/// on the path that is taken most: no store read, and nothing to allocate.
+#[tokio::test]
+async fn reading_reachability_costs_nothing_on_the_reachable_path() {
+    let client = create_reachable_wait_test_client("reachability-cost").await;
+
+    let allocations = crate::test_alloc::min_allocs(0, || {
+        assert_eq!(client.reachability(), Reachability::Reachable);
+        assert!(!client.reachability().recovers_on_its_own());
+    });
+    assert_eq!(allocations, 0);
+}
