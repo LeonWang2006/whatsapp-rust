@@ -113,6 +113,49 @@ Moving them under `src/voip/` would pass test 3 by separating each from the
 Signal-session, response-waiter and tc-token code it belongs with. Worse code
 for a better number, so they stay, and this row is the record of that choice.
 
+### Not a subsystem: WAM
+
+Asked and answered rather than left for the next reader, because telemetry looks
+like a passenger and is not one.
+
+| test | WAM |
+| --- | --- |
+| 1. Reach | **Fails.** A subsystem is entered on a dispatch key the core already routes on. WAM claims no stanza tag, no notification type and no IQ namespace on the way in; what it wants is to watch work the core does for its own reasons, which is the shape this document calls coupled. |
+| 2. State | Passes. Its buffers, queue and counters are read only by itself. |
+| 3. Return | Passes. It needs the event bus and one IQ request, both already public. |
+| 4. Contract | Passes. It owns no `Event` variant and no field of a public type. |
+
+Failing test 1 leaves two options: a fifth `Subsystem` hook, or somewhere else.
+The hook needs two askers and a measured floor, and WAM is one asker, so it goes
+where a watcher belongs, on the plugin host's `events.core.observe`. The core
+gains nothing: production code under `src/` and `wacore/` is untouched by that
+batch apart from the files whatspec regenerates, and one pinned literal in a
+`mod tests` that moved with the spec bump.
+
+What the capability surface does not have, recorded because the next watcher will
+want the same things:
+
+- **An outbound observation point with the send's semantics.** `Event::SentFrame`
+  hands over the marshaled bytes of a stanza after the write, which is enough to
+  replay a stanza and not enough to say what kind of message it was, how many
+  devices it was encrypted for, or how long each stage took. Eighteen WAM events
+  are blocked on that alone.
+- **A storage handle.** WAM wants a sequence number and undelivered buffers to
+  survive a restart. There is no storage capability, and this is not an argument
+  for adding one: a capability is a promise about every plugin. The plugin
+  defines its own trait and ships an in-memory default.
+- **A way to see what the core counts.** Two WAM events describe things
+  `wacore::telemetry` already measures, whose doc comments name those very WAM
+  ids, and a plugin cannot reach a counter, only the event bus.
+- **A per-stanza inbound seam that is not the whole firehose.** A metric about
+  receipt stanzas has to be derived from `Event::RawNode`, because the typed
+  `Event::Receipt` fans out per peer on the aggregated shape and is skipped
+  entirely on the retry path. `RawNode` gives the right unit and forwards every
+  decoded stanza to get there, so a watcher that wants one tag pays for all of
+  them.
+
+`agent_docs/wam_telemetry.md` has the rest.
+
 ### Structural
 
 `client-lifecycle` is the generation-scoped seam; `plugins` is the generic host,
