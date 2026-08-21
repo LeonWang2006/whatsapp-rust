@@ -226,6 +226,8 @@ pub struct WamStats {
 struct Shared {
     queue: VecDeque<PendingEvent>,
     stats: WamStats,
+    /// Losses the store caused that no buffer has carried a report for yet.
+    store_losses: u64,
 }
 
 /// The plugin's telemetry runtime.
@@ -259,6 +261,17 @@ pub enum TickKind {
     /// durable one carries the buffer into the next run. The chain is spelled
     /// out where the decision is taken, in `upload_current`.
     Final,
+}
+
+/// Why no buffer could be started.
+///
+/// The two are different faults with different owners: a store that will not
+/// issue a sequence number, and a catalog whose global no longer belongs on the
+/// channel this buffer is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoBuffer {
+    Store,
+    Catalog,
 }
 
 /// How draining the retained buffers ended.
@@ -308,6 +321,7 @@ impl WamRuntime {
                     store_is_durable: durable,
                     ..WamStats::default()
                 },
+                store_losses: 0,
             }),
         }
     }
@@ -398,6 +412,34 @@ impl WamRuntime {
         }));
     }
 
+    /// Note a loss the store caused, to be reported once a buffer can carry it.
+    ///
+    /// Its own field rather than the drop counter, because the two name
+    /// different faults: a drop is this runtime abandoning a buffer it could
+    /// have kept, and this is the store refusing to hold one or to hand out the
+    /// sequence number it needs. Queued rather than only counted locally, so the
+    /// telemetry that eventually uploads says why the gap in it is there; the
+    /// report rides a later buffer, which is the only kind that can carry it.
+    fn note_store_loss(&self) {
+        let mut shared = self.lock();
+        shared.store_losses = shared.store_losses.saturating_add(1);
+    }
+
+    /// The losses noted since the last report, as the event that carries them.
+    ///
+    /// `None` when there are none. Counted rather than queued so a store that
+    /// keeps failing reports what it lost once it can, instead of one report per
+    /// tick describing the attempt to report the last one.
+    fn take_store_losses(&self) -> Option<PendingEvent> {
+        let count = std::mem::take(&mut self.lock().store_losses);
+        i64::try_from(count).ok().filter(|n| *n > 0).map(|count| {
+            PendingEvent::WamClientErrors(events::WamClientErrors {
+                wam_client_buffer_store_error_count: Some(count),
+                ..Default::default()
+            })
+        })
+    }
+
     /// Write the queued events into a buffer and upload it when it is due.
     ///
     /// `now_secs` and `roll` are parameters rather than reads of a global clock
@@ -449,9 +491,17 @@ impl WamRuntime {
             }
             if writer.current.is_none() {
                 match self.start_buffer().await {
-                    Some(buffer) => writer.current = Some(buffer),
-                    None => {
+                    Ok(buffer) => writer.current = Some(buffer),
+                    Err(reason) => {
                         self.lock().stats.unbuffered += 1;
+                        // Only one of the two is the store's doing. A global the
+                        // catalog no longer allows on this channel is this build
+                        // disagreeing with itself, and reporting it as a storage
+                        // failure would point whoever reads the counter at the
+                        // wrong thing.
+                        if reason == NoBuffer::Store {
+                            self.note_store_loss();
+                        }
                         continue;
                     }
                 }
@@ -459,6 +509,17 @@ impl WamRuntime {
             let Some(buffer) = writer.current.as_mut() else {
                 continue;
             };
+            // A buffer exists, so the losses noted while none could be started
+            // have somewhere to go. Written here rather than queued when they
+            // happen: a queued report is itself an event that needs a buffer,
+            // so a store that keeps failing would drop each report and note a
+            // fresh loss for it, reporting its own retries as losses forever.
+            if let Some(report) = self.take_store_losses() {
+                let weight = report.weight();
+                if report.write_into(buffer, now_secs, weight) {
+                    self.lock().stats.written += 1;
+                }
+            }
             if event.write_into(buffer, now_secs, weight) {
                 self.lock().stats.written += 1;
             }
@@ -492,12 +553,12 @@ impl WamRuntime {
     }
 
     /// A fresh buffer, carrying the identity's globals.
-    async fn start_buffer(&self) -> Option<WamBuffer> {
+    async fn start_buffer(&self) -> Result<WamBuffer, NoBuffer> {
         let sequence = match self.store.next_sequence(Channel::Regular).await {
             Ok(sequence) => sequence,
             Err(err) => {
                 warn!("wam: no sequence number, dropping the event: {err}");
-                return None;
+                return Err(NoBuffer::Store);
             }
         };
         let mut buffer = WamBuffer::new(Channel::Regular, STREAM_ID, sequence);
@@ -508,10 +569,10 @@ impl WamRuntime {
                 // channel. Refusing is right: the alternative is uploading a
                 // buffer no official client would send.
                 warn!("wam: cannot start a buffer: {err}");
-                return None;
+                return Err(NoBuffer::Catalog);
             }
         }
-        Some(buffer)
+        Ok(buffer)
     }
 
     /// Take the current buffer and try to deliver it.
@@ -641,7 +702,7 @@ impl WamRuntime {
             Err(err) => {
                 warn!("wam: cannot retain a buffer without reading the retained set: {err}");
                 self.lock().stats.discarded += 1;
-                self.report_buffer_drop();
+                self.note_store_loss();
                 return;
             }
         };
@@ -659,7 +720,12 @@ impl WamRuntime {
             self.report_buffer_drop();
             return;
         }
-        let key = next_key(&pending);
+        let Some(key) = next_key(&pending) else {
+            warn!("wam: no free key is left in the retained set, dropping a buffer");
+            self.lock().stats.discarded += 1;
+            self.note_store_loss();
+            return;
+        };
         if let Err(err) = self
             .store
             .put_pending(PendingBuffer {
@@ -671,6 +737,7 @@ impl WamRuntime {
         {
             warn!("wam: could not retain a buffer: {err}");
             self.lock().stats.discarded += 1;
+            self.note_store_loss();
         }
     }
 
@@ -780,13 +847,32 @@ enum Delivery {
 /// not know about them would hand out a key one of them already holds, which the
 /// store's insert semantics turn into an undelivered buffer being overwritten.
 /// The caller already has the list, since the retention cap is computed from it.
-fn next_key(pending: &[PendingBuffer]) -> u64 {
-    pending
-        .iter()
-        .map(|b| b.key)
-        .max()
-        .unwrap_or(0)
-        .saturating_add(1)
+///
+/// One past the highest, except when the highest is the largest a key can be.
+/// Saturating there would hand back that same occupied key and let the store's
+/// insert semantics overwrite the buffer holding it, which is the loss this
+/// function exists to prevent. A key at the top says nothing about the space
+/// below it, though, and a store that picks its keys by hash puts one there
+/// while holding almost nothing, so the fallback takes the lowest key nobody
+/// holds. `None` only when every key is taken, which nothing this retention cap
+/// allows can reach.
+fn next_key(pending: &[PendingBuffer]) -> Option<u64> {
+    let mut used: Vec<u64> = pending.iter().map(|b| b.key).collect();
+    used.sort_unstable();
+    used.dedup();
+    if let Some(next) = used.last().copied().unwrap_or(0).checked_add(1) {
+        return Some(next);
+    }
+    // Keys start at 1, so the walk does too.
+    let mut candidate = 1u64;
+    for key in used {
+        match key.cmp(&candidate) {
+            std::cmp::Ordering::Less => {}
+            std::cmp::Ordering::Greater => return Some(candidate),
+            std::cmp::Ordering::Equal => candidate = candidate.checked_add(1)?,
+        }
+    }
+    Some(candidate)
 }
 
 /// How long to wait before the next upload attempt, in seconds, after
@@ -1536,6 +1622,86 @@ mod tests {
         );
     }
 
+    /// A loss the store caused is not a loss this runtime chose. The catalog
+    /// has a field for each, and only the local counter used to move, so the
+    /// telemetry that eventually uploaded never said why it had a gap.
+    ///
+    /// Counted while it cannot be reported and written once it can: queueing
+    /// the report instead would make it an event that itself needs a buffer,
+    /// and a store that keeps failing would drop each one and note a fresh loss
+    /// for it, reporting its own retries forever.
+    #[tokio::test]
+    async fn a_store_that_loses_a_buffer_reports_it_once_a_buffer_can_carry_it() {
+        let store = Arc::new(BlindStore::new());
+        let runtime = WamRuntime::new(WamIdentity::web(), store.clone(), 64);
+        let mut writer = WamWriter::default();
+        let uploader = ScriptedUploader::with([Err(UploadFailure::retryable("503"))]);
+
+        runtime.observe(receipt());
+        runtime
+            .tick(
+                &mut writer,
+                &uploader,
+                1_755_000_000,
+                &mut keep_all(),
+                TickKind::Final,
+            )
+            .await;
+        assert_eq!(runtime.stats().discarded, 1);
+        assert!(
+            runtime.queued().is_empty(),
+            "the report is not itself an event waiting for a buffer"
+        );
+
+        // Once the store answers, the next buffer carries the report.
+        store.see_again();
+        runtime.observe(receipt());
+        runtime
+            .tick(
+                &mut writer,
+                &uploader,
+                1_755_000_000 + ROTATE_INTERVAL_SECS,
+                &mut keep_all(),
+                TickKind::Scheduled,
+            )
+            .await;
+        assert_eq!(
+            runtime.stats().written,
+            3,
+            "the receipt from each tick, plus one report for the loss"
+        );
+    }
+
+    /// A store that will not issue a sequence number costs every event it is
+    /// handed. What it must not cost is a report per tick describing the last
+    /// failed report: nothing is queued, so an idle tick notes nothing.
+    #[tokio::test]
+    async fn a_sequence_outage_does_not_report_its_own_retries() {
+        let runtime = WamRuntime::new(WamIdentity::web(), Arc::new(SequencelessStore), 64);
+        let mut writer = WamWriter::default();
+        let uploader = ScriptedUploader::with([]);
+
+        runtime.observe(receipt());
+        for tick in 0..4 {
+            runtime
+                .tick(
+                    &mut writer,
+                    &uploader,
+                    1_755_000_000 + tick,
+                    &mut keep_all(),
+                    TickKind::Scheduled,
+                )
+                .await;
+        }
+
+        assert_eq!(
+            runtime.stats().unbuffered,
+            1,
+            "one event was lost, and the three idle ticks after it lost nothing"
+        );
+        assert!(runtime.queued().is_empty());
+    }
+
     #[tokio::test]
     async fn a_store_that_cannot_be_read_does_not_get_a_guessed_key() {
         // A failed read is not an empty store. Retaining under a guessed key
@@ -1780,13 +1946,19 @@ mod tests {
 
     #[test]
     fn next_key_clears_every_key_already_in_use() {
-        assert_eq!(next_key(&[]), 1);
+        assert_eq!(next_key(&[]), Some(1));
         let held = |key| PendingBuffer {
             key,
             channel: Channel::Regular,
             bytes: Vec::new(),
         };
-        assert_eq!(next_key(&[held(1), held(7), held(3)]), 8);
+        assert_eq!(next_key(&[held(1), held(7), held(3)]), Some(8));
+        // The top of the range is not a key to hand out again: saturating there
+        // would return the one the buffer at `u64::MAX` already holds. The space
+        // below it is untouched, so that is where the next key comes from rather
+        // than nowhere.
+        assert_eq!(next_key(&[held(u64::MAX)]), Some(1));
+        assert_eq!(next_key(&[held(1), held(2), held(u64::MAX)]), Some(3));
     }
 
     #[test]
