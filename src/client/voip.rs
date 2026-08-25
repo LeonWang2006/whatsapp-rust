@@ -10,6 +10,8 @@ use std::time::Duration;
 
 #[cfg(feature = "voip-runtime")]
 use log::warn;
+#[cfg(feature = "voip-runtime")]
+use wacore::stanza::call::build_mute_v2;
 use wacore::stanza::call::{TerminateParams, build_reject, build_terminate};
 #[cfg(feature = "voip-runtime")]
 use wacore::stanza::group_call::{
@@ -1593,6 +1595,61 @@ impl Voip<'_> {
         }
     }
 
+    /// Announce this side's microphone state, as `<mute_v2 mute-state>`.
+    ///
+    /// `peer` is where the state is published: the call scope for a group or call-link call, whose
+    /// roster shows who is muted, and the peer device for a direct call, the same address the rest of
+    /// its signaling uses. From a `CallHandle` prefer its own `set_muted()`, which applies the local
+    /// mute and resolves `peer` for both shapes.
+    #[cfg(feature = "voip-runtime")]
+    pub async fn announce_muted(
+        &self,
+        call_id: &str,
+        peer: &Jid,
+        call_creator: &Jid,
+        muted: bool,
+    ) -> Result<(), CallError> {
+        let generation = self
+            .client
+            .call_registry()
+            .generation_of(call_id)
+            .ok_or(CallError::Media("call is no longer active"))?;
+        // The answer-transition lane is the lock a replacement generation is installed under; a
+        // per-entry lock belongs to the entry being replaced and so cannot close that window.
+        let _transition = self.client.lock_answer_transition(call_id).await;
+        self.announce_muted_locked(call_id, peer, call_creator, generation, muted)
+            .await
+    }
+
+    /// [`announce_muted`](Self::announce_muted) for a caller that already holds the call's
+    /// answer-transition lane and its own generation.
+    #[cfg(feature = "voip-runtime")]
+    pub(crate) async fn announce_muted_locked(
+        &self,
+        call_id: &str,
+        peer: &Jid,
+        call_creator: &Jid,
+        generation: u64,
+        muted: bool,
+    ) -> Result<(), CallError> {
+        // A handle superseded while it waited must not announce a state for the replacement that now
+        // owns this call-id.
+        if self.client.call_registry().generation_of(call_id) != Some(generation) {
+            return Err(CallError::Media("call is no longer active"));
+        }
+        self.send_group_control(
+            call_id,
+            build_mute_v2(
+                call_id,
+                peer,
+                call_creator,
+                &self.client.generate_request_id(),
+                muted,
+            ),
+        )
+        .await
+    }
+
     /// Publish the local persistent raise/lower-hand state.
     #[cfg(feature = "voip-runtime")]
     pub async fn set_hand_raised(
@@ -1861,33 +1918,136 @@ impl Voip<'_> {
             .set_waiting_room_task(&call_id, generation, task);
     }
 
-    /// Terminate an active call.
+    /// Terminate an active call: `<terminate>` to `peer`, then the local teardown.
+    ///
+    /// Holding a `CallHandle`, prefer its own `terminate()`: it knows all three identifiers, resolves
+    /// `peer` to the device that answered, and reaches every device a still-ringing call rang.
     pub async fn terminate(
         &self,
         call_id: &str,
         peer: &Jid,
         call_creator: &Jid,
     ) -> Result<(), CallError> {
-        if call_id.is_empty() {
-            return Err(CallError::EmptyCallId);
-        }
-        let id = self.client.generate_request_id();
-        let stanza = build_terminate(&TerminateParams {
-            call_id,
-            to: peer,
-            id: Some(&id),
-            call_creator,
-            reason: None,
-        });
-        let sent = self.client.send_node(stanza).await;
-        // Tear the local call down regardless of whether the stanza reached the peer: the app asked to
-        // hang up, and a failed signaling send must not leave the media task capturing/sending (or a
-        // dormant outgoing call free to attach on a late relay ack). Reuse the same teardown the peer's
-        // `<terminate>` triggers so the public hangup actually ends our side too.
         #[cfg(feature = "voip-runtime")]
-        crate::voip::facade::terminate_call(self.client, call_id);
-        sent?;
-        Ok(())
+        {
+            let pinned = self.client.call_registry().generation_of(call_id);
+            // Armed before the lane, since waiting for it is cancellable too, and pinned so it can
+            // only ever end the call this terminate started on. Nothing registered under this call-id
+            // means there is no local call of ours to end, so this path stays teardown-free.
+            let _teardown = pinned.map(|generation| LocalTeardown {
+                client: self.client,
+                call_id,
+                generation,
+            });
+            // Held across the send: a replacement installed in that window would be ended by a
+            // `<terminate>` the peer cannot tell apart from ours, since both carry the same call-id.
+            let _transition = self.client.lock_answer_transition(call_id).await;
+            // Any change since entry -- a replacement, a removal, or a first registration under a
+            // call-id that had none -- belongs to a different call than the one asked to end.
+            if self.client.call_registry().generation_of(call_id) != pinned {
+                return Err(CallError::Media("call is no longer active"));
+            }
+            return self
+                .terminate_inner(call_id, std::slice::from_ref(peer), call_creator, pinned)
+                .await
+                .1;
+        }
+        #[cfg(not(feature = "voip-runtime"))]
+        self.terminate_inner(call_id, std::slice::from_ref(peer), call_creator, None)
+            .await
+            .1
+    }
+
+    /// [`terminate`](Self::terminate) restricted to one registry generation and addressed at every
+    /// device that must be told, so a handle superseded by a same-call-id replacement tears down its
+    /// own call instead of the replacement's.
+    #[cfg(feature = "voip-runtime")]
+    pub(crate) async fn terminate_for_generation(
+        &self,
+        call_id: &str,
+        peers: &[Jid],
+        call_creator: &Jid,
+        generation: u64,
+    ) -> TerminateDelivery {
+        let (notified, result) = self
+            .terminate_inner(call_id, peers, call_creator, Some(generation))
+            .await;
+        TerminateDelivery {
+            notified,
+            failure: result.err(),
+        }
+    }
+
+    async fn terminate_inner(
+        &self,
+        call_id: &str,
+        peers: &[Jid],
+        call_creator: &Jid,
+        _generation: Option<u64>,
+    ) -> (usize, Result<(), CallError>) {
+        if call_id.is_empty() {
+            return (0, Err(CallError::EmptyCallId));
+        }
+        // Tear the local call down whatever happens to the stanzas: the app asked to hang up, and
+        // neither a failed send nor a caller that drops this future mid-send (a timeout, a `select!`)
+        // may leave the media task capturing or a dormant outgoing call free to attach on a late
+        // relay ack. A drop guard is what survives the cancellation; it reuses the same teardown the
+        // peer's `<terminate>` triggers.
+        // Pinned by the caller, never resolved here: a teardown that read the registry at drop time
+        // would find a same-call-id replacement and end that instead of the call the caller asked to
+        // hang up. `None` is a call-id with nothing of ours registered under it, which has no local
+        // side to tear down.
+        #[cfg(feature = "voip-runtime")]
+        let _teardown = _generation.map(|generation| LocalTeardown {
+            client: self.client,
+            call_id,
+            generation,
+        });
+        let mut notified = 0usize;
+        let mut result = Ok(());
+        for peer in peers {
+            let id = self.client.generate_request_id();
+            let stanza = build_terminate(&TerminateParams {
+                call_id,
+                to: peer,
+                id: Some(&id),
+                call_creator,
+                reason: None,
+            });
+            match self.client.send_node(stanza).await {
+                Ok(()) => notified += 1,
+                Err(error) if result.is_ok() => result = Err(error.into()),
+                Err(_) => {}
+            }
+        }
+        (notified, result)
+    }
+}
+
+/// How much of a multi-target `<terminate>` fan-out was confirmed sent. A still-ringing call is told
+/// per device, so "some devices, not all" is a real outcome and not the same as telling nobody. A
+/// send that errors is unconfirmed rather than known-undelivered: the transport can fail after
+/// putting bytes on the wire.
+#[cfg(feature = "voip-runtime")]
+pub(crate) struct TerminateDelivery {
+    pub(crate) notified: usize,
+    pub(crate) failure: Option<CallError>,
+}
+
+/// Local call teardown that runs even when the terminate future is cancelled mid-send.
+#[cfg(feature = "voip-runtime")]
+pub(crate) struct LocalTeardown<'a> {
+    pub(crate) client: &'a Client,
+    pub(crate) call_id: &'a str,
+    /// The generation this teardown owns, pinned when the terminate started, so it can only ever end
+    /// that call and never a replacement registered under the same call-id afterwards.
+    pub(crate) generation: u64,
+}
+
+#[cfg(feature = "voip-runtime")]
+impl Drop for LocalTeardown<'_> {
+    fn drop(&mut self) {
+        crate::voip::facade::terminate_call_if_current(self.client, self.call_id, self.generation);
     }
 }
 
