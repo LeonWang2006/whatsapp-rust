@@ -5681,6 +5681,16 @@ async fn capturing_client(
     Arc<Client>,
     Arc<crate::transport::mock::CapturingMockTransport>,
 ) {
+    capturing_client_with_cache_config(test_id, crate::cache_config::CacheConfig::default()).await
+}
+
+async fn capturing_client_with_cache_config(
+    test_id: &str,
+    cache_config: crate::cache_config::CacheConfig,
+) -> (
+    Arc<Client>,
+    Arc<crate::transport::mock::CapturingMockTransport>,
+) {
     use crate::socket::NoiseSocket;
     use crate::store::SqliteStore;
     use crate::store::persistence_manager::PersistenceManager;
@@ -5710,12 +5720,13 @@ async fn capturing_client(
     );
     let factory = CapturingMockTransportFactory::new();
     let transport = factory.transport();
-    let (client, _sync_rx) = Client::new(
+    let (client, _sync_rx) = Client::new_with_cache_config(
         Arc::new(crate::runtime_impl::TokioRuntime),
         pm,
         Arc::new(factory),
         Arc::new(MockHttpClient),
         None,
+        cache_config,
     )
     .await;
 
@@ -14953,5 +14964,1270 @@ async fn a_namespace_switch_mid_flight_is_seen_as_a_second_message() {
         switched,
         "an unresolved key cannot tell this from a new sender, and the duplicate \
          placeholder is the cost this design accepts"
+    );
+}
+
+// --- Resent-message dispatch gate --------------------------------------
+//
+// A sender whose network is bad re-runs its own outbox: same message id, fresh
+// ciphertext at a new sender-key iteration. The ratchet cannot see that as a
+// duplicate, so only message identity can.
+
+/// A group participant whose sender key the client already holds, as a real
+/// first message would have left it.
+async fn joined_group_sender(client: &Arc<Client>, jid_str: &str, group: &Jid) -> AlicePeer {
+    let mut peer = AlicePeer::new(jid_str).await;
+    let skdm = peer.create_group_skdm(group).await;
+    let axolotl = skdm
+        .axolotl_sender_key_distribution_message
+        .expect("skdm bytes");
+    client
+        .handle_sender_key_distribution_message(group, &peer.jid, "SKDM_INSTALL", &axolotl)
+        .await;
+    peer
+}
+
+fn group_skmsg_stanza(
+    group: &Jid,
+    sender: &Jid,
+    id: &str,
+    ciphertext: Vec<u8>,
+) -> Arc<OwnedNodeRef> {
+    let enc = NodeBuilder::new("enc")
+        .attr("type", "skmsg")
+        .attr("v", "2")
+        .bytes(ciphertext)
+        .build();
+    node_to_arc(
+        NodeBuilder::new("message")
+            .attr("from", group.clone())
+            .attr("participant", sender.clone())
+            .attr("id", id)
+            .attr("t", wacore::time::now_secs().to_string())
+            .attr("type", "text")
+            .attr(
+                "addressing_mode",
+                crate::types::message::AddressingMode::Lid.as_str(),
+            )
+            .children(vec![enc])
+            .build(),
+    )
+}
+
+async fn encrypt_group_text(peer: &mut AlicePeer, group: &Jid, text: &str) -> Vec<u8> {
+    use wacore::messages::MessageUtils;
+
+    let plaintext = MessageUtils::encode_and_pad(&wa::Message {
+        conversation: Some(text.to_string()),
+        ..Default::default()
+    });
+    peer.encrypt_group_message(group, &plaintext).await
+}
+
+/// The production bug: the sender re-encrypts and resends under one id, so both
+/// deliveries decrypt cleanly and the consumer sees one message twice.
+#[tokio::test]
+async fn resent_group_message_dispatches_once() {
+    use wacore::types::events::ChannelEventHandler;
+
+    let (client, transport) = capturing_client("resend_dispatch_once").await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    let group: Jid = "120363000000000001@g.us".parse().expect("group");
+    let mut alice = joined_group_sender(&client, "100000000000001:75@lid", &group).await;
+
+    let id = "RESEND_ONCE";
+    let first = encrypt_group_text(&mut alice, &group, "ping").await;
+    let second = encrypt_group_text(&mut alice, &group, "ping").await;
+    assert_ne!(
+        first, second,
+        "a resend is fresh ciphertext, not the same bytes"
+    );
+
+    for ciphertext in [first, second] {
+        client
+            .clone()
+            .handle_incoming_message(group_skmsg_stanza(&group, &alice.jid, id, ciphertext))
+            .await;
+    }
+
+    // Receipts leave through the delivery-receipt worker, so wait on the count
+    // rather than on a fixed delay.
+    crate::test_utils::poll_until("both delivery receipts", || {
+        delivery_receipts_for(&transport.sent(), id) == 2
+    })
+    .await;
+    assert_eq!(
+        message_events_for_id(&rx, id),
+        (1, 1),
+        "one logical message must reach the consumer once, however often the sender resends it"
+    );
+    assert_eq!(
+        client.stats().messages_suppressed_duplicate,
+        1,
+        "the suppression is counted, so a report of a missing message can be told from this fix"
+    );
+}
+
+/// The reason the key carries the sender: two participants of one group picked
+/// the same id (seen in production, 116s apart), and folding them together
+/// would drop the second one's message.
+#[tokio::test]
+async fn same_id_from_two_participants_dispatches_twice() {
+    use wacore::types::events::ChannelEventHandler;
+
+    let (client, _transport) = capturing_client("resend_two_participants").await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    let group: Jid = "120363000000000002@g.us".parse().expect("group");
+    let mut alice = joined_group_sender(&client, "100000000000001:75@lid", &group).await;
+    let mut bob = joined_group_sender(&client, "100000000000002:12@lid", &group).await;
+
+    let id = "SHARED_ID";
+    let from_alice = encrypt_group_text(&mut alice, &group, "from alice").await;
+    let from_bob = encrypt_group_text(&mut bob, &group, "from bob").await;
+
+    client
+        .clone()
+        .handle_incoming_message(group_skmsg_stanza(&group, &alice.jid, id, from_alice))
+        .await;
+    client
+        .clone()
+        .handle_incoming_message(group_skmsg_stanza(&group, &bob.jid, id, from_bob))
+        .await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        message_events_for_id(&rx, id),
+        (2, 2),
+        "an id is the sending client's to choose; two senders sharing one is two messages"
+    );
+}
+
+/// Drain the event channel into `(id, conversation)` pairs so one test can
+/// count dispatches for more than one message id.
+fn drain_message_events(rx: &async_channel::Receiver<Arc<Event>>) -> Vec<(String, Option<String>)> {
+    let mut seen = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        for m in event.messages() {
+            seen.push((m.info.id.to_string(), m.message.conversation.clone()));
+        }
+    }
+    seen
+}
+
+fn dispatch_count(seen: &[(String, Option<String>)], id: &str) -> usize {
+    seen.iter().filter(|(seen_id, _)| seen_id == id).count()
+}
+
+fn gate_disabled_config() -> crate::cache_config::CacheConfig {
+    let mut config = crate::cache_config::CacheConfig::default();
+    config.dispatched_messages.capacity = 0;
+    config
+}
+
+/// The server replaying the identical stanza is a different failure mode, and
+/// the persisted ratchet already rejects it. Run it with the new gate off so
+/// the assertion can only be satisfied by `DuplicatedMessage`.
+#[tokio::test]
+async fn byte_identical_redelivery_is_still_rejected_by_the_ratchet() {
+    use wacore::types::events::ChannelEventHandler;
+
+    let (client, _transport) =
+        capturing_client_with_cache_config("redelivery_ratchet", gate_disabled_config()).await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    let group: Jid = "120363000000000003@g.us".parse().expect("group");
+    let mut alice = joined_group_sender(&client, "100000000000001:75@lid", &group).await;
+
+    let id = "REDELIVERED";
+    let ciphertext = encrypt_group_text(&mut alice, &group, "ping").await;
+    for _ in 0..2 {
+        client
+            .clone()
+            .handle_incoming_message(group_skmsg_stanza(
+                &group,
+                &alice.jid,
+                id,
+                ciphertext.clone(),
+            ))
+            .await;
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        dispatch_count(&drain_message_events(&rx), id),
+        1,
+        "the persisted ratchet rejects a byte-identical replay without help from the gate"
+    );
+    assert_eq!(
+        client.stats().messages_suppressed_duplicate,
+        0,
+        "a ratchet-level duplicate is not counted as a suppressed resend"
+    );
+}
+
+/// Capacity 0 is the off switch (`PortableCache` short-circuits the insert), and
+/// turning it off must restore the pre-fix behaviour exactly.
+#[tokio::test]
+async fn zero_capacity_disables_the_gate() {
+    use wacore::types::events::ChannelEventHandler;
+
+    let (client, _transport) =
+        capturing_client_with_cache_config("gate_disabled", gate_disabled_config()).await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    let group: Jid = "120363000000000004@g.us".parse().expect("group");
+    let mut alice = joined_group_sender(&client, "100000000000001:75@lid", &group).await;
+
+    let id = "GATE_OFF";
+    for _ in 0..2 {
+        let ciphertext = encrypt_group_text(&mut alice, &group, "ping").await;
+        client
+            .clone()
+            .handle_incoming_message(group_skmsg_stanza(&group, &alice.jid, id, ciphertext))
+            .await;
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        dispatch_count(&drain_message_events(&rx), id),
+        2,
+        "capacity 0 must leave the resend dispatching twice, as it did before the gate"
+    );
+}
+
+/// The off switch has to reach the batch collapse too, or capacity 0 would
+/// restore the old behaviour for live traffic only.
+#[tokio::test]
+async fn zero_capacity_disables_the_batch_collapse() {
+    use wacore::types::events::ChannelEventHandler;
+
+    let (client, _transport) =
+        capturing_client_with_cache_config("gate_disabled_drain", gate_disabled_config()).await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    let group: Jid = "120363000000000012@g.us".parse().expect("group");
+    let mut alice = joined_group_sender(&client, "100000000000001:75@lid", &group).await;
+
+    client.inbound_commit_batch.reset();
+
+    let id = "GATE_OFF_DRAIN";
+    for _ in 0..2 {
+        let ciphertext = encrypt_group_text(&mut alice, &group, "ping").await;
+        client
+            .clone()
+            .handle_incoming_message(group_skmsg_stanza(&group, &alice.jid, id, ciphertext))
+            .await;
+    }
+    assert!(
+        client
+            .flush_inbound_commits_under_permit(true, None, None)
+            .await,
+        "the drained batch must commit"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        dispatch_count(&drain_message_events(&rx), id),
+        2,
+        "capacity 0 must leave a drained batch carrying both deliveries, as it did before the gate"
+    );
+}
+
+/// Nothing was dispatched on the delivery that failed to decrypt, so the key is
+/// not in the cache and the resend must come through.
+#[tokio::test]
+async fn resend_after_our_own_decrypt_failure_dispatches() {
+    use wacore::types::events::ChannelEventHandler;
+
+    let (client, _transport) = capturing_client("resend_after_failure").await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    let group: Jid = "120363000000000005@g.us".parse().expect("group");
+    // Sender key deliberately not installed yet: the first delivery fails with
+    // NoSenderKey, exactly as it does before an SKDM arrives.
+    let mut alice = AlicePeer::new("100000000000001:75@lid").await;
+    let skdm = alice.create_group_skdm(&group).await;
+
+    let id = "RESEND_AFTER_FAILURE";
+    let failed = encrypt_group_text(&mut alice, &group, "ping").await;
+    client
+        .clone()
+        .handle_incoming_message(group_skmsg_stanza(&group, &alice.jid, id, failed))
+        .await;
+
+    client
+        .handle_sender_key_distribution_message(
+            &group,
+            &alice.jid,
+            "SKDM_LATE",
+            &skdm
+                .axolotl_sender_key_distribution_message
+                .expect("skdm bytes"),
+        )
+        .await;
+
+    let resent = encrypt_group_text(&mut alice, &group, "ping").await;
+    client
+        .clone()
+        .handle_incoming_message(group_skmsg_stanza(&group, &alice.jid, id, resent))
+        .await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        dispatch_count(&drain_message_events(&rx), id),
+        1,
+        "a resend after our own decrypt failure is the first dispatch, not a duplicate"
+    );
+}
+
+/// Suppressing the event must not suppress the session `<enc>` the resend
+/// carries: dropping the SKDM would turn one duplicate into a run of
+/// NoSenderKey failures on everything after it.
+#[tokio::test]
+async fn suppressed_resend_still_installs_the_sender_key_it_carries() {
+    use wacore::messages::MessageUtils;
+    use wacore::types::events::ChannelEventHandler;
+
+    let (client, _transport) = capturing_client("resend_with_skdm").await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    let group: Jid = "120363000000000006@g.us".parse().expect("group");
+    let sender_jid = "100000000000001:75@lid";
+    let mut alice = joined_group_sender(&client, sender_jid, &group).await;
+
+    let id = "RESEND_WITH_SKDM";
+    let first = encrypt_group_text(&mut alice, &group, "ping").await;
+    client
+        .clone()
+        .handle_incoming_message(group_skmsg_stanza(&group, &alice.jid, id, first))
+        .await;
+
+    // The sender rotated its sender key before retrying, so the resend carries
+    // a pkmsg with the new SKDM alongside the skmsg.
+    let (bundle, bob_jid) = bobs_prekey_bundle(&client).await;
+    let bob_addr = bob_jid.to_protocol_address();
+    let mut rotated = AlicePeer::new(sender_jid).await;
+    rotated.install_bob_session(&bob_addr, &bundle).await;
+    let skdm = rotated.create_group_skdm(&group).await;
+    let session_ct = rotated
+        .encrypt(
+            &bob_addr,
+            &MessageUtils::encode_and_pad(&wa::Message {
+                sender_key_distribution_message: buffa::MessageField::some(skdm),
+                ..Default::default()
+            }),
+        )
+        .await;
+    let CiphertextMessage::PreKeySignalMessage(pkmsg) = &session_ct else {
+        panic!("expected a pkmsg");
+    };
+    let resent = encrypt_group_text(&mut rotated, &group, "ping").await;
+
+    let stanza = node_to_arc(
+        NodeBuilder::new("message")
+            .attr("from", group.clone())
+            .attr("participant", alice.jid.clone())
+            .attr("id", id)
+            .attr("t", wacore::time::now_secs().to_string())
+            .attr("type", "text")
+            .attr(
+                "addressing_mode",
+                crate::types::message::AddressingMode::Lid.as_str(),
+            )
+            .children(vec![
+                NodeBuilder::new("enc")
+                    .attr("type", "pkmsg")
+                    .attr("v", "2")
+                    .bytes(pkmsg.serialized().to_vec())
+                    .build(),
+                NodeBuilder::new("enc")
+                    .attr("type", "skmsg")
+                    .attr("v", "2")
+                    .bytes(resent)
+                    .build(),
+            ])
+            .build(),
+    );
+    client.clone().handle_incoming_message(stanza).await;
+
+    // The next message rides the rotated chain: it only decrypts if the
+    // suppressed resend still installed the key it carried.
+    let next_id = "AFTER_ROTATION";
+    let next = encrypt_group_text(&mut rotated, &group, "pong").await;
+    client
+        .clone()
+        .handle_incoming_message(group_skmsg_stanza(&group, &alice.jid, next_id, next))
+        .await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let seen = drain_message_events(&rx);
+    assert_eq!(
+        dispatch_count(&seen, id),
+        1,
+        "the resend's own event is suppressed"
+    );
+    assert_eq!(
+        dispatch_count(&seen, next_id),
+        1,
+        "the rotated sender key the suppressed resend carried must still be installed"
+    );
+}
+
+/// A batch deferred by the offline drain claims its ids when the batch itself
+/// commits, not before, so a resend arriving after the drain is still caught.
+#[tokio::test]
+async fn resend_after_a_deferred_batch_commits_is_suppressed() {
+    use wacore::types::events::ChannelEventHandler;
+
+    let (client, _transport) = capturing_client("resend_after_drain").await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    let group: Jid = "120363000000000009@g.us".parse().expect("group");
+    let mut alice = joined_group_sender(&client, "100000000000001:75@lid", &group).await;
+
+    // Back into drain mode: the first delivery joins the accumulating batch
+    // instead of committing on its own.
+    client.inbound_commit_batch.reset();
+
+    let id = "DRAIN_THEN_RESEND";
+    let first = encrypt_group_text(&mut alice, &group, "ping").await;
+    client
+        .clone()
+        .handle_incoming_message(group_skmsg_stanza(&group, &alice.jid, id, first))
+        .await;
+    assert!(
+        client
+            .flush_inbound_commits_under_permit(true, None, None)
+            .await,
+        "the drained batch must commit"
+    );
+
+    let resent = encrypt_group_text(&mut alice, &group, "ping").await;
+    client
+        .clone()
+        .handle_incoming_message(group_skmsg_stanza(&group, &alice.jid, id, resent))
+        .await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        dispatch_count(&drain_message_events(&rx), id),
+        1,
+        "a batch that committed has been handed to the consumer, so the resend is a duplicate"
+    );
+}
+
+/// Both deliveries can land in one drained batch: each checked the gate before
+/// either claim existed, so the batch itself has to collapse them.
+#[tokio::test]
+async fn two_resends_inside_one_deferred_batch_dispatch_once() {
+    use wacore::types::events::ChannelEventHandler;
+
+    let (client, _transport) = capturing_client("resend_same_batch").await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    let group: Jid = "120363000000000011@g.us".parse().expect("group");
+    let mut alice = joined_group_sender(&client, "100000000000001:75@lid", &group).await;
+
+    client.inbound_commit_batch.reset();
+
+    let id = "SAME_BATCH_RESEND";
+    for _ in 0..2 {
+        let ciphertext = encrypt_group_text(&mut alice, &group, "ping").await;
+        client
+            .clone()
+            .handle_incoming_message(group_skmsg_stanza(&group, &alice.jid, id, ciphertext))
+            .await;
+    }
+    assert!(
+        client
+            .flush_inbound_commits_under_permit(true, None, None)
+            .await,
+        "the drained batch must commit"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        dispatch_count(&drain_message_events(&rx), id),
+        1,
+        "one message must not reach the consumer twice inside a single batch"
+    );
+    assert_eq!(
+        client.stats().messages_suppressed_duplicate,
+        1,
+        "what the batch collapse drops is a suppression like any other, and has to be counted as one"
+    );
+}
+
+/// A resent `app_state_sync_key_request` is our phone saying it still has no
+/// keys. Suppressing the duplicate event must not suppress the recovery.
+#[tokio::test]
+async fn suppressed_key_request_resend_still_schedules_the_share() {
+    use wacore::messages::MessageUtils;
+
+    let (client, transport) = capturing_client("key_request_resend").await;
+    let requester_str = "5511000000001:33@s.whatsapp.net";
+    let requester: Jid = requester_str.parse().expect("requester jid");
+    let mut peer = AlicePeer::new(requester_str).await;
+    let (bundle, own_jid) = bobs_prekey_bundle(&client).await;
+    let own_address = own_jid.to_protocol_address();
+    peer.install_bob_session(&own_address, &bundle).await;
+    let establishing = peer.encrypt_text(&own_address, "establish session").await;
+    let (decrypted, _, _, session_present) =
+        submit_and_check_session(&client, &requester, &establishing).await;
+    assert!(decrypted && session_present, "precondition: peer session");
+    client.flush_signal_cache().await.expect("flush session");
+
+    let request = wa::Message {
+        protocol_message: buffa::MessageField::some(wa::message::ProtocolMessage {
+            r#type: Some(wa::message::protocol_message::Type::AppStateSyncKeyRequest),
+            app_state_sync_key_request: buffa::MessageField::some(
+                wa::message::AppStateSyncKeyRequest {
+                    key_ids: vec![wa::message::AppStateSyncKeyId {
+                        key_id: Some(vec![1, 2, 3, 4]),
+                    }],
+                },
+            ),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let mut info = create_test_message_info(requester_str, "AKR_RESEND", requester_str);
+    info.source.is_from_me = true;
+    let info = Arc::new(info);
+
+    let plaintext = || MessageUtils::encode_and_pad(&request);
+    client
+        .handle_decrypted_plaintext("msg", plaintext(), 2, 0, Default::default(), &info)
+        .await
+        .expect("handle key request");
+    crate::test_utils::poll_until("the first key share", || {
+        message_count_to_after(&transport.sent(), 0, requester_str) == 1
+    })
+    .await;
+    let after_first = transport.sent().len();
+
+    // Same request again, re-encrypted: the event is a duplicate, the phone's
+    // need for the keys is not.
+    client
+        .handle_decrypted_plaintext("msg", plaintext(), 2, 0, Default::default(), &info)
+        .await
+        .expect("handle resent key request");
+
+    crate::test_utils::poll_until("the key share for the resent request", || {
+        has_message_to_after(&transport.sent(), after_first, requester_str)
+    })
+    .await;
+    assert_eq!(
+        client.stats().messages_suppressed_duplicate,
+        1,
+        "the resend's consumer event is still suppressed"
+    );
+}
+
+/// A pending row is keyed on the sender exactly as its delivery spelled it,
+/// while the collapse folds spellings together. Clearing only the kept spelling
+/// leaves a row that a later resend replays as an already committed message.
+#[tokio::test]
+async fn a_collapsed_batch_clears_every_arrived_pending_row() {
+    use crate::types::durability_hook::InboundDurabilityHook;
+    use wacore::types::events::{BatchOrigin, InboundMessage};
+
+    struct OkHook;
+
+    #[async_trait::async_trait]
+    impl InboundDurabilityHook for OkHook {
+        async fn on_messages(
+            &self,
+            _client: Arc<Client>,
+            _batch: &[InboundMessage],
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    let (client, _transport) = capturing_client("collapsed_pending_rows").await;
+    client
+        .inbound_durability_hook
+        .set(Arc::new(OkHook) as Arc<dyn InboundDurabilityHook>)
+        .ok()
+        .expect("hook registers once");
+
+    let chat: Jid = "120363000000000013@g.us".parse().expect("group");
+    let bare: Jid = "100000000000001@lid".parse().expect("bare sender");
+    let device: Jid = "100000000000001:75@lid".parse().expect("device sender");
+    let id = "COLLAPSED_ROWS";
+
+    let item = |sender: &Jid| {
+        let sender_str = sender.to_string();
+        let mut info = create_test_message_info(&sender_str, id, &sender_str);
+        info.source.chat = chat.clone();
+        info.source.sender = sender.clone();
+        InboundMessage::builder()
+            .message(Arc::new(wa::Message {
+                conversation: Some("ping".to_string()),
+                ..Default::default()
+            }))
+            .info(Arc::new(info))
+            .build()
+    };
+
+    // Both spellings buffered by earlier failed commits.
+    let backend = client.persistence_manager.backend();
+    for sender in [&bare, &device] {
+        backend
+            .store_pending_inbound_batch(&[crate::store::traits::PendingInboundRow {
+                chat: &chat.to_string(),
+                sender: &sender.to_string(),
+                id,
+                message: &waproto::codec::message_to_vec(&wa::Message {
+                    conversation: Some("ping".to_string()),
+                    ..Default::default()
+                }),
+            }])
+            .await
+            .expect("buffer the delivery");
+    }
+
+    assert!(
+        client
+            .commit_inbound_batch(
+                Arc::from(vec![item(&bare), item(&device)]),
+                BatchOrigin::Live,
+                None,
+            )
+            .await,
+        "the batch must commit"
+    );
+
+    for sender in [&bare, &device] {
+        assert!(
+            backend
+                .get_pending_inbound(&chat.to_string(), &sender.to_string(), id)
+                .await
+                .expect("read pending")
+                .is_none(),
+            "every arrived spelling's row must be cleared, not just the kept one"
+        );
+    }
+}
+
+/// An unresolved secret envelope is a placeholder: the consumer got a payload
+/// it cannot read. Claiming it would suppress the resend that arrives once the
+/// parent secret is known, so it must not be claimed.
+#[tokio::test]
+async fn an_unresolved_secret_envelope_is_not_claimed() {
+    use wacore::messages::MessageUtils;
+    use wacore::types::events::ChannelEventHandler;
+
+    let (client, _transport) = capturing_client("unresolved_envelope").await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    let peer = "5511000000002:11@s.whatsapp.net";
+    let id = "ENC_REACTION";
+    let info = Arc::new(create_test_message_info(peer, id, peer));
+
+    // A reaction whose secret we do not hold: the envelope cannot be opened, so
+    // what reaches the consumer is the envelope itself.
+    let envelope = wa::Message {
+        enc_reaction_message: buffa::MessageField::some(wa::message::EncReactionMessage {
+            target_message_key: buffa::MessageField::some(wa::MessageKey {
+                id: Some("TARGET".into()),
+                remote_jid: Some(peer.to_string()),
+                from_me: Some(false),
+                ..Default::default()
+            }),
+            enc_payload: Some(vec![9; 16]),
+            enc_iv: Some(vec![7; 12]),
+        }),
+        ..Default::default()
+    };
+
+    for _ in 0..2 {
+        client
+            .handle_decrypted_plaintext(
+                "msg",
+                MessageUtils::encode_and_pad(&envelope),
+                2,
+                0,
+                Default::default(),
+                &info,
+            )
+            .await
+            .expect("handle the envelope");
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        dispatch_count(&drain_message_events(&rx), id),
+        2,
+        "the resend must still reach the consumer: the first delivery handed it an envelope it could not open"
+    );
+}
+
+/// A replay whose commit fails dispatches nothing. Reporting it as a replay
+/// would skip the suppression counter, so a message that reached no consumer
+/// would leave no trace in the one number that exists to explain exactly that.
+#[tokio::test]
+async fn a_replay_that_fails_to_commit_counts_as_a_suppression() {
+    use crate::types::durability_hook::InboundDurabilityHook;
+    use wacore::messages::MessageUtils;
+    use wacore::types::events::InboundMessage;
+
+    struct SilentHook;
+
+    #[async_trait::async_trait]
+    impl InboundDurabilityHook for SilentHook {
+        async fn on_messages(
+            &self,
+            _client: Arc<Client>,
+            _batch: &[InboundMessage],
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    let (client, _transport) = capturing_client("failed_replay_counts").await;
+    client
+        .inbound_durability_hook
+        .set(Arc::new(SilentHook) as Arc<dyn InboundDurabilityHook>)
+        .ok()
+        .expect("hook registers once");
+
+    let peer = "5511000000002:11@s.whatsapp.net";
+    let id = "REPLAY_THAT_FAILS";
+    let info = Arc::new(create_test_message_info(peer, id, peer));
+    let msg = wa::Message {
+        conversation: Some("the copy still buffered".into()),
+        ..Default::default()
+    };
+
+    // The state the resend arrives into: the id was claimed by a delivery that
+    // dispatched, but its pending row outlived the commit that should have
+    // cleared it, so the replay path finds a buffered copy to re-commit.
+    client
+        .persistence_manager
+        .backend()
+        .store_pending_inbound(
+            &info.source.chat.to_string(),
+            &info.source.sender.to_string(),
+            id,
+            &{
+                let mut buf = Vec::new();
+                waproto::codec::message_encode_into(&msg, &mut buf);
+                buf
+            },
+        )
+        .await
+        .expect("buffer a copy");
+    client.mark_message_dispatched(&info).await;
+    client
+        .inbound_commit_batch
+        .fail_commits
+        .store(true, Ordering::Release);
+
+    client
+        .handle_decrypted_plaintext(
+            "msg",
+            MessageUtils::encode_and_pad(&msg),
+            2,
+            0,
+            Default::default(),
+            &info,
+        )
+        .await
+        .expect("handle the resend");
+
+    assert_eq!(
+        client.stats().messages_suppressed_duplicate,
+        1,
+        "a replay whose commit failed reached no consumer, so it is a suppression"
+    );
+}
+
+/// `extract_secret_encrypted` returns `None` both for a plain message and for a
+/// tagged envelope that is malformed, so the claim must test for the envelope's
+/// presence: a malformed one is no more readable to a consumer than an
+/// unopenable one.
+#[tokio::test]
+async fn a_malformed_secret_envelope_is_not_claimed() {
+    use wacore::messages::MessageUtils;
+    use wacore::types::events::ChannelEventHandler;
+
+    let (client, _transport) = capturing_client("malformed_envelope").await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    let peer = "5511000000002:11@s.whatsapp.net";
+    let id = "MALFORMED_REACTION";
+    let info = Arc::new(create_test_message_info(peer, id, peer));
+
+    // Tagged as an encrypted reaction, but the IV is not 12 bytes, so
+    // extraction rejects it while the consumer still gets only the envelope.
+    let malformed = wa::Message {
+        enc_reaction_message: buffa::MessageField::some(wa::message::EncReactionMessage {
+            target_message_key: buffa::MessageField::some(wa::MessageKey {
+                id: Some("TARGET".into()),
+                remote_jid: Some(peer.to_string()),
+                from_me: Some(false),
+                ..Default::default()
+            }),
+            enc_payload: Some(vec![9; 16]),
+            enc_iv: Some(vec![7; 5]),
+        }),
+        ..Default::default()
+    };
+
+    for _ in 0..2 {
+        client
+            .handle_decrypted_plaintext(
+                "msg",
+                MessageUtils::encode_and_pad(&malformed),
+                2,
+                0,
+                Default::default(),
+                &info,
+            )
+            .await
+            .expect("handle the envelope");
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        dispatch_count(&drain_message_events(&rx), id),
+        2,
+        "a malformed envelope must not claim the id its corrected resend needs"
+    );
+}
+
+/// Two dispatches of one stanza share its `MessageInfo`, which is what the
+/// msmsg loop hands every bot-reply part. Equal parts are not a repeat of each
+/// other, so identity plus content is not enough on its own.
+#[tokio::test]
+async fn two_identical_msmsg_parts_under_one_id_both_reach_the_consumer() {
+    use wacore::types::events::ChannelEventHandler;
+
+    let (client, _transport) = capturing_client("msmsg_identical_parts").await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    let peer = "5511000000002:11@s.whatsapp.net";
+    let id = "BOT_REPLY_SAME_TWICE";
+    let info = Arc::new(create_test_message_info(peer, id, peer));
+
+    client.inbound_commit_batch.reset();
+    for _ in 0..2 {
+        client
+            .dispatch_parsed_message(
+                wa::Message {
+                    conversation: Some("the same bot reply twice".into()),
+                    ..Default::default()
+                },
+                &info,
+                false,
+            )
+            .await;
+    }
+    assert!(
+        client
+            .flush_inbound_commits_under_permit(true, None, None)
+            .await,
+        "the drained batch must commit"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        dispatch_count(&drain_message_events(&rx), id),
+        2,
+        "parts of one stanza are not repeats of each other, even when identical"
+    );
+}
+
+/// One participant reusing an id across a whole drain batch must not make the
+/// collapse compare every payload against every earlier one. Past the bound it
+/// gives up on that identity and keeps everything, which is the safe direction
+/// and is what this asserts: a repeat that arrives after the bound survives.
+#[tokio::test]
+async fn an_id_reused_past_the_bound_stops_being_collapsed() {
+    use wacore::types::events::ChannelEventHandler;
+
+    let (client, _transport) = capturing_client("id_reuse_bound").await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    let peer = "5511000000002:11@s.whatsapp.net";
+    let id = "REUSED_PAST_THE_BOUND";
+    let repeated = "the payload that comes back";
+
+    client.inbound_commit_batch.reset();
+    // Distinct stanzas (each its own info) all claiming one id: the first
+    // payload, then enough different ones to exhaust the bound, then the first
+    // payload again. Below the bound that last one would collapse into the
+    // first; past it the collapse has stopped looking at this identity.
+    let payloads = std::iter::once(repeated.to_string())
+        .chain((0..8).map(|n| format!("filler {n}")))
+        .chain(std::iter::once(repeated.to_string()));
+    for text in payloads {
+        client
+            .dispatch_parsed_message(
+                wa::Message {
+                    conversation: Some(text),
+                    ..Default::default()
+                },
+                &Arc::new(create_test_message_info(peer, id, peer)),
+                false,
+            )
+            .await;
+    }
+    assert!(
+        client
+            .flush_inbound_commits_under_permit(true, None, None)
+            .await,
+        "the drained batch must commit"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        dispatch_count(&drain_message_events(&rx), id),
+        10,
+        "past the bound the collapse gives up on an identity and keeps everything"
+    );
+}
+
+/// The msmsg loop dispatches every bot-reply part of one stanza under a single
+/// `info`, so a drain batch can hold several genuinely different payloads that
+/// share an identity. Collapsing them would ack every part and deliver one.
+#[tokio::test]
+async fn two_msmsg_parts_under_one_id_both_reach_the_consumer() {
+    use wacore::types::events::ChannelEventHandler;
+
+    let (client, _transport) = capturing_client("msmsg_parts_one_id").await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    let peer = "5511000000002:11@s.whatsapp.net";
+    let id = "BOT_REPLY_PARTS";
+    let info = Arc::new(create_test_message_info(peer, id, peer));
+
+    client.inbound_commit_batch.reset();
+    // What `handle_msmsg_payload` does per part: one `dispatch_parsed_message`
+    // with the stanza's shared info and this part's own decrypted content.
+    for part in [
+        "first half of the bot reply",
+        "second half of the bot reply",
+    ] {
+        client
+            .dispatch_parsed_message(
+                wa::Message {
+                    conversation: Some(part.into()),
+                    ..Default::default()
+                },
+                &info,
+                false,
+            )
+            .await;
+    }
+    assert!(
+        client
+            .flush_inbound_commits_under_permit(true, None, None)
+            .await,
+        "the drained batch must commit"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        dispatch_count(&drain_message_events(&rx), id),
+        2,
+        "both bot-reply parts must reach the consumer: one stanza id, two different payloads"
+    );
+}
+
+/// Capture is write-behind and can lose an entry when its backend is down. A
+/// resend is the second chance, so suppressing its event must not also skip
+/// the capture, or every later encrypted addon on that parent stays unopenable.
+#[tokio::test]
+async fn a_suppressed_resend_still_captures_the_message_secret() {
+    use wacore::messages::MessageUtils;
+
+    let (client, _transport) = capturing_client("suppressed_secret_capture").await;
+
+    let peer = "5511000000002:11@s.whatsapp.net";
+    let id = "SECRET_PARENT";
+    let info = Arc::new(create_test_message_info(peer, id, peer));
+
+    let with_secret = |forwarded: bool| wa::Message {
+        extended_text_message: buffa::MessageField::some(wa::message::ExtendedTextMessage {
+            text: Some("parent of a later reaction".into()),
+            context_info: buffa::MessageField::some(wa::ContextInfo {
+                is_forwarded: Some(forwarded),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        message_context_info: buffa::MessageField::some(wa::MessageContextInfo {
+            message_secret: Some(vec![4; 32]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    // The first delivery dispatches and claims the id but stores no secret.
+    // Forwarding is the controllable stand-in here for any reason the capture
+    // did not land; the branch the resend then takes is the same either way.
+    client
+        .handle_decrypted_plaintext(
+            "msg",
+            MessageUtils::encode_and_pad(&with_secret(true)),
+            2,
+            0,
+            Default::default(),
+            &info,
+        )
+        .await
+        .expect("handle the first delivery");
+    assert_eq!(
+        client.memory_report().await.msg_secret_buffer,
+        0,
+        "precondition: the first delivery stored no secret"
+    );
+
+    client
+        .handle_decrypted_plaintext(
+            "msg",
+            MessageUtils::encode_and_pad(&with_secret(false)),
+            2,
+            0,
+            Default::default(),
+            &info,
+        )
+        .await
+        .expect("handle the resend");
+
+    assert_eq!(
+        client.memory_report().await.msg_secret_buffer,
+        1,
+        "the suppressed resend must still capture the secret it carries"
+    );
+}
+
+/// A drain batch can hold an unresolved envelope and, once the parent secret
+/// arrived mid-drain, a retry of the same id that resolved to the inner
+/// message. Collapsing them would drop the only copy the consumer can read.
+#[tokio::test]
+async fn a_batch_keeps_the_resolved_copy_of_an_unresolved_envelope() {
+    use wacore::messages::MessageUtils;
+    use wacore::types::events::ChannelEventHandler;
+
+    let (client, _transport) = capturing_client("envelope_then_resolved").await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    let peer = "5511000000002:11@s.whatsapp.net";
+    let id = "ENC_THEN_PLAIN";
+    let info = Arc::new(create_test_message_info(peer, id, peer));
+
+    let envelope = wa::Message {
+        enc_reaction_message: buffa::MessageField::some(wa::message::EncReactionMessage {
+            target_message_key: buffa::MessageField::some(wa::MessageKey {
+                id: Some("TARGET".into()),
+                remote_jid: Some(peer.to_string()),
+                from_me: Some(false),
+                ..Default::default()
+            }),
+            enc_payload: Some(vec![9; 16]),
+            enc_iv: Some(vec![7; 12]),
+        }),
+        ..Default::default()
+    };
+    // What the retry looks like once the secret is known: the inner message,
+    // under the same id the envelope carried.
+    let resolved = wa::Message {
+        conversation: Some("the reaction we could finally read".into()),
+        ..Default::default()
+    };
+
+    client.inbound_commit_batch.reset();
+    for payload in [
+        MessageUtils::encode_and_pad(&envelope),
+        MessageUtils::encode_and_pad(&resolved),
+    ] {
+        client
+            .handle_decrypted_plaintext("msg", payload, 2, 0, Default::default(), &info)
+            .await
+            .expect("handle the delivery");
+    }
+    assert!(
+        client
+            .flush_inbound_commits_under_permit(true, None, None)
+            .await,
+        "the drained batch must commit"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        dispatch_count(&drain_message_events(&rx), id),
+        2,
+        "the resolved copy must survive the collapse: the envelope is not the content"
+    );
+}
+
+/// The server spells `participant` bare on an skmsg and device-qualified on the
+/// pkmsg that carries an SKDM, so the two deliveries of one message can differ.
+/// The key drops the device for exactly this reason.
+#[tokio::test]
+async fn resend_with_a_device_qualified_participant_is_suppressed() {
+    use wacore::types::events::ChannelEventHandler;
+
+    let (client, _transport) = capturing_client("resend_device_spelling").await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    let group: Jid = "120363000000000010@g.us".parse().expect("group");
+    let mut alice = joined_group_sender(&client, "100000000000001:75@lid", &group).await;
+    let bare = alice.jid.to_non_ad();
+
+    let id = "DEVICE_SPELLING";
+    let first = encrypt_group_text(&mut alice, &group, "ping").await;
+    client
+        .clone()
+        .handle_incoming_message(group_skmsg_stanza(&group, &bare, id, first))
+        .await;
+
+    let resent = encrypt_group_text(&mut alice, &group, "ping").await;
+    client
+        .clone()
+        .handle_incoming_message(group_skmsg_stanza(&group, &alice.jid, id, resent))
+        .await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        dispatch_count(&drain_message_events(&rx), id),
+        1,
+        "one message spelled two ways on the wire is still one message"
+    );
+}
+
+/// A commit that failed handed nothing to a consumer, so the claim must not be
+/// taken: suppressing the resend there would lose the message rather than
+/// deduplicate it.
+#[tokio::test]
+async fn resend_after_a_failed_commit_dispatches() {
+    use std::sync::atomic::Ordering;
+    use wacore::types::events::ChannelEventHandler;
+
+    let (client, _transport) = capturing_client("resend_after_failed_commit").await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    let group: Jid = "120363000000000008@g.us".parse().expect("group");
+    let mut alice = joined_group_sender(&client, "100000000000001:75@lid", &group).await;
+
+    let id = "COMMIT_FAILED";
+    client
+        .inbound_commit_batch
+        .fail_commits
+        .store(true, Ordering::Release);
+    let first = encrypt_group_text(&mut alice, &group, "ping").await;
+    client
+        .clone()
+        .handle_incoming_message(group_skmsg_stanza(&group, &alice.jid, id, first))
+        .await;
+
+    client
+        .inbound_commit_batch
+        .fail_commits
+        .store(false, Ordering::Release);
+    let resent = encrypt_group_text(&mut alice, &group, "ping").await;
+    client
+        .clone()
+        .handle_incoming_message(group_skmsg_stanza(&group, &alice.jid, id, resent))
+        .await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        dispatch_count(&drain_message_events(&rx), id),
+        1,
+        "the resend is the first delivery the consumer actually gets"
+    );
+}
+
+/// With a hook registered and its first commit failed, the message is buffered
+/// and unacked. The suppression must replay that buffered copy instead of
+/// acking it away: a bare ack here would lose the message for the consumer
+/// while telling the server it was handled.
+#[tokio::test]
+async fn suppressed_resend_replays_to_a_durability_hook() {
+    use crate::types::durability_hook::InboundDurabilityHook;
+    use std::sync::atomic::AtomicUsize;
+    use wacore::types::events::{ChannelEventHandler, InboundMessage};
+
+    /// Fails the first commit (leaving a buffered, unacked copy) and succeeds
+    /// after, the way a consumer recovering from a transient storage error does.
+    struct FlakyHook {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl InboundDurabilityHook for FlakyHook {
+        async fn on_messages(
+            &self,
+            _client: Arc<Client>,
+            _batch: &[InboundMessage],
+        ) -> anyhow::Result<()> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(anyhow::anyhow!("commit failed"));
+            }
+            Ok(())
+        }
+    }
+
+    let (client, transport) = capturing_client("resend_hook_replay").await;
+    let hook = Arc::new(FlakyHook {
+        calls: AtomicUsize::new(0),
+    });
+    client
+        .inbound_durability_hook
+        .set(hook.clone() as Arc<dyn InboundDurabilityHook>)
+        .ok()
+        .expect("hook registers once");
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    let group: Jid = "120363000000000007@g.us".parse().expect("group");
+    let mut alice = joined_group_sender(&client, "100000000000001:75@lid", &group).await;
+
+    let id = "HOOK_REPLAY";
+    for _ in 0..2 {
+        let ciphertext = encrypt_group_text(&mut alice, &group, "ping").await;
+        client
+            .clone()
+            .handle_incoming_message(group_skmsg_stanza(&group, &alice.jid, id, ciphertext))
+            .await;
+    }
+
+    crate::test_utils::poll_until("the replayed commit's receipt", || {
+        delivery_receipts_for(&transport.sent(), id) == 1
+    })
+    .await;
+    assert_eq!(
+        hook.calls.load(Ordering::SeqCst),
+        2,
+        "the suppressed resend replays the buffered copy to the hook"
+    );
+    assert_eq!(
+        dispatch_count(&drain_message_events(&rx), id),
+        1,
+        "the replay is what delivers the message the failed commit owed the consumer"
     );
 }

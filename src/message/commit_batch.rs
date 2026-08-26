@@ -704,6 +704,109 @@ impl Client {
         .await
     }
 
+    /// Collapse deliveries of one message inside a batch, keeping the first.
+    ///
+    /// Returns the input untouched when there is nothing to drop, which is
+    /// every live batch (they hold one message) and almost every drained one.
+    ///
+    /// A repeat is identity *and* content: a resend re-encrypts the same
+    /// message, so the decoded protos are equal. Identity alone is not enough,
+    /// because one stanza id can carry several genuinely different payloads
+    /// that share an `info`. The msmsg loop in `handle_incoming_message`
+    /// dispatches every bot-reply part under one id, and a drain batch can hold
+    /// an unresolved secret envelope beside the retry that resolved to the
+    /// inner message; collapsing on identity alone would drop those and ack
+    /// them, losing content with nothing left to redeliver it. Comparing the
+    /// message keeps them and costs a structural compare only where identities
+    /// actually collide, which is the rare case this whole function exists for.
+    fn dedup_batch_by_message(&self, items: Arc<[InboundMessage]>) -> Arc<[InboundMessage]> {
+        if items.len() < 2 {
+            return items;
+        }
+        /// Distinct payloads compared per identity before the collapse gives
+        /// up on it. A resend repeats one message, so a real duplicate is
+        /// found against the first or second entry; an identity accumulating
+        /// more than this is not the pattern this function exists for, and
+        /// without a bound a participant could reuse one id across a full
+        /// 400-message drain batch and force ~80k structural compares on the
+        /// receive path while it holds the processing permit. Giving up keeps
+        /// everything, which is the safe direction.
+        const MAX_COMPARED_PER_ID: usize = 8;
+        /// A kept payload, with its wire form filled in only if some later
+        /// item in the batch turns out to share its identity.
+        struct Kept {
+            info: Arc<MessageInfo>,
+            message: Arc<waproto::whatsapp::Message>,
+            encoded: Option<Vec<u8>>,
+        }
+        /// Compare the wire form rather than the decoded proto. `wa::Message`
+        /// derives `PartialEq`, but nothing else calls it, so one `==` here
+        /// makes the whole message tree's comparison code live and costs
+        /// ~236 KiB of binary. Encoding is already instantiated for the commit
+        /// path's durable write, so this adds no code and one memcmp.
+        fn wire(msg: &waproto::whatsapp::Message) -> Vec<u8> {
+            let mut buf = Vec::with_capacity(waproto::codec::message_encoded_len(msg));
+            waproto::codec::message_encode_into(msg, &mut buf);
+            buf
+        }
+        type Seen = std::collections::HashMap<wacore::types::message::SenderMessageId, Vec<Kept>>;
+        fn keep(seen: &mut Seen, item: &InboundMessage) -> bool {
+            let kept = seen.entry(Client::dispatch_key(&item.info)).or_default();
+            if kept.len() >= MAX_COMPARED_PER_ID {
+                return true;
+            }
+            // Encoded lazily and at most once per side, so a batch whose
+            // identities are all distinct (every live batch, and almost every
+            // drained one) never encodes anything here.
+            let mut candidate: Option<Vec<u8>> = None;
+            for k in kept.iter_mut() {
+                // Never collapse two dispatches of one stanza. They share the
+                // `MessageInfo` the stanza was parsed into, which the msmsg
+                // loop hands to every bot-reply part, so equal parts are not a
+                // repeat of each other. Best-effort by construction: two
+                // separate stanzas always allocate separate infos, so this
+                // never exempts a genuine resend, while a part whose info was
+                // copied on write falls through to the content compare.
+                if Arc::ptr_eq(&k.info, &item.info) {
+                    continue;
+                }
+                if Arc::ptr_eq(&k.message, &item.message) {
+                    return false;
+                }
+                let candidate = candidate.get_or_insert_with(|| wire(&item.message));
+                let existing = k.encoded.get_or_insert_with(|| wire(&k.message));
+                if *existing == *candidate {
+                    return false;
+                }
+            }
+            kept.push(Kept {
+                info: Arc::clone(&item.info),
+                message: Arc::clone(&item.message),
+                encoded: candidate,
+            });
+            true
+        }
+        let mut seen = Seen::with_capacity(items.len());
+        if items.iter().all(|item| keep(&mut seen, item)) {
+            return items;
+        }
+        seen.clear();
+        let kept: Arc<[InboundMessage]> = items
+            .iter()
+            .filter(|item| keep(&mut seen, item))
+            .cloned()
+            .collect();
+        // Counted like any other suppression: what this drops never reaches a
+        // consumer, so leaving it out would make the metric disagree with what
+        // the consumer saw for exactly the deliveries it exists to explain.
+        for _ in 0..(items.len() - kept.len()) {
+            self.duplicate_dispatch_suppressed
+                .fetch_add(1, Ordering::Relaxed);
+            wacore::telemetry::recv("duplicate_resend");
+        }
+        kept
+    }
+
     /// Commit one batch: durable buffer → Signal flush → hook → clear buffer →
     /// acks → event. Nothing is acked or observable before it is durable (WA
     /// Web's `createSnapshot` ordering); acks precede the event dispatch so a
@@ -737,6 +840,17 @@ impl Client {
             debug_assert!(commit_ticket.is_none());
             return true;
         }
+        // A drain can accumulate two deliveries of one message before the batch
+        // commits: both read the gate before either claim landed, so the
+        // collapse has to happen here too. Every stanza that arrived is still
+        // acked from `arrived`; only what the hook and the consumer see is
+        // reduced to one copy.
+        let arrived = Arc::clone(&items);
+        let items = if self.dispatch_gate_enabled() {
+            self.dedup_batch_by_message(items)
+        } else {
+            items
+        };
         let mut reinsert = ReinsertGuard {
             batcher: &self.inbound_commit_batch,
             items: is_drain.then(|| Arc::clone(&items)),
@@ -840,15 +954,43 @@ impl Client {
             }
             hook_committed = true;
 
-            let delete_keys: Vec<PendingInboundKey<'_>> = items
-                .iter()
-                .zip(&keys)
-                .map(|(item, (chat, sender))| PendingInboundKey {
-                    chat,
-                    sender,
-                    id: &item.info.id,
-                })
-                .collect();
+            // Cleared for every stanza that arrived, not just the ones kept: a
+            // pending row is keyed on the sender exactly as that delivery spelled
+            // it, while the collapse folds spellings together. Deleting only the
+            // kept spelling would leave a row that a later resend replays as an
+            // already committed message. Deleting a row that is not there is a
+            // no-op, so the superset is free.
+            let arrived_keys: Vec<(String, String)>;
+            let delete_keys: Vec<PendingInboundKey<'_>> = if arrived.len() == items.len() {
+                items
+                    .iter()
+                    .zip(&keys)
+                    .map(|(item, (chat, sender))| PendingInboundKey {
+                        chat,
+                        sender,
+                        id: &item.info.id,
+                    })
+                    .collect()
+            } else {
+                arrived_keys = arrived
+                    .iter()
+                    .map(|m| {
+                        (
+                            m.info.source.chat.to_string(),
+                            m.info.source.sender.to_string(),
+                        )
+                    })
+                    .collect();
+                arrived
+                    .iter()
+                    .zip(&arrived_keys)
+                    .map(|(item, (chat, sender))| PendingInboundKey {
+                        chat,
+                        sender,
+                        id: &item.info.id,
+                    })
+                    .collect()
+            };
             if let Err(e) = backend.delete_pending_inbound_batch(&delete_keys).await {
                 // Leftover rows replay as duplicates; the idempotent hook
                 // re-commits and the replay path clears them.
@@ -870,7 +1012,7 @@ impl Client {
         // synchronously, so a handler that panics or blocks must not be able
         // to suppress acks for messages the consumer already owns — the
         // pre-batch at-most-once path acked before dispatching too.
-        for item in items.iter() {
+        for item in arrived.iter() {
             self.ack_received_message(&item.info);
         }
         // WA Web `createSnapshot` sends `sendAggregateOfflineReceipts` per
@@ -883,6 +1025,7 @@ impl Client {
         if is_drain {
             self.flush_offline_receipts();
         }
+        let dispatched = Arc::clone(&items);
         self.core.event_bus.dispatch(Event::Messages(
             MessageBatch::builder()
                 .messages(items)
@@ -890,6 +1033,27 @@ impl Client {
                 .hook_committed(hook_committed)
                 .build(),
         ));
+        // Claimed after the dispatch, never between the acks and it: this is the
+        // one suspension point in that span, and a teardown cancelling it there
+        // would leave the batch acked with its event never sent, which for a
+        // consumer without a hook is a lost message. Cancelled here instead, the
+        // claim is simply missing and a resend dispatches twice.
+        for item in dispatched.iter() {
+            // An unresolved secret envelope is a placeholder in the same sense
+            // as an UndecryptableMessage: what reached the consumer is not the
+            // content. Presence, not extractability: a malformed envelope is
+            // just as unreadable to a consumer as an unopenable one, and
+            // `extract_secret_encrypted` returns `None` for both a plain
+            // message and a malformed envelope. Claiming it would suppress the resend that arrives once
+            // the parent secret is known, so leave it unclaimed and take the
+            // duplicate instead. The batch collapse keeps such a resend for a
+            // related reason: it compares content, and the envelope is not the
+            // content.
+            if crate::features::message_edit::carries_secret_encrypted(&item.message) {
+                continue;
+            }
+            self.mark_message_dispatched(&item.info).await;
+        }
         true
     }
 }
