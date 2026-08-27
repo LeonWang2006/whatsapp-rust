@@ -155,14 +155,24 @@ async fn sync_pair_code_key(
 /// - [`Event::PairingCode`] → `pairing` + the code (the flow is live).
 /// - [`Event::PairSuccess`] → `success`, clearing any code.
 /// - [`Event::PairingCodeError`] → `failed` + a reason the client can show.
-/// - [`Event::PairingCodeRefresh`] → `pairing` again (the code was rotated;
-///   the consumer re-requests, so the flow is still live).
+/// - [`Event::PairingCodeRefresh`] → `pairing` again on a server-initiated
+///   refresh (`force_manual`), `failed` + `code-mismatch` when the pair-success
+///   timer expired (`!force_manual` — the entered code did not link).
+/// - [`Event::LoggedOut`] → `failed` + reason. Can fire during pairing or at any
+///   point in the session's life (401, account locked, temp ban, device
+///   removed); the session is dead, so the client must see it.
+/// - [`Event::StreamReplaced`] → `failed` + `stream-replaced`. The device was
+///   superseded by another client.
 /// - [`Event::Connected`] on a *resume* session (`device_existed`) → `success`:
 ///   an already-paired device coming back online is the desired outcome of a
 ///   `/link` call on it, and there is no [`Event::PairSuccess`] for a resume.
 ///
 /// Success/failed are terminal: the key gets a long TTL so a slow client still
 /// reads the outcome after the pairing session is gone.
+///
+/// A plain [`Event::Disconnected`] (transport drop without logout) deliberately
+/// does NOT write here — it is not a pairing outcome and the session may
+/// reconnect; clients learn about it via the `wa-events` stream instead.
 async fn sync_link_status(
     redis: &mut ConnectionManager,
     jid: &str,
@@ -221,14 +231,57 @@ async fn sync_link_status(
             };
             Some((status, crate::task::LINK_STATUS_TERMINAL_TTL_SECS))
         }
-        Event::PairingCodeRefresh(_) => {
+        Event::PairingCodeRefresh(r) => {
+            // `force_manual=false` means the pair-success timer expired:
+            // the user entered the code on the phone but pair-success never
+            // arrived — the code was wrong, or the phone failed to link.
+            // `force_manual=true` is a server-initiated refresh and the
+            // flow is still live.
+            if r.force_manual {
+                let status = LinkStatus {
+                    status: LinkStatusKind::Pairing,
+                    code: None,
+                    error: None,
+                    updated_at,
+                };
+                Some((status, crate::task::LINK_STATUS_RESET_TTL_SECS))
+            } else {
+                let status = LinkStatus {
+                    status: LinkStatusKind::Failed,
+                    code: None,
+                    error: Some("code-mismatch".to_string()),
+                    updated_at,
+                };
+                Some((status, crate::task::LINK_STATUS_TERMINAL_TTL_SECS))
+            }
+        }
+        // These three events can fire at any time during a session's lifetime,
+        // including while a pairing flow is in progress. They are terminal
+        // failures — the session is dead or the device was superseded — so the
+        // client must be told via the link-status key.
+        Event::LoggedOut(l) => {
+            let error = l
+                .logout_message
+                .as_ref()
+                .and_then(|m| m.header.as_deref())
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("logged-out-{}", l.reason.code()));
             let status = LinkStatus {
-                status: LinkStatusKind::Pairing,
+                status: LinkStatusKind::Failed,
                 code: None,
-                error: None,
+                error: Some(error),
                 updated_at,
             };
-            Some((status, crate::task::LINK_STATUS_RESET_TTL_SECS))
+            Some((status, crate::task::LINK_STATUS_TERMINAL_TTL_SECS))
+        }
+        Event::StreamReplaced(_) => {
+            let status = LinkStatus {
+                status: LinkStatusKind::Failed,
+                code: None,
+                error: Some("stream-replaced".to_string()),
+                updated_at,
+            };
+            Some((status, crate::task::LINK_STATUS_TERMINAL_TTL_SECS))
         }
         _ => None,
     };

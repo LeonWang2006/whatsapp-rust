@@ -403,6 +403,7 @@ pub async fn run_session(ctx: ServerContext, jid: String, first_task: Option<Tas
     // bot's run future is being awaited below.
     let cmd_client = client.clone();
     let cmd_cancel = cancel.clone();
+    let cmd_ctx = ctx.clone();
     let cmd_task = tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -410,7 +411,7 @@ pub async fn run_session(ctx: ServerContext, jid: String, first_task: Option<Tas
                 cmd = cmd_rx.recv() => {
                     let Some(cmd) = cmd else { break; };
                     match cmd {
-                        SessionCommand::Task(t) => handle_task(&cmd_client, t).await,
+                        SessionCommand::Task(t) => handle_task(&cmd_client, &cmd_ctx, t).await,
                         SessionCommand::Disconnect => {
                             info!("disconnect requested for jid");
                             cmd_client.disconnect().await;
@@ -438,7 +439,7 @@ pub async fn run_session(ctx: ServerContext, jid: String, first_task: Option<Tas
 }
 
 /// Dispatch a single task to the live `Client`.
-async fn handle_task(client: &Arc<whatsapp_rust::Client>, task: TaskEnvelope) {
+async fn handle_task(client: &Arc<whatsapp_rust::Client>, ctx: &ServerContext, task: TaskEnvelope) {
     let task_id = task.task_id.clone();
     match task.task_type {
         TaskType::Disconnect => {
@@ -475,7 +476,7 @@ async fn handle_task(client: &Arc<whatsapp_rust::Client>, task: TaskEnvelope) {
         }
         TaskType::PairCode => {
             match serde_json::from_value::<PairCodePayload>(task.payload.clone()) {
-                Ok(p) => handle_pair_code(client, &task_id, p).await,
+                Ok(p) => handle_pair_code(client, ctx, &task_id, p).await,
                 Err(e) => warn!("bad pair_code payload for task={task_id}: {e}"),
             }
         }
@@ -619,7 +620,12 @@ fn pair_phone_from_task(task: Option<&TaskEnvelope>) -> Option<String> {
     Some(payload.phone_number)
 }
 
-async fn handle_pair_code(client: &Arc<whatsapp_rust::Client>, task_id: &str, p: PairCodePayload) {
+async fn handle_pair_code(
+    client: &Arc<whatsapp_rust::Client>,
+    ctx: &ServerContext,
+    task_id: &str,
+    p: PairCodePayload,
+) {
     if client.is_logged_in() {
         info!("pair_code task={task_id} skipped - already logged in");
         return;
@@ -630,6 +636,28 @@ async fn handle_pair_code(client: &Arc<whatsapp_rust::Client>, task_id: &str, p:
     // it rather than failing with `client is not connected`.
     if let Err(e) = client.wait_for_socket(Duration::from_secs(30)).await {
         warn!("pair_code task={task_id} socket not ready: {e}");
+        // The client polling /link-status never learns about this failure
+        // unless we write the key ourselves — `pair_with_code` handles its
+        // own errors via the event bus, but a socket that never comes up
+        // skips the event flow entirely.
+        let phone = &p.phone_number;
+        let key = crate::task::link_status_key(&ctx.link_status_key_prefix, phone);
+        let status = crate::task::LinkStatus {
+            status: crate::task::LinkStatusKind::Failed,
+            code: None,
+            error: Some(format!("socket not ready: {e}")),
+            updated_at: wacore::time::now_secs().max(0),
+        };
+        let mut redis = ctx.redis.clone();
+        if let Ok(body) = serde_json::to_vec(&status) {
+            let _ = redis::Cmd::set_ex(
+                &key,
+                body,
+                crate::task::LINK_STATUS_TERMINAL_TTL_SECS as u64,
+            )
+            .query_async::<()>(&mut redis)
+            .await;
+        }
         return;
     }
     let options = PairCodeOptions {
