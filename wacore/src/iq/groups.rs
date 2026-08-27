@@ -52,14 +52,7 @@ pub enum MemberLinkMode {
     AllMemberLink,
 }
 
-/// Member add mode for who can add participants.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, WireEnum)]
-pub enum MemberAddMode {
-    #[wire = "admin_add"]
-    AdminAdd,
-    #[wire = "all_member_add"]
-    AllMemberAdd,
-}
+pub use crate::types::wire_enums::MemberAddMode;
 
 /// Membership approval mode for join requests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, WireEnum)]
@@ -71,15 +64,7 @@ pub enum MembershipApprovalMode {
     On,
 }
 
-/// Who can share message history with new members.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, WireEnum)]
-pub enum MemberShareHistoryMode {
-    #[wire_default]
-    #[wire = "admin_share"]
-    AdminShare,
-    #[wire = "all_member_share"]
-    AllMemberShare,
-}
+pub use crate::types::wire_enums::MemberShareHistoryMode;
 
 /// Review state for an appeal on a suspended group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, WireEnum)]
@@ -1468,7 +1453,12 @@ pub enum GroupInfoOutcome {
 #[derive(Debug, Clone)]
 pub struct GroupQueryIq {
     pub group_jid: Jid,
-    pub phash: Option<String>,
+    /// A `CompactString` because that is what a phash is everywhere else:
+    /// `MessageUtils::participant_list_hash` produces one, the send memos hold
+    /// one, and a ten-byte value lives inside it with nothing on the heap. A
+    /// `String` here would allocate once to be built and again on the clone
+    /// into the node attribute below.
+    pub phash: Option<CompactString>,
 }
 
 impl GroupQueryIq {
@@ -1481,7 +1471,7 @@ impl GroupQueryIq {
 
     /// Query carrying the cached participant `phash` so the server can answer
     /// "not-modified" by omitting `<group>`.
-    pub fn with_phash(group_jid: &Jid, phash: Option<String>) -> Self {
+    pub fn with_phash(group_jid: &Jid, phash: Option<CompactString>) -> Self {
         Self {
             group_jid: group_jid.clone(),
             phash,
@@ -3690,6 +3680,119 @@ mod tests {
     use super::*;
     use crate::request::InfoQueryType;
 
+    /// Whether a `w:g2` request is addressed to the group server or to one
+    /// group's own JID, checked against what the whatspec IR resolves for each
+    /// upstream builder.
+    ///
+    /// The IR only started answering this in schema 4: before it, every `w:g2`
+    /// stanza reported the namespace's base target of `s.whatsapp.net`, so a
+    /// request sent to the wrong one of the two looked exactly like a request
+    /// sent to the right one. It now splits them (26 `group_jid`, 6 `g.us`),
+    /// and a mistake here is otherwise silent -- the server ignores the IQ and
+    /// the caller waits out its timeout.
+    ///
+    /// This is a regression lock, not a derivation: the expectations below were
+    /// read off the IR by hand, since the IR is not available at test time.
+    #[test]
+    fn group_requests_are_addressed_the_way_the_ir_resolves_them() {
+        use crate::iq::targets::{self, IqTarget};
+
+        let group: Jid = "120363000000000001@g.us".parse().unwrap();
+        let server = Jid::new("", Server::Group);
+
+        // The expectation comes from the generated constants, so a request
+        // upstream moves between the two targets flips the constant on the next
+        // sync and fails here, rather than turning into a silent timeout.
+        let expect = |actual: Jid, want: IqTarget, spec: &str| {
+            let addressed = match want {
+                IqTarget::GroupServer => server.clone(),
+                IqTarget::GroupJid => group.clone(),
+                IqTarget::MainServer => Jid::new("", Server::Pn),
+            };
+            assert_eq!(actual, addressed, "{spec} is addressed to the wrong target");
+        };
+
+        expect(
+            LeaveGroupIq::new(&group).build_iq().to,
+            targets::LEAVE_GROUP,
+            "LeaveGroupIq",
+        );
+        expect(
+            GroupParticipatingIq::new().build_iq().to,
+            targets::GROUP_PARTICIPATING,
+            "GroupParticipatingIq",
+        );
+        expect(
+            BatchGetGroupInfoIq::new(std::slice::from_ref(&group))
+                .build_iq()
+                .to,
+            targets::BATCH_GET_GROUP_INFO,
+            "BatchGetGroupInfoIq",
+        );
+        expect(
+            GetGroupInviteInfoIq::new("ABC123").build_iq().to,
+            targets::GET_GROUP_INVITE_INFO,
+            "GetGroupInviteInfoIq",
+        );
+        expect(
+            GroupQueryIq::new(&group).build_iq().to,
+            targets::GROUP_QUERY,
+            "GroupQueryIq",
+        );
+        expect(
+            SetGroupSubjectIq::new(&group, GroupSubject::new("x").unwrap())
+                .build_iq()
+                .to,
+            targets::SET_GROUP_SUBJECT,
+            "SetGroupSubjectIq",
+        );
+        expect(
+            SetGroupDescriptionIq::new(&group, None, None).build_iq().to,
+            targets::SET_GROUP_DESCRIPTION,
+            "SetGroupDescriptionIq",
+        );
+        expect(
+            SetGroupLockedIq::lock(&group).build_iq().to,
+            targets::SET_GROUP_LOCKED,
+            "SetGroupLockedIq",
+        );
+        expect(
+            ReportGroupMessagesIq::new(&group, &["M1".to_string()])
+                .build_iq()
+                .to,
+            targets::REPORT_GROUP_MESSAGES,
+            "ReportGroupMessagesIq",
+        );
+        expect(
+            GetReportedGroupMessagesIq::new(&group).build_iq().to,
+            targets::GET_REPORTED_GROUP_MESSAGES,
+            "GetReportedGroupMessagesIq",
+        );
+        expect(
+            GetMembershipRequestsIq::new(&group).build_iq().to,
+            targets::GET_MEMBERSHIP_REQUESTS,
+            "GetMembershipRequestsIq",
+        );
+        expect(
+            MembershipRequestActionIq::approve(&group, &[])
+                .build_iq()
+                .to,
+            targets::MEMBERSHIP_REQUEST_ACTION,
+            "MembershipRequestActionIq",
+        );
+
+        // Still hand-asserted: `resetGroupInviteCode` has two entries in
+        // `WAWebGroupInviteJob` resolving to different targets, so the emitter
+        // refuses to pin either. Ours is the `group_jid` overload, the one with
+        // an empty `<invite/>`; the `g.us` overload carries a code and is a call
+        // this repository does not make.
+        assert_eq!(
+            GetGroupInviteLinkIq::new(&group, false).build_iq().to,
+            group
+        );
+        assert_eq!(GetGroupInviteLinkIq::new(&group, true).build_iq().to, group);
+    }
+
     #[test]
     fn report_messages_iq_matches_the_group_report_shape() {
         let jid: Jid = "120363000000000001@g.us".parse().unwrap();
@@ -3808,7 +3911,7 @@ mod tests {
     #[test]
     fn group_query_iq_with_phash_emits_attr() {
         let jid: Jid = "120363000000000001@g.us".parse().unwrap();
-        let iq = GroupQueryIq::with_phash(&jid, Some("2:abc123".to_string())).build_iq();
+        let iq = GroupQueryIq::with_phash(&jid, Some(CompactString::from("2:abc123"))).build_iq();
         let Some(NodeContent::Nodes(nodes)) = &iq.content else {
             panic!("expected NodeContent::Nodes");
         };

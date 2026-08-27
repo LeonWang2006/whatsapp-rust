@@ -130,7 +130,8 @@ pub use client::NodeFilter;
 pub use client::interceptor::{Interception, InterceptorHandle, StanzaInterceptor};
 pub use client::{
     AllocSnapshot, CollectionStats, HttpResourceReport, MemoryReport, ResourceReport,
-    StatsSnapshot, StorageResourceReport, TransportResourceReport,
+    StatsSnapshot, StorageResourceReport, SubsystemCollection, SubsystemMemory,
+    TransportResourceReport,
 };
 pub use client::{CallError, Voip};
 pub use client::{
@@ -140,7 +141,7 @@ pub use client::{
 #[cfg(feature = "client-lifecycle")]
 #[cfg_attr(docsrs, doc(cfg(feature = "client-lifecycle")))]
 pub use client::{ClientLifecycle, ConnectionScope, ConnectionScopeState};
-pub use client::{ConnectError, ConnectStage, SignalMaintenanceError};
+pub use client::{ConnectError, ConnectStage, Reachability, SignalMaintenanceError};
 pub use types::durability_hook::InboundDurabilityHook;
 pub use types::retry_admission::RetryAdmission;
 pub mod download;
@@ -156,6 +157,8 @@ pub mod message;
 pub(crate) mod msg_secret_buffer;
 pub mod pair;
 pub mod pair_code;
+#[cfg(feature = "passkey")]
+#[cfg_attr(docsrs, doc(cfg(feature = "passkey")))]
 pub mod passkey;
 #[cfg(feature = "plugins")]
 #[cfg_attr(docsrs, doc(cfg(feature = "plugins")))]

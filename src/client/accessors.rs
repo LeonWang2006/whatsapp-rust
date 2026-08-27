@@ -290,6 +290,8 @@ impl Client {
         let mut snapshot = self.stats.snapshot();
         snapshot.reconnect_errors = self.auto_reconnect_errors.load(Ordering::Relaxed);
         snapshot.resends_throttled = self.resend_rate_limiter.throttled_total();
+        snapshot.messages_suppressed_duplicate =
+            self.duplicate_dispatch_suppressed.load(Ordering::Relaxed);
         snapshot
     }
 
@@ -309,6 +311,11 @@ impl Client {
         let (lid_pn_lid_entries, lid_pn_pn_entries) = self.lid_pn_cache.memory_stats().await;
         let pending_retries_count = self
             .pending_retries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len();
+        let pending_lid_refreshes_count = self
+            .pending_lid_refreshes
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .len();
@@ -366,20 +373,7 @@ impl Client {
             history_sync_activity.tasks as u64,
             history_sync_activity.payload_bytes as u64,
         );
-        #[cfg(feature = "voip-runtime")]
-        let pending_call_link_updates = self
-            .pending_call_link_joins
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .memory_stats();
-        #[cfg(feature = "voip-runtime")]
-        let active_calls = self.call_registry.memory_stats();
-        #[cfg(feature = "voip-runtime")]
-        let pending_outgoing_calls = self
-            .pending_outgoing_calls
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .len() as u64;
+        let subsystems = subsystem::memory(&self.subsystems);
         #[cfg(feature = "plugins")]
         let plugin_stats = self.plugin_stats();
         #[cfg(feature = "plugins")]
@@ -433,6 +427,7 @@ impl Client {
             dm_devices_memo,
             message_retry_counts: self.message_retry_counts.entry_count(),
             undecryptable_dispatched: self.undecryptable_dispatched.entry_count(),
+            dispatched_messages: self.dispatched_messages.entry_count(),
             pdo_pending_requests: self.pdo_pending_requests.entry_count(),
             pdo_requested: self.pdo_requested.entry_count(),
             history_sync_tasks,
@@ -442,6 +437,8 @@ impl Client {
             msg_secret_buffer,
             pending_device_sync,
             session_locks: self.session_locks.entry_count(),
+            ensure_inflight: self.ensure_inflight.len() as u64,
+            group_metadata_inflight: self.group_metadata_inflight.len() as u64,
             chat_lanes: self.chat_lanes.entry_count(),
             group_distribution_locks: group_distribution_locks.entries,
             group_distribution_lock_evictions: group_distribution_locks.evictions,
@@ -455,6 +452,7 @@ impl Client {
             node_waiters: self.node_waiter_count.load(Ordering::Relaxed),
             sent_node_waiters: self.sent_node_waiter_count.load(Ordering::Relaxed),
             pending_retries: pending_retries_count,
+            pending_lid_refreshes: pending_lid_refreshes_count,
             presence_subscriptions,
             app_state_key_requests,
             app_state_key_cache,
@@ -462,12 +460,7 @@ impl Client {
             signal_sessions,
             signal_identities,
             signal_sender_keys,
-            #[cfg(feature = "voip-runtime")]
-            pending_call_link_updates,
-            #[cfg(feature = "voip-runtime")]
-            active_calls,
-            #[cfg(feature = "voip-runtime")]
-            pending_outgoing_calls,
+            subsystems,
             #[cfg(feature = "plugins")]
             plugins,
             #[cfg(feature = "plugins")]
@@ -627,7 +620,7 @@ impl Client {
             return;
         }
 
-        log::debug!("Updating push name from '{}' -> '{}'", old_name, new_name);
+        log::debug!("Updating push name");
         self.persistence_manager
             .process_command(DeviceCommand::SetPushName(new_name.clone()))
             .await;
@@ -938,6 +931,9 @@ mod identity_span_tests {
             Some(pn.observe().to_string().as_str()),
             "pn field must render through the redacting wrapper, not raw"
         );
+        // `tracing-pii` exists to render the number raw, so this is the one
+        // claim it invalidates; same split as `observe_redacts_phone_but_not_lid_or_group`.
+        #[cfg(not(feature = "tracing-pii"))]
         assert!(
             !recorded(&captured, "pn")
                 .expect("pn recorded")

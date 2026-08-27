@@ -1148,69 +1148,19 @@ impl Client {
 
     /// Wait until there is a connection to work on, or the client is finished.
     ///
-    /// Returns whether one arrived. Bounded by the client's own lifetime rather
-    /// than by a duration: every number tried here was wrong in one direction or
-    /// the other, because the reconnect backoff is jittered, capped at 900s, and
-    /// followed by a handshake — there is no honest constant. Terminal is the
-    /// condition that actually means "stop waiting", and it is already tracked.
+    /// Returns whether one arrived. The internal half of
+    /// [`Client::wait_until_reachable`], differing only in sitting through a
+    /// pause: nothing on the next connection re-issues a consumer's task, so
+    /// giving up there would drop a full-sync request outright rather than
+    /// defer it, and a pause is the same shape as the backoff this already
+    /// waits out — offline now, connected later.
     ///
-    /// Waits for [`Self::can_reach_server`], not for `Connected`: the caller's
-    /// question is whether its IQ can be sent and answered, and the `Connected`
-    /// notifier additionally waits for the critical sync, so a retry would sit
-    /// through a bootstrap it may itself be part of.
+    /// Waits for `can_reach_server`, not for `Connected`: the caller's question
+    /// is whether its IQ can be sent and answered, and the `Connected` notifier
+    /// additionally waits for the critical sync, so a retry would sit through a
+    /// bootstrap it may itself be part of.
     pub(crate) async fn await_connection(&self) -> bool {
-        loop {
-            if let Some(verdict) = self.connection_wait_verdict() {
-                return verdict;
-            }
-            // Both registered before the re-check, so a transition landing in the
-            // gap is not missed. Socket readiness alone is not enough to wait on:
-            // it fires before login, and nothing fires at all when the client
-            // stops without a replacement socket — a wait on it alone parks
-            // forever, holding the `Arc<Client>` whose drop is the only other
-            // way this task ends.
-            let ready = self.socket_ready_notifier.listen();
-            let session = self.session_state_notifier.listen();
-            if let Some(verdict) = self.connection_wait_verdict() {
-                return verdict;
-            }
-            futures::pin_mut!(ready);
-            futures::pin_mut!(session);
-            // A notification that does not settle the question simply loops: the
-            // wait ends on the state, never on one event.
-            futures::future::select(ready, session).await;
-        }
-    }
-
-    /// Whether [`Self::await_connection`] can stop, and with what answer.
-    fn connection_wait_verdict(&self) -> Option<bool> {
-        // Terminal first. The two are not mutually exclusive during a teardown:
-        // the stream-error paths set the terminal flags before they clear
-        // `is_logged_in` and close the transport, so asking about reachability
-        // first hands out a connection that is already ending.
-        if self.is_terminal() {
-            return Some(false);
-        }
-        if self.can_reach_server() {
-            return Some(true);
-        }
-        // A client with no supervision loop has no reader, so nothing will ever
-        // answer an IQ and no `<success>` will ever arrive. That is not terminal
-        // — the connection is fine and the application may still use it — but it
-        // is unwaitable, and the alternative is parking until the process ends.
-        if !self.is_running.load(Ordering::Relaxed) {
-            return Some(false);
-        }
-        // A pause deliberately gets no branch of its own. It is not terminal —
-        // the application means to come back — and nothing on the next
-        // connection re-issues a consumer's task, so giving up here would drop
-        // a full-sync request outright rather than defer it. Waiting is already
-        // what this does for a 900s backoff, and a pause is the same shape:
-        // offline now, connected later, bounded by the client's lifetime. The
-        // window where the pause is still tearing down is handled where it
-        // belongs, in `can_reach_server`, so a paused client never reads as
-        // reachable while it waits.
-        None
+        self.wait_for_reachability(true).await.is_reachable()
     }
 
     /// Open a scope for work starting now on the live connection.
@@ -1810,7 +1760,7 @@ impl Client {
         // collection under both `synced` and `skipped`, making `all_synced()`
         // false and publishing a failure that blames a writer who never existed.
         let mut seen = HashSet::with_capacity(collections.len());
-        let mut collections: Vec<WAPatchName> = collections
+        let collections: Vec<WAPatchName> = collections
             .into_iter()
             .filter(|name| seen.insert(*name))
             .collect();
@@ -1821,9 +1771,20 @@ impl Client {
         // opposite orders would otherwise each hold the other's next collection
         // and make no progress until both waits time out, minutes later, for
         // work neither was slow at. A single order over a shared set is what
-        // makes that cycle unconstructible. The name is the only ordering both
-        // callers can agree on without coordinating.
-        collections.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+        // makes that cycle unconstructible, and `reservation_rank` is where that
+        // order lives, as a property of the collection rather than a list a new
+        // variant can be left out of. Placed one by one rather than sorted,
+        // because the set is at most six elements and a generic sort over them
+        // monomorphizes to kilobytes of code.
+        let mut ordered: Vec<WAPatchName> = Vec::with_capacity(collections.len());
+        for name in collections {
+            let at = ordered
+                .iter()
+                .position(|placed| placed.reservation_rank() > name.reservation_rank())
+                .unwrap_or(ordered.len());
+            ordered.insert(at, name);
+        }
+        let collections = ordered;
 
         // The bootstrap cannot skip: it has to know the collection is synced
         // before it dispatches Connected, and an equivalent sync in flight only
@@ -3102,7 +3063,7 @@ impl Client {
             let snapshot = self.persistence_manager.get_device_snapshot();
             let old = snapshot.push_name.clone();
             if old != new_name {
-                debug!(target: "Client/AppState", "Persisting push name from app state mutation: '{}' (old='{}')", new_name, old);
+                debug!(target: "Client/AppState", "Persisting changed push name from app state mutation");
                 self.persistence_manager
                     .process_command(DeviceCommand::SetPushName(new_name.clone()))
                     .await;
@@ -3122,7 +3083,7 @@ impl Client {
                     }
                 }
             } else {
-                debug!(target: "Client/AppState", "Push name mutation received but name unchanged: '{}'", new_name);
+                debug!(target: "Client/AppState", "Push name mutation received but name unchanged");
             }
         }
     }
@@ -4301,6 +4262,139 @@ mod retry_gate_tests {
 }
 
 #[cfg(test)]
+mod collection_order_tests {
+    use super::*;
+    use crate::client::app_state::batched_sync_outcome_tests::batch_result;
+
+    /// The order the batch reserves in is the order the `<collection>` children
+    /// go out in, so it is pinned on the wire rather than on the vector: a
+    /// change here is a change the server sees.
+    #[tokio::test]
+    async fn a_shuffled_batch_reaches_the_wire_in_reservation_order() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let sync = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                let scope = client.sync_scope(None);
+                client
+                    .sync_collections_batched(
+                        vec![
+                            WAPatchName::RegularLow,
+                            WAPatchName::Regular,
+                            WAPatchName::CriticalUnblockLow,
+                            WAPatchName::RegularHigh,
+                            WAPatchName::CriticalBlock,
+                        ],
+                        scope,
+                    )
+                    .await
+            })
+        };
+
+        let request = crate::test_utils::decode_sent_iq(&transport, 0).await;
+        let request = request.get().to_owned();
+        let sync_node = request
+            .get_optional_child("sync")
+            .expect("the batch is a `<sync>` IQ");
+        let asked: Vec<String> = sync_node
+            .get_children_by_tag("collection")
+            .map(|collection| {
+                collection
+                    .attrs()
+                    .optional_string("name")
+                    .expect("every `<collection>` is named")
+                    .into_owned()
+            })
+            .collect();
+
+        assert_eq!(
+            asked,
+            [
+                "critical_block",
+                "critical_unblock_low",
+                "regular",
+                "regular_high",
+                "regular_low",
+            ]
+        );
+
+        let id = request
+            .attrs()
+            .optional_string("id")
+            .expect("every IQ carries an id")
+            .into_owned();
+        let response = batch_result(
+            &id,
+            &[
+                ("critical_block", None),
+                ("critical_unblock_low", None),
+                ("regular", None),
+                ("regular_high", None),
+                ("regular_low", None),
+            ],
+        );
+        crate::test_utils::answer_iq(&client, &id, &response).await;
+        let outcome = sync
+            .await
+            .expect("the sync task should not panic")
+            .expect("a clean batch is not a transport failure");
+
+        assert_eq!(
+            outcome.synced,
+            vec![
+                WAPatchName::CriticalBlock,
+                WAPatchName::CriticalUnblockLow,
+                WAPatchName::Regular,
+                WAPatchName::RegularHigh,
+                WAPatchName::RegularLow,
+            ]
+        );
+    }
+
+    /// The dedup runs before the ordering, so a repeated collection must not
+    /// reach the wire twice or push the rest out of order.
+    #[tokio::test]
+    async fn a_repeated_collection_is_asked_for_once_and_still_in_order() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let sync = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                let scope = client.sync_scope(None);
+                client
+                    .sync_collections_batched(
+                        vec![
+                            WAPatchName::Regular,
+                            WAPatchName::CriticalBlock,
+                            WAPatchName::Regular,
+                        ],
+                        scope,
+                    )
+                    .await
+            })
+        };
+
+        let request = crate::test_utils::decode_sent_iq(&transport, 0).await;
+        let request = request.get().to_owned();
+        let asked: Vec<String> = request
+            .get_optional_child("sync")
+            .expect("the batch is a `<sync>` IQ")
+            .get_children_by_tag("collection")
+            .map(|collection| {
+                collection
+                    .attrs()
+                    .optional_string("name")
+                    .expect("every `<collection>` is named")
+                    .into_owned()
+            })
+            .collect();
+
+        assert_eq!(asked, ["critical_block", "regular"]);
+
+        sync.abort();
+    }
+}
+
+#[cfg(test)]
 mod request_hygiene_tests {
     use super::*;
     use crate::client::app_state::batched_sync_outcome_tests::sync_against;
@@ -5089,7 +5183,7 @@ mod sync_outcome_tests {
         client.expected_disconnect.store(true, Ordering::Relaxed);
 
         assert!(client.is_terminal());
-        assert_eq!(client.connection_wait_verdict(), Some(false));
+        assert_eq!(client.reachability(), Reachability::Finished);
 
         // The window is now closed at the source rather than ordered around:
         // `can_reach_server()` rejects a socket marked for retirement, and every
@@ -5137,8 +5231,8 @@ mod sync_outcome_tests {
         let current = client.connection_generation.fetch_add(1, Ordering::SeqCst) + 1;
         assert!(!client.can_reach_server());
         assert_eq!(
-            client.connection_wait_verdict(),
-            None,
+            client.reachability(),
+            Reachability::Reconnecting,
             "the wait carries on"
         );
 
@@ -5146,7 +5240,7 @@ mod sync_outcome_tests {
         client
             .authenticated_generation
             .store(current, Ordering::SeqCst);
-        assert_eq!(client.connection_wait_verdict(), Some(true));
+        assert_eq!(client.reachability(), Reachability::Reachable);
     }
 }
 
@@ -5315,8 +5409,8 @@ mod retiring_socket_tests {
             "which is not the same as the client being finished"
         );
         assert_eq!(
-            client.connection_wait_verdict(),
-            None,
+            client.reachability(),
+            Reachability::Reconnecting,
             "so the wait carries on to the replacement"
         );
     }

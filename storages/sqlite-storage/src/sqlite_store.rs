@@ -89,6 +89,7 @@ struct DeviceRow {
     lid_migrated: bool,
     last_signed_pre_key_rotation_ms: i64,
     read_receipts_disabled: bool,
+    server_client_expiration: Option<String>,
 }
 
 /// Max ids per `eq_any` list, under SQLite's default 999 host-parameter limit.
@@ -895,6 +896,14 @@ impl SqliteStore {
         let edge_routing_info: Option<Arc<[u8]>> =
             device_data.edge_routing_info.as_deref().map(Arc::from);
         let props_hash: Option<Arc<str>> = device_data.props_hash.as_deref().map(Arc::from);
+        // JSON rather than a column per field: the record is a deadline plus
+        // the build it was issued for, and splitting a version triple across
+        // columns buys nothing -- nothing queries or orders by it.
+        let server_client_expiration: Option<Arc<str>> = device_data
+            .server_client_expiration
+            .as_ref()
+            .and_then(|v| serde_json::to_string(v).ok())
+            .map(Arc::from);
         let next_pre_key_id = device_data.next_pre_key_id as i32;
         let first_unupload_pre_key_id = device_data.first_unupload_pre_key_id as i32;
         let server_has_prekeys = device_data.server_has_prekeys;
@@ -934,6 +943,7 @@ impl SqliteStore {
             let push_name = Arc::clone(&push_name);
             let edge_routing_info = edge_routing_info.clone();
             let props_hash = props_hash.clone();
+            let server_client_expiration = server_client_expiration.clone();
             let nct_salt = nct_salt.clone();
             let server_cert_chain = server_cert_chain.clone();
             let new_lid = Arc::clone(&new_lid);
@@ -969,6 +979,7 @@ impl SqliteStore {
                         device::lid_migrated.eq(lid_migrated),
                         device::last_signed_pre_key_rotation_ms.eq(last_signed_pre_key_rotation_ms),
                         device::read_receipts_disabled.eq(read_receipts_disabled),
+                        device::server_client_expiration.eq(server_client_expiration.as_deref()),
                     ))
                     .on_conflict(device::id)
                     .do_update()
@@ -1003,6 +1014,8 @@ impl SqliteStore {
                         device::last_signed_pre_key_rotation_ms
                             .eq(excluded(device::last_signed_pre_key_rotation_ms)),
                         device::read_receipts_disabled.eq(excluded(device::read_receipts_disabled)),
+                        device::server_client_expiration
+                            .eq(excluded(device::server_client_expiration)),
                     ))
                     .execute(conn)
                     .map(|_| ())
@@ -1072,6 +1085,7 @@ impl SqliteStore {
                         device::lid_migrated.eq(false),
                         device::last_signed_pre_key_rotation_ms.eq(last_signed_pre_key_rotation_ms),
                         device::read_receipts_disabled.eq(false),
+                        device::server_client_expiration.eq(None::<&str>),
                     ))
                     .execute(conn)
                     .map(|_| device_id)
@@ -1194,6 +1208,13 @@ impl SqliteStore {
                 lid_migrated: row.lid_migrated,
                 last_signed_pre_key_rotation_ms: row.last_signed_pre_key_rotation_ms,
                 read_receipts_disabled: row.read_receipts_disabled,
+                // A row written by a newer build, or corrupted, reads as no
+                // deadline rather than failing the whole device load; the
+                // next `<ib>` restates it.
+                server_client_expiration: row
+                    .server_client_expiration
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str(raw).ok()),
             }))
         } else {
             Ok(None)
@@ -4131,6 +4152,45 @@ mod tests {
         assert_eq!(cs.cache, -4096, "cache_size_kib applied as negative KiB");
         assert_eq!(cs.sync, 2, "synchronous = FULL");
         assert_eq!(busy.timeout, 7000, "busy_timeout = 7s");
+    }
+
+    /// The performance-relevant pragmas a default store runs on. The custom-config
+    /// test above pins the tunables when they are overridden; these are the values
+    /// every consumer that never touches `SqliteStoreConfig` actually gets, and
+    /// they are the ones a "why is this slow" investigation starts from.
+    #[tokio::test]
+    async fn default_pragmas_are_normal_sync_and_memory_temp_store() {
+        let db_name = format!(
+            "file:memdb_default_pragmas_{}?mode=memory&cache=shared",
+            std::process::id()
+        );
+        let store = SqliteStore::new(&db_name).await.expect("default store");
+
+        #[derive(diesel::QueryableByName)]
+        struct Pragmas {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            sync: i64,
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            temp_store: i64,
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            cache: i64,
+        }
+        let mut conn = store.pool.get().unwrap();
+        let pragmas: Pragmas = diesel::sql_query(
+            "SELECT sy.synchronous AS sync, ts.temp_store AS temp_store, cs.cache_size AS cache \
+             FROM pragma_synchronous sy, pragma_temp_store ts, pragma_cache_size cs",
+        )
+        .get_result(&mut conn)
+        .unwrap();
+
+        // NORMAL is the chosen default because the store runs its file-backed
+        // databases in WAL, where a commit does not fsync and only a checkpoint
+        // does. `on_acquire` stamps the pragma on every connection whatever the
+        // journal mode, which is the part this in-memory database checks.
+        assert_eq!(pragmas.sync, 1, "default synchronous = NORMAL");
+        // MEMORY: sorters and materialized subqueries never touch the disk.
+        assert_eq!(pragmas.temp_store, 2, "temp_store = MEMORY");
+        assert_eq!(pragmas.cache, -512, "default cache_size = 512 KiB");
     }
 
     #[tokio::test]

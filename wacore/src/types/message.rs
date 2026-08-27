@@ -1,9 +1,10 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use wacore_binary::{Jid, JidExt, MessageId, MessageServerId};
+use wacore_binary::{CompactString, Jid, JidExt, MessageId, MessageServerId};
 use waproto::whatsapp as wa;
 
 use crate::WireEnum;
+use smallvec::SmallVec;
 
 /// Identifies a specific message within a chat.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -15,6 +16,26 @@ pub struct ChatMessageId {
 impl ChatMessageId {
     pub fn new(chat: Jid, id: MessageId) -> Self {
         Self { chat, id }
+    }
+}
+
+/// Identifies a message *and who sent it*.
+///
+/// Message ids come from the sending client and are not unique across senders,
+/// so `(chat, id)` names a message only when the sender is already known from
+/// context. WA Web says the same in `MsgKey`, which serializes as
+/// `[fromMe, remote, id, participant]`: two participants of one group using the
+/// same id are two messages, and folding them into one drops the second.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SenderMessageId {
+    pub chat: Jid,
+    pub id: MessageId,
+    pub sender: Jid,
+}
+
+impl SenderMessageId {
+    pub fn new(chat: Jid, id: MessageId, sender: Jid) -> Self {
+        Self { chat, id, sender }
     }
 }
 
@@ -47,131 +68,11 @@ pub enum PushPriority {
     HighForce,
 }
 
-/// The `type` attribute of an incoming `<message>` envelope.
-///
-/// The server declares which class of payload the stanza carries before any
-/// `<enc>` is decrypted. WhatsApp Web treats the attribute as required and
-/// fails the parse when it is absent or carries a value outside its list; this
-/// client keeps the stanza instead, so absence surfaces as `None` on
-/// [`MessageInfo::type`](MessageInfo) and an unrecognized value as
-/// [`Unknown`](Self::Unknown) holding the exact wire bytes.
-///
-/// Says nothing about the decrypted content: it is the envelope's own claim,
-/// which nothing verifies against the `Message` that comes out of the
-/// ciphertext.
-#[derive(Debug, Clone, PartialEq, Eq, WireEnum)]
-pub enum StanzaMessageType {
-    #[wire = "text"]
-    Text,
-    #[wire = "media"]
-    Media,
-    #[wire = "medianotify"]
-    MediaNotify,
-    #[wire = "pay"]
-    Pay,
-    #[wire = "poll"]
-    Poll,
-    #[wire = "reaction"]
-    Reaction,
-    #[wire = "event"]
-    Event,
-    /// A value this build does not model, kept verbatim.
-    #[wire_fallback]
-    Unknown(String),
-}
-
-/// The `polltype` attribute of an incoming `<message><meta>` node.
-///
-/// Read only when the envelope declares [`StanzaMessageType::Poll`], mirroring
-/// the official parser, which scopes the attribute to poll envelopes. Closed
-/// on purpose: the attribute is `attrEnumOrNullIfUnknown` upstream, so a value
-/// outside this list parses as `None` rather than being preserved.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, WireEnum)]
-pub enum PollType {
-    #[wire = "creation"]
-    Creation,
-    #[wire = "quiz_creation"]
-    QuizCreation,
-    #[wire = "vote"]
-    Vote,
-    #[wire = "result_snapshot"]
-    ResultSnapshot,
-    #[wire = "edit"]
-    Edit,
-}
-
-/// The `mediatype` attribute of an `<enc>` node.
-///
-/// A hint about the payload the ciphertext carries, available before the
-/// decryption that would reveal it. It is the sender's claim and nothing
-/// checks it against the decrypted `Message`, so it is useful for routing and
-/// telemetry and not for deciding what a message is.
-#[derive(Debug, Clone, PartialEq, Eq, WireEnum)]
-pub enum EncMediaType {
-    #[wire = "image"]
-    Image,
-    #[wire = "video"]
-    Video,
-    #[wire = "ptv"]
-    Ptv,
-    #[wire = "audio"]
-    Audio,
-    #[wire = "ptt"]
-    Ptt,
-    #[wire = "location"]
-    Location,
-    #[wire = "vcard"]
-    Vcard,
-    #[wire = "document"]
-    Document,
-    #[wire = "url"]
-    Url,
-    #[wire = "call"]
-    Call,
-    #[wire = "gif"]
-    Gif,
-    #[wire = "future"]
-    Future,
-    #[wire = "contact_array"]
-    ContactArray,
-    #[wire = "livelocation"]
-    LiveLocation,
-    #[wire = "profile_pic"]
-    ProfilePic,
-    #[wire = "sticker"]
-    Sticker,
-    #[wire = "sticker_pack"]
-    StickerPack,
-    #[wire = "hsm"]
-    Hsm,
-    #[wire = "product_image"]
-    ProductImage,
-    #[wire = "template"]
-    Template,
-    #[wire = "md_app_state"]
-    MdAppState,
-    #[wire = "md_history_sync"]
-    MdHistorySync,
-    #[wire = "list"]
-    List,
-    #[wire = "list_response"]
-    ListResponse,
-    #[wire = "button"]
-    Button,
-    #[wire = "button_response"]
-    ButtonResponse,
-    #[wire = "order"]
-    Order,
-    #[wire = "product"]
-    Product,
-    #[wire = "native_flow_response"]
-    NativeFlowResponse,
-    #[wire = "group_history"]
-    GroupHistory,
-    /// A value this build does not model, kept verbatim.
-    #[wire_fallback]
-    Unknown(String),
-}
+// The wire vocabulary these three enums carry is generated from the whatspec
+// enum catalog, so a variant added upstream arrives on the next sync instead of
+// being noticed by hand. Re-exported here because this is where the types that
+// use them live, and moving the path would break consumers for no gain.
+pub use crate::types::wire_enums::{EncMediaType, PollType, StanzaMessageType};
 
 /// Whether an envelope's declared type agrees with the server's request to
 /// hide decryption failures for it.
@@ -432,10 +333,19 @@ pub struct MsgBotInfo {
     pub edit_sender_timestamp_ms: Option<DateTime<Utc>>,
 }
 
+/// The `<reporting>` payloads: a 16 or 20 byte tag, a 16 byte token. Both fit
+/// inline, so a message that carries reporting data does not pay a heap
+/// allocation per payload for bytes this client only stores and hands back.
+pub type ReportingBytes = SmallVec<[u8; 20]>;
+
+/// The short `<meta>` attributes are `CompactString`: a message id is 22 wire
+/// characters and the rest are short keywords ("add_on", "default"), so all of
+/// them live in the 24 inline bytes and parsing a `<meta>` child allocates
+/// nothing for them.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct MsgMetaInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub target_id: Option<MessageId>,
+    pub target_id: Option<CompactString>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_sender: Option<Jid>,
     /// `<meta target_chat_jid="…">` — present when the bot reply addresses a
@@ -446,7 +356,7 @@ pub struct MsgMetaInfo {
     /// `<meta thread_msg_id="…">`: the message this one threads under, for a
     /// stanza the server routes into an existing thread.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub thread_message_id: Option<MessageId>,
+    pub thread_message_id: Option<CompactString>,
     /// `<meta thread_msg_sender_jid="…">`: who authored
     /// [`thread_message_id`](Self::thread_message_id). Absent whenever that is.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -463,18 +373,18 @@ pub struct MsgMetaInfo {
     /// `<meta content_type=...>` attr. Server marks reactions/edits as
     /// `"add_on"`; mirrors `WAWebHandleMsgParser` b()'s metadata read.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub content_type: Option<String>,
+    pub content_type: Option<CompactString>,
     /// `<meta appdata=...>` attr. `"default"` is the only observed value.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub appdata: Option<String>,
+    pub appdata: Option<CompactString>,
     /// `<reporting><reporting_tag>` content bytes (16 or 20). Pre-requisite
     /// for the server-side report-abuse flow.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reporting_tag: Option<Vec<u8>>,
+    pub reporting_tag: Option<ReportingBytes>,
     /// `<reporting><reporting_token>` content bytes (16). Pre-requisite
     /// for the server-side report-abuse flow.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reporting_token: Option<Vec<u8>>,
+    pub reporting_token: Option<ReportingBytes>,
     /// `v` attr on `<reporting_token>`. WA Web defaults to 1 when missing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reporting_token_version: Option<i64>,
@@ -604,7 +514,7 @@ mod tests {
     fn message_info_serde_omits_only_absent_optional_fields() {
         let mut info = MessageInfo::default();
         info.source.sender_alt = Some("15550000001@lid".parse().unwrap());
-        info.meta_info.target_id = Some("TARGET".to_owned());
+        info.meta_info.target_id = Some("TARGET".into());
         info.unavailable_request_id = Some("REQUEST".to_owned());
 
         let serialized = serde_json::to_value(info).expect("serialize message info");

@@ -3,6 +3,7 @@
 use super::*;
 use crate::client::{PhashWaiter, ResponseWaiter};
 use wacore::net::DisconnectReason;
+use wacore::stanza::wire_tags::StanzaTag;
 
 /// Non-error exits of [`Client::read_messages_loop`] — `ServerRecycle` keeps the
 /// routine reconnect path out of `Err`, so severity consumers (logs, the span's
@@ -67,9 +68,9 @@ fn from_jid_matches(
 /// reason.
 fn is_connection_critical(node: &wacore_binary::NodeRef<'_>) -> bool {
     matches!(
-        node.tag.as_ref(),
-        "success" | "failure" | "stream:error" | "ack"
-    ) || (node.tag.as_ref() == "iq" && is_ping_request(node))
+        StanzaTag::try_from(node.tag.as_ref()),
+        Ok(StanzaTag::Success | StanzaTag::Failure | StanzaTag::StreamError | StanzaTag::Ack)
+    ) || (node.tag.as_ref() == StanzaTag::Iq.as_str() && is_ping_request(node))
 }
 
 /// A server-initiated ping, which this client owes a pong.
@@ -352,7 +353,7 @@ impl Client {
     ) {
         // ACKs need shared ownership only for opt-in raw/node observers. The
         // usual response-waiter path borrows the node and can skip the Arc.
-        if node.tag() == "ack"
+        if node.tag() == StanzaTag::Ack.as_str()
             && !self.raw_node_forwarding_enabled()
             && self.node_waiter_count.load(Ordering::Acquire) == 0
             && !self.offline_sync_metrics.active.load(Ordering::Acquire)
@@ -378,7 +379,7 @@ impl Client {
         let nr = node.get();
 
         // --- Offline Sync Tracking ---
-        if nr.tag.as_ref() == "ib" {
+        if nr.tag.as_ref() == StanzaTag::InfoBanner.as_str() {
             // Check for offline_preview child to get expected count
             if let Some(preview) = nr.get_optional_child("offline_preview") {
                 let count: usize = preview
@@ -468,7 +469,7 @@ impl Client {
         }
         // --- End Tracking ---
 
-        if nr.tag.as_ref() == "iq"
+        if nr.tag.as_ref() == StanzaTag::Iq.as_str()
             && let Some(sync_node) = nr.get_optional_child("sync")
             && let Some(collection_node) = sync_node.get_optional_child("collection")
         {
@@ -490,7 +491,7 @@ impl Client {
                 .dispatch(Event::RawNode(Arc::clone(&node)));
         }
 
-        if nr.tag.as_ref() == "xmlstreamend" {
+        if nr.tag.as_ref() == StanzaTag::XmlStreamEnd.as_str() {
             if self.expected_disconnect.load(Ordering::Relaxed) {
                 debug!("Received <xmlstreamend/>, expected disconnect.");
             } else {
@@ -507,7 +508,7 @@ impl Client {
             self.resolve_node_waiters(&node);
         }
 
-        if nr.tag.as_ref() == "iq"
+        if nr.tag.as_ref() == StanzaTag::Iq.as_str()
             && let Some(id) = nr.get_attr("id").map(|v| v.as_str())
             && let Some(waiter) = self.response_waiters_guard().remove(id.as_ref())
         {
@@ -515,8 +516,7 @@ impl Client {
             // message ids), so a mismatch here means the id space collided.
             match waiter {
                 ResponseWaiter::Iq(sender) => {
-                    #[cfg(feature = "voip-runtime")]
-                    self.bind_pending_call_link_join_ack(nr);
+                    subsystem::on_response(self, nr);
                     if sender.send(Arc::clone(&node)).is_err() {
                         warn!(target: "Client/IQ", "Failed to send IQ response to waiter. Receiver was likely dropped.");
                     }
@@ -575,13 +575,13 @@ impl Client {
         // Bypass async_trait's boxed future for the hot built-in handlers while
         // retaining router registration for direct router callers.
         match nr.tag.as_ref() {
-            "ack" => {
+            t if t == StanzaTag::Ack.as_str() => {
                 self.handle_ack_response_arc(&node);
             }
-            "receipt" => {
+            t if t == StanzaTag::Receipt.as_str() => {
                 self.handle_receipt_inline(node);
             }
-            "message" => {
+            t if t == StanzaTag::Message.as_str() => {
                 crate::handlers::message::MessageHandler::handle_inline(
                     self.clone(),
                     node,
@@ -591,7 +591,7 @@ impl Client {
             }
             // Differs from a `<message>` only in tag, so WA Web retags it and
             // runs the same pipeline.
-            "status" if is_status_broadcast_stanza(nr) => {
+            t if t == StanzaTag::Status.as_str() && is_status_broadcast_stanza(nr) => {
                 crate::handlers::message::MessageHandler::handle_inline(
                     self.clone(),
                     node,
@@ -646,10 +646,16 @@ impl Client {
     /// enqueue could put a group message ahead of the pkmsg that establishes its
     /// session. Acks and receipts qualify only while nothing observes them.
     pub(crate) fn processes_inline(&self, node: &wacore_binary::NodeRef<'_>) -> bool {
-        match node.tag.as_ref() {
-            "success" | "failure" | "stream:error" | "message" | "ib" => true,
-            "status" => is_status_broadcast_stanza(node),
-            "receipt" => {
+        match StanzaTag::try_from(node.tag.as_ref()) {
+            Ok(
+                StanzaTag::Success
+                | StanzaTag::Failure
+                | StanzaTag::StreamError
+                | StanzaTag::Message
+                | StanzaTag::InfoBanner,
+            ) => true,
+            Ok(StanzaTag::Status) => is_status_broadcast_stanza(node),
+            Ok(StanzaTag::Receipt) => {
                 !self.synchronous_ack
                     && !self.raw_node_forwarding_enabled()
                     && !self
@@ -657,7 +663,7 @@ impl Client {
                         .event_bus
                         .has_handler_for(wacore::types::events::EventKind::Receipt)
             }
-            "ack" => {
+            Ok(StanzaTag::Ack) => {
                 !self.raw_node_forwarding_enabled()
                     && !self
                         .core
@@ -696,7 +702,7 @@ impl Client {
     /// would redeliver indefinitely. WA Web emits `<receipt context="status">`
     /// in the success path on top of this; the duplicate is tolerated.
     pub(crate) fn should_ack(&self, node: &wacore_binary::NodeRef<'_>) -> bool {
-        let tag = node.tag.as_ref();
+        let tag = StanzaTag::try_from(node.tag.as_ref());
         if node.get_attr("id").is_none() {
             return false;
         }
@@ -704,9 +710,11 @@ impl Client {
             return false;
         }
         match tag {
-            "receipt" | "notification" | "call" => true,
-            "message" => from_jid_matches(node, |j| j.is_newsletter() || j.is_status_broadcast()),
-            "status" => is_status_broadcast_stanza(node),
+            Ok(StanzaTag::Receipt | StanzaTag::Notification | StanzaTag::Call) => true,
+            Ok(StanzaTag::Message) => {
+                from_jid_matches(node, |j| j.is_newsletter() || j.is_status_broadcast())
+            }
+            Ok(StanzaTag::Status) => is_status_broadcast_stanza(node),
             _ => false,
         }
     }
@@ -1579,13 +1587,13 @@ impl Client {
         self: &Arc<Self>,
         node: &Arc<wacore_binary::OwnedNodeRef>,
     ) -> bool {
+        self.maybe_refresh_lid_from_ack(node.get());
         let Some(waiter) = self.take_ack_waiter(node.get()) else {
             return false;
         };
         match waiter {
             ResponseWaiter::Iq(sender) => {
-                #[cfg(feature = "voip-runtime")]
-                self.bind_pending_call_link_join_ack(node.get());
+                subsystem::on_response(self, node.get());
                 if let Err(rejected) = sender.send(Arc::clone(node)) {
                     Self::warn_ack_waiter_dropped(&rejected);
                 }
@@ -1602,13 +1610,13 @@ impl Client {
         self: &Arc<Self>,
         node: wacore_binary::OwnedNodeRef,
     ) -> bool {
+        self.maybe_refresh_lid_from_ack(node.get());
         let Some(waiter) = self.take_ack_waiter(node.get()) else {
             return false;
         };
         match waiter {
             ResponseWaiter::Iq(sender) => {
-                #[cfg(feature = "voip-runtime")]
-                self.bind_pending_call_link_join_ack(node.get());
+                subsystem::on_response(self, node.get());
                 if let Err(rejected) = sender.send(Arc::new(node)) {
                     Self::warn_ack_waiter_dropped(&rejected);
                 }
@@ -1616,6 +1624,37 @@ impl Client {
             ResponseWaiter::Phash(waiter) => self.check_phash_against_ack(node.get(), waiter),
         }
         true
+    }
+
+    /// `<ack refresh_lid="true">`: the server telling us the LID mapping we hold
+    /// for this peer is stale.
+    ///
+    /// It is the only invalidation this client gets. `lid_pn_cache` entries
+    /// never expire, so without acting here a mapping that has gone stale stays
+    /// stale for the lifetime of the process, and every Signal address derived
+    /// from it keeps resolving to the wrong identity.
+    ///
+    /// Both ack entry points call this before taking the waiter, because a send
+    /// ack carries the flag whether or not anything is waiting on it.
+    fn maybe_refresh_lid_from_ack(self: &Arc<Self>, node: &wacore_binary::NodeRef<'_>) {
+        let Some(peer) = Self::refresh_lid_peer_from_ack(node) else {
+            return;
+        };
+        let client = Arc::clone(self);
+        self.runtime.spawn_detached(Box::pin(async move {
+            client.refresh_lid_mapping_for(peer).await;
+        }));
+    }
+
+    /// The peer an `<ack>` asks us to re-resolve, or `None` when it asks for
+    /// nothing. Split out from the spawn so the gate can be asserted directly.
+    fn refresh_lid_peer_from_ack(node: &wacore_binary::NodeRef<'_>) -> Option<Jid> {
+        // Absent on all but a handful of acks, so the common path is one failed
+        // attribute lookup on the read loop and nothing else.
+        if node.get_attr("refresh_lid")?.as_str() != "true" {
+            return None;
+        }
+        node.attrs().optional_jid("from")
     }
 
     /// Inline half of the phash check. The comparison is a string equality on
@@ -2033,5 +2072,58 @@ impl Client {
 
     pub(crate) fn update_server_time_offset(&self, node: &wacore_binary::NodeRef<'_>) {
         self.unified_session.update_server_time_offset(node);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ack(attrs: &[(&'static str, &str)]) -> Node {
+        attrs
+            .iter()
+            .fold(NodeBuilder::new("ack"), |b, (k, v)| b.attr(k, *v))
+            .build()
+    }
+
+    /// The flag is what asks for a refresh. Every other ack -- which is nearly
+    /// all of them -- must cost nothing beyond the attribute lookup.
+    #[test]
+    fn an_ack_without_the_flag_asks_for_no_refresh() {
+        for attrs in [
+            &[("from", "5511987650001@s.whatsapp.net")][..],
+            &[
+                ("from", "5511987650001@s.whatsapp.net"),
+                ("refresh_lid", "false"),
+            ][..],
+        ] {
+            let node = ack(attrs);
+            assert!(
+                Client::refresh_lid_peer_from_ack(&node.as_node_ref()).is_none(),
+                "{attrs:?} must not request a refresh"
+            );
+        }
+    }
+
+    /// The peer to re-resolve is the ack's sender, not the local device: the
+    /// server is telling us which mapping it disagrees with.
+    #[test]
+    fn a_flagged_ack_names_its_sender_as_the_peer() {
+        let node = ack(&[
+            ("from", "111000011112222@lid"),
+            ("refresh_lid", "true"),
+            ("id", "ACK-REFRESH-1"),
+        ]);
+        assert_eq!(
+            Client::refresh_lid_peer_from_ack(&node.as_node_ref()),
+            Some(Jid::new("111000011112222", wacore_binary::Server::Lid)),
+        );
+    }
+
+    /// A flag with no sender names nobody to refresh.
+    #[test]
+    fn a_flagged_ack_without_a_sender_asks_for_no_refresh() {
+        let node = ack(&[("refresh_lid", "true"), ("id", "ACK-REFRESH-2")]);
+        assert!(Client::refresh_lid_peer_from_ack(&node.as_node_ref()).is_none());
     }
 }

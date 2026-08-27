@@ -20,7 +20,8 @@ mod node_io;
 pub(crate) mod offline_resume;
 mod sender_keys;
 mod sessions;
-mod voip;
+pub(crate) mod subsystem;
+pub(crate) mod voip;
 use builder::{ClientAssembly, ClientExtensions};
 pub use builder::{ClientBuild, ClientBuilder, ClientBuilderError};
 pub(crate) use device_memo_stats::{
@@ -32,7 +33,7 @@ use extension_lifecycle::LifecycleRegistration;
 #[cfg(feature = "client-lifecycle")]
 #[cfg_attr(docsrs, doc(cfg(feature = "client-lifecycle")))]
 pub use extension_lifecycle::{ClientLifecycle, ConnectionScope, ConnectionScopeState};
-pub use lifecycle::Connection;
+pub use lifecycle::{Connection, Reachability};
 pub use voip::{CallError, Voip};
 
 use crate::cache::Cache;
@@ -70,6 +71,7 @@ use wacore_binary::Jid;
 use portable_atomic::{AtomicI64, AtomicU64};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use wacore::stanza::wire_tags::{NotificationType, StanzaTag};
 
 /// Lease that keeps decrypted-payload events enabled for one consumer.
 ///
@@ -430,6 +432,8 @@ pub struct MemoryReport {
     pub dm_devices_memo: CollectionStats,
     pub message_retry_counts: u64,
     pub undecryptable_dispatched: u64,
+    /// Entries in the dispatch-once gate for decrypted messages.
+    pub dispatched_messages: u64,
     pub pdo_pending_requests: u64,
     pub pdo_requested: u64,
     /// Queued/running history-sync tasks and their logical compressed-payload
@@ -471,6 +475,10 @@ pub struct MemoryReport {
     pub pending_device_sync: usize,
     // -- Capacity-only caches (coordination, counts only) --
     pub session_locks: u64,
+    /// Addresses with a session establishment in flight; normally zero.
+    pub ensure_inflight: u64,
+    /// Groups with a metadata query in flight; normally zero.
+    pub group_metadata_inflight: u64,
     pub chat_lanes: u64,
     pub group_distribution_locks: u64,
     /// Cumulative capacity evictions; poll successive reports to derive a rate.
@@ -496,6 +504,10 @@ pub struct MemoryReport {
     /// [`Self::node_waiters`]. Each retains a filter and a oneshot sender.
     pub sent_node_waiters: usize,
     pub pending_retries: usize,
+    /// Numbers with a `refresh_lid` re-resolve in flight. Bounded by the
+    /// number of distinct peers acked at once; a value that stays high
+    /// means refreshes are not completing, not that many were requested.
+    pub pending_lid_refreshes: usize,
     pub presence_subscriptions: usize,
     pub app_state_key_requests: usize,
     /// Expanded app-state keys the processor holds in memory. No capacity cap
@@ -507,16 +519,11 @@ pub struct MemoryReport {
     pub signal_sessions: CollectionStats,
     pub signal_identities: CollectionStats,
     pub signal_sender_keys: CollectionStats,
-    /// Admission snapshots retained while a call-link join ACK is in flight.
-    #[cfg(feature = "voip-runtime")]
-    pub pending_call_link_updates: CollectionStats,
-    /// Active/ringing calls and bounded pre-offer group controls, including their snapshots/queues.
-    #[cfg(feature = "voip-runtime")]
-    pub active_calls: CollectionStats,
-    /// Outgoing calls parked until the server sends the relay that owns them.
-    /// Each entry retains the material needed to spawn one media engine.
-    #[cfg(feature = "voip-runtime")]
-    pub pending_outgoing_calls: u64,
+    /// What the optional subsystems attached to this build retain. Empty when
+    /// none is attached. One field rather than a `cfg`'d field per subsystem,
+    /// so the report has one shape whatever was compiled; see
+    /// `agent_docs/subsystem_boundary.md`.
+    pub subsystems: Vec<SubsystemMemory>,
     #[cfg(feature = "plugins")]
     pub plugins: u64,
     #[cfg(feature = "plugins")]
@@ -547,6 +554,42 @@ pub struct MemoryReport {
     pub stanza_interceptors: usize,
 }
 
+/// Names one collection an attached subsystem reports.
+///
+/// A subsystem exports these as constants (see `voip::collections`), so looking
+/// a figure up in [`MemoryReport`] is a name the compiler checks rather than two
+/// string literals a caller has to spell the way the report happens to print
+/// them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubsystemCollection {
+    pub subsystem: &'static str,
+    pub collection: &'static str,
+}
+
+impl SubsystemCollection {
+    pub const fn new(subsystem: &'static str, collection: &'static str) -> Self {
+        Self {
+            subsystem,
+            collection,
+        }
+    }
+}
+
+/// One collection an attached subsystem retains, as `MemoryReport` carries it.
+///
+/// The subsystem and the collection stay separate fields rather than one fused
+/// display string, so a caller looks a figure up by what it is instead of by
+/// how the report happens to print it.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct SubsystemMemory {
+    /// The subsystem that reported it, e.g. `"voip"`.
+    pub subsystem: &'static str,
+    /// The collection within that subsystem, e.g. `"active_calls"`.
+    pub collection: &'static str,
+    pub stats: CollectionStats,
+}
+
 impl MemoryReport {
     /// Common byte-carrying collections used by both totals and `Display`.
     /// Feature-specific collections stay beside their gated report section.
@@ -568,13 +611,23 @@ impl MemoryReport {
         ]
     }
 
+    /// One collection of one attached subsystem. `None` when that subsystem is
+    /// not attached to this build, or does not report that collection.
+    pub fn subsystem(&self, which: SubsystemCollection) -> Option<CollectionStats> {
+        self.subsystems
+            .iter()
+            .find(|retained| {
+                retained.subsystem == which.subsystem && retained.collection == which.collection
+            })
+            .map(|retained| retained.stats)
+    }
+
     /// Sum of every estimated byte figure in the report.
     pub fn total_estimated_bytes(&self) -> u64 {
         let total: u64 = self.collections().iter().map(|(_, c)| c.bytes).sum();
-        #[cfg(feature = "voip-runtime")]
-        let total = total
-            .saturating_add(self.pending_call_link_updates.bytes)
-            .saturating_add(self.active_calls.bytes);
+        let total = self.subsystems.iter().fold(total, |sum, retained| {
+            sum.saturating_add(retained.stats.bytes)
+        });
         #[cfg(feature = "plugins")]
         let total = total.saturating_add(self.plugin_event_queue.bytes);
         total
@@ -611,10 +664,17 @@ impl std::fmt::Display for MemoryReport {
             "  undec_dispatched:       {}",
             self.undecryptable_dispatched
         )?;
+        writeln!(f, "  dispatched_messages:    {}", self.dispatched_messages)?;
         writeln!(f, "  pdo_pending_requests:   {}", self.pdo_pending_requests)?;
         writeln!(f, "  pdo_requested:          {}", self.pdo_requested)?;
         writeln!(f, "--- Capacity-only caches ---")?;
         writeln!(f, "  session_locks:          {}", self.session_locks)?;
+        writeln!(f, "  ensure_inflight:        {}", self.ensure_inflight)?;
+        writeln!(
+            f,
+            "  group_metadata_inflight:{}",
+            self.group_metadata_inflight
+        )?;
         writeln!(f, "  chat_lanes:             {}", self.chat_lanes)?;
         writeln!(
             f,
@@ -647,6 +707,11 @@ impl std::fmt::Display for MemoryReport {
         writeln!(f, "  pending_retries:        {}", self.pending_retries)?;
         writeln!(
             f,
+            "  pending_lid_refreshes:  {}",
+            self.pending_lid_refreshes
+        )?;
+        writeln!(
+            f,
             "  presence_subscriptions: {}",
             self.presence_subscriptions
         )?;
@@ -661,16 +726,12 @@ impl std::fmt::Display for MemoryReport {
         for (name, c) in &collections[TTL_BOUNDED..TTL_BOUNDED + SIGNAL_CACHES] {
             line(f, name, c)?;
         }
-        #[cfg(feature = "voip-runtime")]
-        {
-            writeln!(f, "--- VoIP state ---")?;
-            line(f, "pending_link_updates:", &self.pending_call_link_updates)?;
-            line(f, "active_calls:", &self.active_calls)?;
-            writeln!(
-                f,
-                "  pending_outgoing_calls: {}",
-                self.pending_outgoing_calls
-            )?;
+        if !self.subsystems.is_empty() {
+            writeln!(f, "--- Optional subsystems ---")?;
+            for retained in &self.subsystems {
+                let name = format!("{} {}:", retained.subsystem, retained.collection);
+                line(f, &name, &retained.stats)?;
+            }
         }
         writeln!(f, "--- In-flight history sync ---")?;
         line(f, collections[HISTORY_SYNC].0, &self.history_sync_tasks)?;
@@ -1267,6 +1328,29 @@ pub struct Client {
     /// to match the SignalProtocolStoreAdapter's internal locking.
     pub(crate) session_locks: Cache<String, Arc<Mutex<()>>>,
 
+    /// Addresses whose session establishment is already in flight, so a
+    /// concurrent caller waits on it instead of fetching the same bundle again.
+    ///
+    /// An existence probe before the fetch cannot do this on its own: it answers
+    /// before the IQ goes out, so every caller in a burst reads the same "no
+    /// session" and every one of them fetches. Each answered bundle is then
+    /// installed over the last, retiring a session the peer may still be
+    /// encrypting under, and each fetch burns one of the peer's one-time
+    /// prekeys. WA Web keeps the same registration in
+    /// `WAWebManageE2ESessionsJob` (a module-level wid -> promise map, cleared
+    /// in a `finally`).
+    ///
+    /// Holds only what is in flight — normally empty — so it is a plain map
+    /// rather than a capacity-bounded cache.
+    pub(crate) ensure_inflight: Arc<sessions::EnsureRegistry>,
+
+    /// Group-metadata queries in flight, so a burst of callers for one group
+    /// shares a single round trip. See [`GroupMetadataRegistry`] for why only
+    /// `get_metadata` needs it.
+    ///
+    /// [`GroupMetadataRegistry`]: crate::features::GroupMetadataRegistry
+    pub(crate) group_metadata_inflight: Arc<crate::features::GroupMetadataRegistry>,
+
     /// Per-chat lane combining enqueue lock + message queue into a single cached entry.
     /// One cache lookup instead of two per incoming message.
     pub(crate) chat_lanes: Cache<Jid, ChatLane>,
@@ -1301,6 +1385,15 @@ pub struct Client {
 
     pub(crate) pending_retries: Arc<std::sync::Mutex<HashSet<String>>>,
 
+    /// Identities with a `refresh_lid` re-resolve in flight, keyed by
+    /// `(connection_generation, PN-side JID)`. A burst of sends to one stale
+    /// peer is acked one message at a time, and every one of those acks carries
+    /// the flag, so without this the same query would go out once per ack while
+    /// the first is still pending. The generation scopes a reservation to the
+    /// connection that took it, so a refresh left parked on a dead socket
+    /// cannot suppress the next connection's.
+    pub(crate) pending_lid_refreshes: Arc<std::sync::Mutex<HashSet<(u64, String)>>>,
+
     /// Track retry attempts per message to prevent infinite retry loops.
     /// Key: "{chat}:{msg_id}:{sender}", Value: retry count plus the most
     /// recent `RetryReason` we attached, fused so the decrypt-failure path
@@ -1330,7 +1423,17 @@ pub struct Client {
     /// failed id re-enters the failure path and would otherwise fire a
     /// duplicate event. Mirrors WA Web's DB-level placeholder uniqueness
     /// in `WAWebMessageProcessPlaceholder`.
-    pub(crate) undecryptable_dispatched: Cache<ChatMessageId, ()>,
+    pub(crate) undecryptable_dispatched: Cache<wacore::types::message::SenderMessageId, ()>,
+
+    /// Dispatch-once gate for a decrypted message. A sender retrying its own
+    /// outbox resends one id as fresh ciphertext on a new ratchet iteration,
+    /// which decrypts as new traffic, so only message identity can collapse it.
+    pub(crate) dispatched_messages: Cache<wacore::types::message::SenderMessageId, ()>,
+
+    /// Lifetime count of resent messages this gate kept from reaching
+    /// consumers. Client-level, so it survives reconnects: the sender's retry
+    /// window does not end because our socket did.
+    pub(crate) duplicate_dispatch_suppressed: AtomicU64,
 
     pub enable_auto_reconnect: Arc<AtomicBool>,
     /// Set by [`Client::pause`] and cleared by [`Client::resume`]: the run loop
@@ -1492,14 +1595,11 @@ pub struct Client {
     /// Tracks the pending pair code request and ephemeral keys.
     pub(crate) pair_code_state: Arc<Mutex<wacore::pair_code::PairCodeState>>,
 
-    /// SHORTCAKE_PASSKEY linking flow state: the pending handoff key, the
-    /// per-attempt ephemeral linking cache, and the optional host authenticator.
-    pub(crate) passkey_state: Arc<Mutex<crate::passkey::flow::PasskeyFlowState>>,
-
-    /// Wait-free "an open is in flight" reservation for the passkey flow. Kept
-    /// outside `passkey_state` so it can be released synchronously on drop (a
-    /// cancelled open can't leave it stuck), unlike a flag behind the async lock.
-    pub(crate) passkey_opening: AtomicBool,
+    /// Per-client state of every optional subsystem attached to this build,
+    /// each under its own type, in one field rather than one field per
+    /// subsystem. Empty, and zero-sized, in a build with none attached; see
+    /// `agent_docs/subsystem_boundary.md`.
+    pub(crate) subsystems: subsystem::Subsystems,
 
     /// Custom handlers for encrypted message types. Set once at `Bot::build` and
     /// immutable afterward, so the receive hot path reads it with a plain
@@ -1538,7 +1638,12 @@ pub struct Client {
     /// request per message, no matter how many times the server redelivers
     /// the undecryptable original. Entries are dropped on send failure so a
     /// transient error does not block the next attempt.
-    pub(crate) pdo_requested: Cache<ChatMessageId, ()>,
+    ///
+    /// Keyed with the sender, unlike [`Self::pdo_pending_requests`]. This one
+    /// is a purely local gate that never has to agree with anything the phone
+    /// sends back, so it can name the message precisely; the pending map has
+    /// to match a response and keeps the key the phone answers with.
+    pub(crate) pdo_requested: Cache<wacore::types::message::SenderMessageId, ()>,
 
     /// LRU cache for device registry (matches WhatsApp Web's 5000 entry limit).
     /// Maps user ID to DeviceListRecord for fast device existence checks.
@@ -1693,38 +1798,6 @@ pub struct Client {
     /// are registered.
     stanza_interceptor_count: AtomicUsize,
     next_interceptor_id: AtomicU64,
-
-    /// Active VoIP calls and their media-task abort handles. `abort_all` runs from the
-    /// connection-cleanup path so a disconnect/reconnect tears down every in-flight call. Behind the
-    /// `voip` feature: it is populated only by the `voip` media facade.
-    #[cfg(feature = "voip-runtime")]
-    pub(crate) call_registry: Arc<wacore::voip::CallRegistry>,
-
-    /// Admission snapshots that can race a call-link join ACK before its call id is registered.
-    /// Kept beside the client-side join lifecycle so `wacore` does not authorize unknown calls.
-    #[cfg(feature = "voip-runtime")]
-    pending_call_link_joins: Arc<std::sync::Mutex<voip::PendingCallLinkJoins>>,
-
-    /// Serializes call-link joins until the ACK reveals which call id owns any admission state
-    /// buffered during the request. This keeps a bounded overflow tied to one join instead of
-    /// letting it reject an unrelated concurrent join.
-    #[cfg(feature = "voip-runtime")]
-    pending_call_link_join_lane: Arc<Mutex<()>>,
-
-    /// Serializes incoming-answer registration with generation-aware teardown. A failed answer holds
-    /// its call-id lane until `<terminate>` has been written, so a same-call-id re-offer cannot become
-    /// current in the removal-before-send window. Stripes bound storage while allowing independent
-    /// lanes to progress concurrently.
-    #[cfg(feature = "voip-runtime")]
-    pub(crate) answer_transition_locks: [Arc<Mutex<()>>; 16],
-
-    /// Outgoing calls awaiting their relay. The initiator's relay is not in the offer; it arrives
-    /// from the server AFTER the offer (live-only), so each `voip().call()` parks the material needed
-    /// to spawn the engine here, keyed by call-id, until a `<call>` carrying a `<relay>` for that id
-    /// arrives. Behind the `voip` feature; populated only by the media facade.
-    #[cfg(feature = "voip-runtime")]
-    pub(crate) pending_outgoing_calls:
-        Arc<std::sync::Mutex<HashMap<String, crate::voip::facade::PendingOutgoing>>>,
 }
 
 /// Builds a pong response node for a server-initiated ping.
@@ -1771,7 +1844,8 @@ fn ack_participant<'node, 'data>(
         .filter(|participant| match policy {
             AckParticipantPolicy::Preserve => true,
             AckParticipantPolicy::OmitReceiptDestinationDuplicate => {
-                node.tag != "receipt" || !value_refs_display_equal(participant, from)
+                node.tag != StanzaTag::Receipt.as_str()
+                    || !value_refs_display_equal(participant, from)
             }
         })
 }
@@ -1815,7 +1889,7 @@ fn encode_ack_bytes(
     };
 
     // WA Web stamps the own device JID for both classes.
-    let own_device_pn = if tag == "message" || tag == "status" {
+    let own_device_pn = if tag == StanzaTag::Message.as_str() || tag == StanzaTag::Status.as_str() {
         Some(own_device_pn.ok_or(crate::features::StanzaResponseError::MissingLocalIdentity)?)
     } else {
         None
@@ -1948,7 +2022,7 @@ fn build_ack_node(node: &wacore_binary::NodeRef<'_>, own_device_pn: Option<&Jid>
     attrs.insert("class", NodeValue::from(tag));
     attrs.insert("id", id);
     attrs.insert("to", from);
-    if tag == "message"
+    if tag == StanzaTag::Message.as_str()
         && let Some(own_device_pn) = own_device_pn
     {
         attrs.insert("from", NodeValue::Jid(own_device_pn.clone()));
@@ -1971,10 +2045,10 @@ fn build_ack_node(node: &wacore_binary::NodeRef<'_>, own_device_pn: Option<&Jid>
 
 /// WA Web omits `type` when ACKing `<notification type="encrypt"><identity/></notification>`.
 fn is_encrypt_identity_notification(node: &wacore_binary::NodeRef<'_>) -> bool {
-    node.tag == "notification"
+    node.tag == StanzaTag::Notification.as_str()
         && node
             .get_attr("type")
-            .is_some_and(|value| value == "encrypt")
+            .is_some_and(|value| value == NotificationType::Encrypt.as_str())
         && node.get_optional_child("identity").is_some()
 }
 

@@ -9,6 +9,7 @@ use wacore::types::message::MessageCategory;
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::{Jid, JidExt as _, NodeRef, NodeValue};
 
+use wacore::stanza::wire_tags::StanzaTag;
 use wacore_binary::OwnedNodeRef;
 
 /// Max message ids per read/played `<receipt>` stanza. WA Web's
@@ -421,7 +422,10 @@ trait NackSource {
 impl NackSource for NodeRef<'_> {
     fn class(&self, reason: NackReason) -> Result<&str, crate::features::StanzaResponseError> {
         if reason == NackReason::UnrecognizedStanza
-            || matches!(self.tag.as_ref(), "message" | "notification" | "receipt")
+            || matches!(
+                StanzaTag::try_from(self.tag.as_ref()),
+                Ok(StanzaTag::Message | StanzaTag::Notification | StanzaTag::Receipt)
+            )
         {
             Ok(self.tag.as_ref())
         } else {
@@ -596,9 +600,12 @@ impl Client {
         if let Some(part_node) = nr.get_optional_child("participants") {
             let (agg_msg_id, agg_key, users) =
                 wacore::stanza::receipt::parse_participants(part_node);
-            let fan_out_id = agg_msg_id
-                .clone()
-                .or_else(|| agg_key.clone())
+            // The event's `message_ids` are `String`, so the borrowed compact id
+            // is widened once here instead of cloning both candidates first.
+            let fan_out_id: String = agg_msg_id
+                .as_deref()
+                .or(agg_key.as_deref())
+                .map(String::from)
                 .unwrap_or_else(|| stanza_id.clone());
             debug!(
                 "Aggregated receipt from {}: stanza={stanza_id} \

@@ -5988,3 +5988,1170 @@ async fn send_raw_bytes_refuses_a_payload_without_its_format_byte() {
         .expect("installed socket");
     assert_eq!(transport.sent().len(), 1);
 }
+
+/// Concurrent `ensure_e2e_sessions` for one address.
+///
+/// Production shape (offline-sync drain): a burst of undecryptable group
+/// messages from one peer emits one PDO placeholder resend per message, and
+/// each of those ensures a session with that same peer. Nine identical
+/// `<iq><key>` requests went out in 130 ms, and the five bundles that came back
+/// were each installed over the last.
+#[cfg(test)]
+mod ensure_sessions_concurrency {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use wacore::libsignal::protocol::{IdentityKeyPair, KeyPair, SessionRecord};
+    use wacore::types::jid::JidExt;
+    use wacore_binary::builder::NodeBuilder;
+    use wacore_binary::{Jid, Node};
+
+    const CONCURRENT_CALLS: usize = 6;
+
+    /// One peer identity, reused across every bundle a test hands out, so each
+    /// response is a legitimate answer for the same address rather than a
+    /// different peer wearing the same jid.
+    struct PeerKeys {
+        identity: IdentityKeyPair,
+        signed: KeyPair,
+        signature: Vec<u8>,
+    }
+
+    impl PeerKeys {
+        fn generate() -> Self {
+            let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+            let identity = IdentityKeyPair::generate(&mut rng);
+            let signed = KeyPair::generate(&mut rng);
+            // `process_prekey_bundle` verifies this signature, so a filler byte
+            // pattern would fail before the behaviour under test is reached.
+            let signature = identity
+                .private_key()
+                .calculate_signature(&signed.public_key.serialize(), &mut rng)
+                .expect("signature over the signed prekey")
+                .to_vec();
+            Self {
+                identity,
+                signed,
+                signature,
+            }
+        }
+
+        /// A `<user>` bundle response. The one-time prekey id varies per call,
+        /// as the server's does: each fetch burns one of the peer's prekeys.
+        fn bundle_response(&self, jid: &Jid, request_id: &str, one_time_id: u32) -> Node {
+            let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+            let one_time = KeyPair::generate(&mut rng);
+            let id_bytes = |id: u32| id.to_be_bytes()[1..].to_vec();
+
+            NodeBuilder::new("iq")
+                .attr("type", "result")
+                .attr("from", "s.whatsapp.net")
+                .attr("id", request_id)
+                .children([NodeBuilder::new("list")
+                    .children([NodeBuilder::new("user")
+                        .attr("jid", jid.to_string())
+                        .children([
+                            NodeBuilder::new("registration")
+                                .bytes(1234u32.to_be_bytes().to_vec())
+                                .build(),
+                            NodeBuilder::new("type").bytes(vec![5]).build(),
+                            NodeBuilder::new("identity")
+                                .bytes(self.identity.public_key().public_key_bytes().to_vec())
+                                .build(),
+                            NodeBuilder::new("skey")
+                                .children([
+                                    NodeBuilder::new("id").bytes(id_bytes(1)).build(),
+                                    NodeBuilder::new("value")
+                                        .bytes(self.signed.public_key.public_key_bytes().to_vec())
+                                        .build(),
+                                    NodeBuilder::new("signature")
+                                        .bytes(self.signature.clone())
+                                        .build(),
+                                ])
+                                .build(),
+                            NodeBuilder::new("key")
+                                .children([
+                                    NodeBuilder::new("id").bytes(id_bytes(one_time_id)).build(),
+                                    NodeBuilder::new("value")
+                                        .bytes(one_time.public_key.public_key_bytes().to_vec())
+                                        .build(),
+                                ])
+                                .build(),
+                        ])
+                        .build()])
+                    .build()])
+                .build()
+        }
+    }
+
+    /// Runs `CONCURRENT_CALLS` ensures for `peer` while answering every prekey
+    /// IQ the client writes, and reports how many it had to answer.
+    ///
+    /// Frames are read by index because `decode_sent_iq` decrypts each one
+    /// under the counter its position implies.
+    async fn ensure_concurrently(
+        client: &Arc<Client>,
+        transport: &Arc<crate::transport::mock::CapturingMockTransport>,
+        peer: &Jid,
+    ) -> usize {
+        let keys = PeerKeys::generate();
+
+        let done = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::with_capacity(CONCURRENT_CALLS);
+        for _ in 0..CONCURRENT_CALLS {
+            let client = client.clone();
+            let peer = peer.clone();
+            let done = done.clone();
+            tasks.push(tokio::spawn(async move {
+                let result = client
+                    .ensure_e2e_sessions_resolved(std::slice::from_ref(&peer))
+                    .await;
+                done.fetch_add(1, Ordering::Release);
+                result
+            }));
+        }
+
+        let mut next_frame = 0usize;
+        let mut served = 0usize;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut timed_out = false;
+        while done.load(Ordering::Acquire) < CONCURRENT_CALLS {
+            if tokio::time::Instant::now() >= deadline {
+                timed_out = true;
+                break;
+            }
+            if transport.sent().len() <= next_frame {
+                tokio::task::yield_now().await;
+                continue;
+            }
+            let node = crate::test_utils::decode_sent_iq(transport, next_frame).await;
+            next_frame += 1;
+
+            let node_ref = node.get();
+            if node_ref.tag != "iq" || node_ref.get_optional_child("key").is_none() {
+                continue;
+            }
+            let request_id = node_ref
+                .attrs()
+                .optional_string("id")
+                .expect("an IQ carries an id")
+                .to_string();
+            served += 1;
+            let response = keys.bundle_response(peer, &request_id, 100 + served as u32);
+            crate::test_utils::answer_iq(client, &request_id, &response).await;
+        }
+
+        // Reported before the results are checked: a timeout would otherwise
+        // surface as a fetch count of zero, which reads like a coalescing
+        // regression rather than a hang.
+        assert!(
+            !timed_out,
+            "the ensures did not finish in time; served {served} prekey fetch(es)"
+        );
+        for task in tasks {
+            task.await
+                .expect("ensure task should not panic")
+                .expect("every ensure must succeed once the bundle arrives");
+        }
+        served
+    }
+
+    /// The request id of the prekey IQ at `index`, once it reaches the wire.
+    ///
+    /// Frames are addressed by index because `decode_sent_iq` decrypts each one
+    /// under the counter its position implies.
+    async fn pending_prekey_request(
+        transport: &Arc<crate::transport::mock::CapturingMockTransport>,
+        index: usize,
+    ) -> String {
+        let node = crate::test_utils::decode_sent_iq(transport, index).await;
+        let node_ref = node.get();
+        assert!(
+            node_ref.tag == "iq" && node_ref.get_optional_child("key").is_some(),
+            "frame {index} should be a prekey fetch"
+        );
+        node_ref
+            .attrs()
+            .optional_string("id")
+            .expect("an IQ carries an id")
+            .to_string()
+    }
+
+    /// The jids a prekey fetch asks for, in wire order.
+    async fn fetch_targets(
+        transport: &Arc<crate::transport::mock::CapturingMockTransport>,
+        index: usize,
+    ) -> Vec<String> {
+        let node = crate::test_utils::decode_sent_iq(transport, index).await;
+        let node_ref = node.get();
+        node_ref
+            .get_optional_child("key")
+            .expect("a prekey fetch carries <key>")
+            .children()
+            .iter()
+            .flat_map(|children| children.iter())
+            .filter(|child| child.tag == "user")
+            .map(|child| {
+                child
+                    .attrs()
+                    .optional_string("jid")
+                    .expect("a <user> carries a jid")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// Give a spawned ensure the chance to reach its claim.
+    ///
+    /// The claim is taken synchronously right after an await that resolves
+    /// immediately on this client, so yielding is enough to get there. What
+    /// makes it observable is the frame count: a caller that failed to defer
+    /// would have put its own fetch on the wire, which the assertion after this
+    /// call catches.
+    async fn let_the_waiter_park(
+        transport: &Arc<crate::transport::mock::CapturingMockTransport>,
+        expected_frames: usize,
+    ) {
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            transport.sent().len(),
+            expected_frames,
+            "the second caller must defer to the claim in flight, not fetch"
+        );
+    }
+
+    /// A device the first chunk actually asked for.
+    ///
+    /// The probe runs `buffer_unordered`, so which devices land in which chunk
+    /// does not follow the order they were passed in. A test that assumed it
+    /// would put its waiter's address in the *second* chunk half the time.
+    async fn first_chunk_member(
+        transport: &Arc<crate::transport::mock::CapturingMockTransport>,
+        devices: &[Jid],
+    ) -> Jid {
+        let asked = fetch_targets(transport, 0).await;
+        devices
+            .iter()
+            .find(|jid| asked.contains(&jid.to_string()))
+            .cloned()
+            .expect("the first chunk asks for at least one of the devices")
+    }
+
+    /// How many prekey fetches reached the wire so far.
+    async fn prekey_requests(
+        transport: &Arc<crate::transport::mock::CapturingMockTransport>,
+    ) -> usize {
+        let total = transport.sent().len();
+        let mut fetches = 0;
+        for index in 0..total {
+            let node = crate::test_utils::decode_sent_iq(transport, index).await;
+            let node_ref = node.get();
+            if node_ref.tag == "iq" && node_ref.get_optional_child("key").is_some() {
+                fetches += 1;
+            }
+        }
+        fetches
+    }
+
+    /// The cause: one address, one fetch, however many callers ask at once.
+    ///
+    /// Every redundant fetch burns one of the peer's one-time prekeys, so the
+    /// cost of getting this wrong is paid on the other side of the wire too.
+    #[tokio::test]
+    async fn concurrent_ensure_for_one_address_fetches_prekeys_once() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let peer = Jid::lid_device("111111111111111".to_string(), 0);
+
+        let served = ensure_concurrently(&client, &transport, &peer).await;
+
+        assert_eq!(
+            served, 1,
+            "concurrent ensures for one address must share a single prekey fetch, \
+             not one per caller"
+        );
+    }
+
+    /// The damage: each installed bundle retires the state before it, so N
+    /// concurrent ensures leave N sessions where one belongs.
+    ///
+    /// Every retired state is a session the peer may still be encrypting under
+    /// and a candidate the decrypt path has to try; in production this is what
+    /// left one peer with five states and no usable one.
+    #[tokio::test]
+    async fn concurrent_ensure_leaves_exactly_one_session_state() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let peer = Jid::lid_device("222222222222222".to_string(), 0);
+
+        ensure_concurrently(&client, &transport, &peer).await;
+        client
+            .flush_signal_cache_batch_safe()
+            .await
+            .expect("flush the established session");
+
+        let address = peer.to_protocol_address();
+        let stored = client
+            .persistence_manager
+            .get_device_snapshot()
+            .backend
+            .get_session(address.as_str())
+            .await
+            .expect("session read")
+            .expect("concurrent ensures must establish a session");
+        let record = SessionRecord::deserialize(&stored).expect("stored session decodes");
+        let archived = record.previous_session_states().count();
+
+        assert_eq!(
+            archived, 0,
+            "concurrent ensures for one address must leave a single session state; \
+             each extra one is a bundle installed over a session that was already good"
+        );
+    }
+
+    /// A waiter whose leader failed must fetch for itself, not report a
+    /// session that was never established.
+    ///
+    /// Sharing the leader's outcome would be wrong here: a timeout on one
+    /// caller is not evidence about the address, and a waiter that swallowed it
+    /// would hand the send an address with no session behind it.
+    #[tokio::test]
+    async fn a_waiter_whose_leader_failed_establishes_the_session_itself() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let peer = Jid::lid_device("333333333333333".to_string(), 0);
+        let keys = PeerKeys::generate();
+
+        let leader = {
+            let client = client.clone();
+            let peer = peer.clone();
+            tokio::spawn(async move {
+                client
+                    .ensure_e2e_sessions_resolved(std::slice::from_ref(&peer))
+                    .await
+            })
+        };
+        // The claim is taken before the leader's first await, so its IQ
+        // reaching the wire means the address is registered.
+        let leader_id = pending_prekey_request(&transport, 0).await;
+
+        let waiter = {
+            let client = client.clone();
+            let peer = peer.clone();
+            tokio::spawn(async move {
+                client
+                    .ensure_e2e_sessions_resolved(std::slice::from_ref(&peer))
+                    .await
+            })
+        };
+
+        let refusal = NodeBuilder::new("iq")
+            .attr("type", "error")
+            .attr("from", "s.whatsapp.net")
+            .attr("id", &leader_id)
+            .children([NodeBuilder::new("error")
+                .attr("code", "500")
+                .attr("text", "internal-server-error")
+                .build()])
+            .build();
+        crate::test_utils::answer_iq(&client, &leader_id, &refusal).await;
+        assert!(
+            leader.await.expect("leader task").is_err(),
+            "the leader reports its own fetch failure"
+        );
+
+        // The waiter's own attempt: without it, the failed leader would have
+        // left this caller with nothing and no way to know.
+        let waiter_id = pending_prekey_request(&transport, 1).await;
+        crate::test_utils::answer_iq(
+            &client,
+            &waiter_id,
+            &keys.bundle_response(&peer, &waiter_id, 200),
+        )
+        .await;
+        waiter
+            .await
+            .expect("waiter task")
+            .expect("a waiter must establish the session its leader failed to");
+    }
+
+    /// A batch that overlaps an in-flight address still resolves the rest of
+    /// its devices, and does not re-fetch the one already being established.
+    #[tokio::test]
+    async fn a_batch_overlapping_an_inflight_address_fetches_only_the_rest() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let shared = Jid::lid_device("444444444444444".to_string(), 0);
+        let extra = Jid::lid_device("444444444444444".to_string(), 3);
+        let keys = PeerKeys::generate();
+
+        let leader = {
+            let client = client.clone();
+            let shared = shared.clone();
+            tokio::spawn(async move {
+                client
+                    .ensure_e2e_sessions_resolved(std::slice::from_ref(&shared))
+                    .await
+            })
+        };
+        // Registered only once the leader has claimed it, which it does before
+        // its first await — so waiting for its IQ is waiting for the claim.
+        let leader_id = pending_prekey_request(&transport, 0).await;
+
+        let overlapping = {
+            let client = client.clone();
+            let batch = vec![shared.clone(), extra.clone()];
+            tokio::spawn(async move { client.ensure_e2e_sessions_resolved(&batch).await })
+        };
+
+        let second_id = pending_prekey_request(&transport, 1).await;
+        crate::test_utils::answer_iq(
+            &client,
+            &second_id,
+            &keys.bundle_response(&extra, &second_id, 301),
+        )
+        .await;
+        crate::test_utils::answer_iq(
+            &client,
+            &leader_id,
+            &keys.bundle_response(&shared, &leader_id, 302),
+        )
+        .await;
+
+        leader.await.expect("leader task").expect("leader ensure");
+        overlapping
+            .await
+            .expect("overlapping task")
+            .expect("overlapping ensure");
+
+        // The count alone would not tell the two behaviours apart: without
+        // coalescing the second fetch is still one IQ, it just names the
+        // claimed address again. What it asks for is the discriminating fact.
+        assert_eq!(
+            prekey_requests(&transport).await,
+            2,
+            "one fetch each, with nothing left over"
+        );
+        assert_eq!(
+            fetch_targets(&transport, 1).await,
+            vec![extra.to_string()],
+            "the overlapping batch must ask only for the address nobody claimed"
+        );
+    }
+
+    /// A leader that got an answer with no bundle for the device has asked the
+    /// question. Its waiters must not ask it again.
+    ///
+    /// Without this, coalescing would hold for the happy path and quietly give
+    /// way for exactly the device that is most expensive to keep asking about:
+    /// one the server has no prekeys for.
+    #[tokio::test]
+    async fn a_leader_that_found_no_bundle_is_not_re_fetched_by_its_waiters() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let peer = Jid::lid_device("555555555555555".to_string(), 0);
+
+        let leader = {
+            let client = client.clone();
+            let peer = peer.clone();
+            tokio::spawn(async move {
+                client
+                    .ensure_e2e_sessions_resolved(std::slice::from_ref(&peer))
+                    .await
+            })
+        };
+        let leader_id = pending_prekey_request(&transport, 0).await;
+
+        let waiter = {
+            let client = client.clone();
+            let peer = peer.clone();
+            tokio::spawn(async move {
+                client
+                    .ensure_e2e_sessions_resolved(std::slice::from_ref(&peer))
+                    .await
+            })
+        };
+
+        // A result the server did answer, carrying no user for this device.
+        let empty = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .attr("from", "s.whatsapp.net")
+            .attr("id", &leader_id)
+            .children([NodeBuilder::new("list").build()])
+            .build();
+        crate::test_utils::answer_iq(&client, &leader_id, &empty).await;
+
+        leader
+            .await
+            .expect("leader task")
+            .expect("an answered fetch with no bundle is not an error");
+        waiter
+            .await
+            .expect("waiter task")
+            .expect("the waiter inherits the answered question");
+
+        assert_eq!(
+            prekey_requests(&transport).await,
+            1,
+            "a waiter must not re-ask a question its leader already got an answer to"
+        );
+    }
+
+    /// A fetch is chunked, and a chunk the server answered stays answered even
+    /// if a later one fails. Waiters for an address in the answered chunk must
+    /// not be sent back to re-ask it.
+    #[tokio::test]
+    async fn an_answered_chunk_stays_answered_when_a_later_one_fails() {
+        // Two chunks: one address over the batch size.
+        let batch = crate::session::SESSION_CHECK_BATCH_SIZE;
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let devices: Vec<Jid> = (0..=batch)
+            .map(|i| Jid::lid_device("666666666666666".to_string(), i as u16))
+            .collect();
+        let leader = {
+            let client = client.clone();
+            let devices = devices.clone();
+            tokio::spawn(async move { client.ensure_e2e_sessions_resolved(&devices).await })
+        };
+
+        // First chunk: answered, with no bundle for anyone in it.
+        let first_id = pending_prekey_request(&transport, 0).await;
+        // Taken from the frame rather than assumed: the probe is
+        // `buffer_unordered`, so the chunk split does not follow input order.
+        let answered = first_chunk_member(&transport, &devices).await;
+
+        // A waiter for an address the first chunk covers, joining while the
+        // claim is still held — a completed claim is retired, so a caller
+        // arriving after the answer would rightly become a leader instead.
+        let waiter = {
+            let client = client.clone();
+            let answered = answered.clone();
+            tokio::spawn(async move {
+                client
+                    .ensure_e2e_sessions_resolved(std::slice::from_ref(&answered))
+                    .await
+            })
+        };
+        let_the_waiter_park(&transport, 1).await;
+
+        let empty = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .attr("from", "s.whatsapp.net")
+            .attr("id", &first_id)
+            .children([NodeBuilder::new("list").build()])
+            .build();
+        crate::test_utils::answer_iq(&client, &first_id, &empty).await;
+
+        // Second chunk: refused, which fails the leader as a whole.
+        let second_id = pending_prekey_request(&transport, 1).await;
+        let refusal = NodeBuilder::new("iq")
+            .attr("type", "error")
+            .attr("from", "s.whatsapp.net")
+            .attr("id", &second_id)
+            .children([NodeBuilder::new("error")
+                .attr("code", "500")
+                .attr("text", "internal-server-error")
+                .build()])
+            .build();
+        crate::test_utils::answer_iq(&client, &second_id, &refusal).await;
+
+        assert!(
+            leader.await.expect("leader task").is_err(),
+            "a failed chunk fails the call that owned it"
+        );
+        waiter
+            .await
+            .expect("waiter task")
+            .expect("the waiter inherits the chunk that was answered");
+
+        assert_eq!(
+            prekey_requests(&transport).await,
+            2,
+            "one fetch per chunk; the waiter must not add a third for an address \
+             the first chunk already covered"
+        );
+    }
+
+    /// A waiter is released by its own address finishing, not by the whole
+    /// batch. A later chunk stalling must not hold it.
+    #[tokio::test]
+    async fn a_waiter_is_released_when_its_own_chunk_lands() {
+        let batch = crate::session::SESSION_CHECK_BATCH_SIZE;
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let devices: Vec<Jid> = (0..=batch)
+            .map(|i| Jid::lid_device("777777777777777".to_string(), i as u16))
+            .collect();
+        let leader = {
+            let client = client.clone();
+            let devices = devices.clone();
+            tokio::spawn(async move { client.ensure_e2e_sessions_resolved(&devices).await })
+        };
+
+        let first_id = pending_prekey_request(&transport, 0).await;
+        let answered = first_chunk_member(&transport, &devices).await;
+        let waiter = {
+            let client = client.clone();
+            let answered = answered.clone();
+            tokio::spawn(async move {
+                client
+                    .ensure_e2e_sessions_resolved(std::slice::from_ref(&answered))
+                    .await
+            })
+        };
+        let_the_waiter_park(&transport, 1).await;
+
+        let empty = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .attr("from", "s.whatsapp.net")
+            .attr("id", &first_id)
+            .children([NodeBuilder::new("list").build()])
+            .build();
+        crate::test_utils::answer_iq(&client, &first_id, &empty).await;
+
+        // The second chunk is deliberately left unanswered: the waiter must
+        // finish anyway, since nothing it asked for is in that chunk.
+        pending_prekey_request(&transport, 1).await;
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("a waiter must not be held by a chunk it has no address in")
+            .expect("waiter task")
+            .expect("the waiter inherits the chunk that answered its address");
+
+        leader.abort();
+    }
+
+    /// A claim is retired the moment its work lands, so a caller arriving
+    /// afterwards leads its own fetch instead of inheriting an answer.
+    ///
+    /// This is what lets retry recovery delete a session and immediately
+    /// re-establish it: joining the finished claim would hand it a verdict
+    /// about the session it had just deleted.
+    #[tokio::test]
+    async fn a_finished_claim_is_retired_so_the_next_caller_leads() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let peer = Jid::lid_device("888888888888888".to_string(), 0);
+        let keys = PeerKeys::generate();
+
+        let first = {
+            let client = client.clone();
+            let peer = peer.clone();
+            tokio::spawn(async move {
+                client
+                    .ensure_e2e_sessions_resolved(std::slice::from_ref(&peer))
+                    .await
+            })
+        };
+        let first_id = pending_prekey_request(&transport, 0).await;
+        crate::test_utils::answer_iq(
+            &client,
+            &first_id,
+            &keys.bundle_response(&peer, &first_id, 400),
+        )
+        .await;
+        first.await.expect("first task").expect("first ensure");
+
+        assert_eq!(
+            client.ensure_inflight.len(),
+            0,
+            "a finished claim must not stay registered"
+        );
+
+        // Whatever established that session is gone again: the next ensure has
+        // to do the work itself.
+        client
+            .signal_cache
+            .delete_session(&peer.to_protocol_address())
+            .await;
+        client
+            .flush_signal_cache_batch_safe()
+            .await
+            .expect("flush the deletion");
+
+        let second = {
+            let client = client.clone();
+            let peer = peer.clone();
+            tokio::spawn(async move {
+                client
+                    .ensure_e2e_sessions_resolved(std::slice::from_ref(&peer))
+                    .await
+            })
+        };
+        let second_id = pending_prekey_request(&transport, 1).await;
+        crate::test_utils::answer_iq(
+            &client,
+            &second_id,
+            &keys.bundle_response(&peer, &second_id, 401),
+        )
+        .await;
+        second
+            .await
+            .expect("second task")
+            .expect("a caller after the claim retired must establish the session itself");
+    }
+
+    /// The invariant behind the retirement ordering: a caller can never find a
+    /// slot that is registered and already complete.
+    ///
+    /// That state is what lets a caller which just deleted a session join a
+    /// finished claim and inherit a verdict about it, so the registry must
+    /// publish completion and unregister under one lock.
+    #[tokio::test]
+    async fn a_registered_claim_is_never_already_complete() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let peer = Jid::lid_device("999999999999999".to_string(), 0);
+        let keys = PeerKeys::generate();
+
+        let leader = {
+            let client = client.clone();
+            let peer = peer.clone();
+            tokio::spawn(async move {
+                client
+                    .ensure_e2e_sessions_resolved(std::slice::from_ref(&peer))
+                    .await
+            })
+        };
+        let request_id = pending_prekey_request(&transport, 0).await;
+
+        // Sampled while the claim is held, and again once it is answered: the
+        // pair (registered, complete) must never both hold.
+        assert!(
+            !client.ensure_inflight.any_completed_still_registered(),
+            "a claim in flight must not be complete"
+        );
+        crate::test_utils::answer_iq(
+            &client,
+            &request_id,
+            &keys.bundle_response(&peer, &request_id, 500),
+        )
+        .await;
+        leader.await.expect("leader task").expect("leader ensure");
+
+        assert!(
+            !client.ensure_inflight.any_completed_still_registered(),
+            "a completed claim must be unregistered by the same lock that completed it"
+        );
+        assert_eq!(client.ensure_inflight.len(), 0);
+    }
+}
+
+/// Reproduction: a client between connections and a client that is finished
+/// refuse the same public call with the same error, so nothing in what the
+/// caller gets back separates "this comes back on its own" from "stop trying".
+///
+/// The two clients differ only in the state the reconnect loop reads, which is
+/// exactly what [`Client::reachability`] reports and the error does not.
+#[tokio::test]
+async fn a_reconnecting_client_and_a_finished_one_refuse_a_call_identically() {
+    let reconnecting = crate::test_utils::create_test_client().await;
+    reconnecting.is_running.store(true, Ordering::Relaxed);
+
+    let finished = crate::test_utils::create_test_client().await;
+    finished.is_running.store(true, Ordering::Relaxed);
+    finished
+        .enable_auto_reconnect
+        .store(false, Ordering::Relaxed);
+    finished.expected_disconnect.store(true, Ordering::Relaxed);
+
+    let jid = Jid::pn("12025550111");
+    let transient = reconnecting
+        .contacts()
+        .get_user_info(std::slice::from_ref(&jid))
+        .await
+        .expect_err("a client with no socket cannot answer a usync");
+    let terminal = finished
+        .contacts()
+        .get_user_info(std::slice::from_ref(&jid))
+        .await
+        .expect_err("nor can one that is finished");
+
+    assert_eq!(
+        transient.to_string(),
+        terminal.to_string(),
+        "the error is the same on both, which is the gap being closed"
+    );
+
+    assert_eq!(
+        reconnecting.reachability(),
+        Reachability::Reconnecting,
+        "a client whose loop is still trying is worth waiting for"
+    );
+    assert_eq!(
+        finished.reachability(),
+        Reachability::Finished,
+        "a finished one never is"
+    );
+}
+
+/// A client whose flags say `<success>` finished publishing: connected,
+/// authenticated, and with a reader running.
+async fn create_reachable_wait_test_client(name: &str) -> Arc<Client> {
+    let client = crate::test_utils::create_test_client_with_name(name).await;
+    client.is_running.store(true, Ordering::Relaxed);
+    client.set_connected_for_test(true);
+    client.is_logged_in.store(true, Ordering::Relaxed);
+    client.authenticated_generation.store(
+        client.connection_generation.load(Ordering::SeqCst),
+        Ordering::SeqCst,
+    );
+    assert_eq!(client.reachability(), Reachability::Reachable);
+    client
+}
+
+/// The other half of the reproduction: the call the reconnecting client refused
+/// is one the caller can wait out, and the wait ends the moment the replacement
+/// connection finishes authenticating.
+#[tokio::test]
+async fn the_wait_ends_when_the_replacement_connection_authenticates() {
+    let client = crate::test_utils::create_test_client_with_name("wait-release").await;
+    client.is_running.store(true, Ordering::Relaxed);
+    assert_eq!(client.reachability(), Reachability::Reconnecting);
+
+    let waiter = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move { client.wait_until_reachable().await })
+    };
+    crate::test_utils::wait_for_notifier_listeners(&client.session_state_notifier, 1).await;
+
+    // What `handle_success` publishes, in its order: the session, then the
+    // generation it is authenticated under, then the announcement.
+    client.set_connected_for_test(true);
+    client.is_logged_in.store(true, Ordering::Relaxed);
+    client.authenticated_generation.store(
+        client.connection_generation.load(Ordering::SeqCst),
+        Ordering::SeqCst,
+    );
+    client.notify_session_state();
+
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("the wait must end on the new connection")
+            .expect("the waiter should not panic"),
+        Reachability::Reachable
+    );
+}
+
+/// Terminal beats reachability. Every one of these sets its terminal flags
+/// before it clears the session and closes the transport, so a wait that asked
+/// about the socket first would be handed a connection that is already ending.
+///
+/// The ordering is asserted on a client that is still connected and still
+/// authenticated, because that is the window it exists for. The release is
+/// asserted from a wait that is already parked, so what ends it is the terminal
+/// transition and not the state the waiter happened to start in.
+#[tokio::test]
+async fn a_terminal_session_ends_the_wait_however_it_became_terminal() {
+    for code in ["401", "409", "516"] {
+        let client = create_reachable_wait_test_client(&format!("terminal-{code}")).await;
+        let error = NodeBuilder::new("stream:error").attr("code", code).build();
+        client.handle_stream_error(&error.as_node_ref()).await;
+
+        assert!(client.is_terminal(), "{code} ends the session for good");
+        assert_eq!(
+            client.reachability(),
+            Reachability::Finished,
+            "and that outranks whatever the socket still says"
+        );
+    }
+
+    // Parked first, on a client that is merely between connections, so the only
+    // thing that can end this wait is the transition under test.
+    let client = crate::test_utils::create_test_client_with_name("terminal-parked").await;
+    client.is_running.store(true, Ordering::Relaxed);
+    let waiter = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move { client.wait_until_reachable().await })
+    };
+    crate::test_utils::wait_for_notifier_listeners(&client.session_state_notifier, 1).await;
+    assert!(!waiter.is_finished(), "parked, with no verdict yet");
+
+    // A shutdown is terminal without any stream error, and reaches the parked
+    // wait through the same notifier.
+    client.signal_shutdown_sync();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("a shutdown must release the wait")
+            .expect("the waiter should not panic"),
+        Reachability::Finished,
+        "reporting that no connection is coming, rather than that none arrived yet"
+    );
+}
+
+/// A 429 clears the session and leaves everything else standing: the socket is
+/// open, the generation unchanged, `is_connected` still true. Reading it as
+/// ready would send the very traffic the server just penalised straight back
+/// down the same connection.
+#[tokio::test]
+async fn a_rate_limited_session_is_not_a_reachable_one() {
+    let client = create_reachable_wait_test_client("rate-limited").await;
+
+    let error = NodeBuilder::new("stream:error").attr("code", "429").build();
+    client.handle_stream_error(&error.as_node_ref()).await;
+
+    assert!(
+        client.is_connected(),
+        "the socket the rate limit arrived on is still open"
+    );
+    assert!(!client.is_terminal(), "and the session is not over");
+    assert_eq!(
+        client.reachability(),
+        Reachability::Reconnecting,
+        "but nothing sent on it is worth sending"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), client.wait_until_reachable())
+            .await
+            .is_err(),
+        "so the wait carries on to the connection that follows the penalty"
+    );
+}
+
+/// A client nothing is reading answers no IQ and reconnects from nothing, so
+/// the wait says that instead of parking for the life of the process. Its
+/// caller holds the `Arc` whose drop would have been the only other way out.
+#[tokio::test]
+async fn a_client_with_no_reader_is_told_rather_than_parked() {
+    let client = crate::test_utils::create_test_client_with_name("no-reader").await;
+    client.set_connected_for_test(true);
+    client.is_logged_in.store(true, Ordering::Relaxed);
+    client.authenticated_generation.store(
+        client.connection_generation.load(Ordering::SeqCst),
+        Ordering::SeqCst,
+    );
+
+    assert!(
+        !client.is_terminal(),
+        "a connection nobody drives is not a finished session"
+    );
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), client.wait_until_reachable())
+            .await
+            .expect("waiting cannot be what fixes this, so it must not wait"),
+        Reachability::Unsupervised
+    );
+}
+
+/// The two waits differ by exactly one policy. Work the client re-issues for
+/// itself sits through a pause, because nothing on the next connection asks for
+/// it again; a caller waiting on its own behalf is the side that calls
+/// `resume`, so it is told and can decide.
+#[tokio::test]
+async fn a_pause_ends_the_public_wait_and_not_the_internal_one() {
+    let client = create_reachable_wait_test_client("paused").await;
+
+    // Paused before the internal waiter starts, so it parks on the pause rather
+    // than racing the connection this call tears down.
+    client.pause().await;
+    assert_eq!(client.reachability(), Reachability::Paused);
+
+    let internal = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move { client.await_connection().await })
+    };
+    crate::test_utils::wait_for_notifier_listeners(&client.session_state_notifier, 1).await;
+
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), client.wait_until_reachable())
+            .await
+            .expect("the public wait must not sit through an offline the caller asked for"),
+        Reachability::Paused
+    );
+    assert!(
+        !internal.is_finished(),
+        "while the internal one waits for the connection the resume brings back"
+    );
+
+    client.resume();
+    client.set_connected_for_test(true);
+    client.is_logged_in.store(true, Ordering::Relaxed);
+    client.authenticated_generation.store(
+        client.connection_generation.load(Ordering::SeqCst),
+        Ordering::SeqCst,
+    );
+    client.notify_session_state();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), internal)
+            .await
+            .expect("and ends on it")
+            .expect("the waiter should not panic"),
+        "reporting the connection it was waiting for"
+    );
+}
+
+/// The wait ends on the state, never on one event. A notification that does not
+/// settle the question loops, so a wake that lands just before a teardown does
+/// not hand the caller the connection that teardown is taking away.
+#[tokio::test]
+async fn a_wake_that_settles_nothing_leaves_the_wait_parked() {
+    let client = crate::test_utils::create_test_client_with_name("relooping-wait").await;
+    client.is_running.store(true, Ordering::Relaxed);
+
+    let waiter = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move { client.wait_until_reachable().await })
+    };
+    crate::test_utils::wait_for_notifier_listeners(&client.session_state_notifier, 1).await;
+
+    // The socket is up, which is what `socket_ready_notifier` announces, and
+    // `<success>` has not arrived: a one-shot wait would return here, on a
+    // connection that answers nothing.
+    client.set_connected_for_test(true);
+    client.socket_ready_notifier.notify(usize::MAX);
+    // Yielded rather than polled for a condition, because the condition being
+    // proved is that nothing happens: the waiter has to be given the chance to
+    // run and to have taken it before "still parked" means anything.
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !waiter.is_finished(),
+        "a socket with no session behind it is not something to release work onto"
+    );
+
+    // And the teardown that follows is what it ends on.
+    client.signal_shutdown_sync();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("the teardown must release the wait")
+            .expect("the waiter should not panic"),
+        Reachability::Finished
+    );
+}
+
+/// The happy path pays nothing: a reachable client resolves the wait on its
+/// first poll, without yielding and without registering the two listeners a
+/// park costs.
+#[tokio::test]
+async fn a_reachable_client_completes_the_wait_without_parking() {
+    use futures::FutureExt;
+
+    let client = create_reachable_wait_test_client("no-park").await;
+
+    let allocations = crate::test_alloc::min_allocs(0, || {
+        assert_eq!(
+            client
+                .wait_until_reachable()
+                .now_or_never()
+                .expect("a ready client must not yield"),
+            Reachability::Reachable
+        );
+    });
+    assert_eq!(
+        allocations, 0,
+        "and must not register a listener on the way through"
+    );
+}
+
+/// Reproduction: the two clients [`Reachability`] does not separate are one
+/// whose first connection has not landed and one restoring a session it lost.
+/// Every marker that could tell them apart is set on the second and not the
+/// first, and both report the same state, so a caller holding work until the
+/// client is reachable holds both the same way.
+#[tokio::test]
+async fn a_first_connection_and_a_restored_one_report_the_same_state() {
+    let first = crate::test_utils::create_test_client_with_name("never-connected").await;
+    first.is_running.store(true, Ordering::Relaxed);
+
+    let restoring = crate::test_utils::create_test_client_with_name("lost-session").await;
+    restoring.is_running.store(true, Ordering::Relaxed);
+    // What one authenticated-then-lost cycle leaves standing: the persistent
+    // record of a login, and the generations `<success>` and the teardown bump.
+    restoring
+        .persistence_manager
+        .process_command(DeviceCommand::IncrementLoginCounter)
+        .await;
+    restoring
+        .connection_generation
+        .fetch_add(2, Ordering::SeqCst);
+
+    assert_eq!(first.connection_generation.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        first
+            .persistence_manager
+            .get_device_snapshot()
+            .login_counter,
+        0,
+        "the first client has never authenticated, in this process or any other"
+    );
+    assert!(restoring.connection_generation.load(Ordering::SeqCst) > 0);
+    assert!(
+        restoring
+            .persistence_manager
+            .get_device_snapshot()
+            .login_counter
+            > 0,
+        "and the second has, which is the whole of the difference between them"
+    );
+
+    assert_eq!(
+        first.reachability(),
+        restoring.reachability(),
+        "yet nothing reachability reads separates them"
+    );
+    assert_eq!(first.reachability(), Reachability::Reconnecting);
+    assert!(first.reachability().recovers_on_its_own());
+    assert!(restoring.reachability().recovers_on_its_own());
+
+    for client in [&first, &restoring] {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), client.wait_until_reachable())
+                .await
+                .is_err(),
+            "so a wait sits through both alike"
+        );
+    }
+}
+
+/// A client that has never connected is the state every healthy start passes
+/// through, so it is waited out like any other and ends on the connection
+/// rather than on a verdict about the past. A state that reported "no
+/// connection has ever landed" and settled the wait would hand that verdict to
+/// every caller that waits right after starting the loop.
+#[tokio::test]
+async fn a_first_connection_is_waited_out_like_any_other() {
+    let client = crate::test_utils::create_test_client_with_name("first-connect-wait").await;
+    client.is_running.store(true, Ordering::Relaxed);
+    assert_eq!(
+        client.connection_generation.load(Ordering::SeqCst),
+        0,
+        "no connection of this client was ever driven or torn down"
+    );
+
+    let waiter = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move { client.wait_until_reachable().await })
+    };
+    crate::test_utils::wait_for_notifier_listeners(&client.session_state_notifier, 1).await;
+    assert!(
+        !waiter.is_finished(),
+        "having never connected is not a reason to stop waiting"
+    );
+
+    client.set_connected_for_test(true);
+    client.is_logged_in.store(true, Ordering::Relaxed);
+    client.authenticated_generation.store(
+        client.connection_generation.load(Ordering::SeqCst),
+        Ordering::SeqCst,
+    );
+    client.notify_session_state();
+
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("the first connection must end the wait")
+            .expect("the waiter should not panic"),
+        Reachability::Reachable
+    );
+}
+
+/// The gate an embedder reads before every call stays flag loads and a match,
+/// on the path that is taken most: no store read, and nothing to allocate.
+#[tokio::test]
+async fn reading_reachability_costs_nothing_on_the_reachable_path() {
+    let client = create_reachable_wait_test_client("reachability-cost").await;
+
+    let allocations = crate::test_alloc::min_allocs(0, || {
+        assert_eq!(client.reachability(), Reachability::Reachable);
+        assert!(!client.reachability().recovers_on_its_own());
+    });
+    assert_eq!(allocations, 0);
+}

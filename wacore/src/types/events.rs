@@ -241,7 +241,11 @@ pub enum EventKind {
     IncomingCall,
     MissedCall,
     CallEndedElsewhere,
-    PushNameUpdate,
+    /// Retired: the payload promised an old-name/new-name comparison this
+    /// client has no contact store to make, and nothing ever dispatched it.
+    /// The slot stays because the discriminant is an `EventInterest` bit index
+    /// a consumer persists, so removing it would re-point every mask past it.
+    RetiredPushNameUpdate,
     SelfPushNameUpdated,
     PinUpdate,
     MuteUpdate,
@@ -285,6 +289,7 @@ pub enum EventKind {
     EncDecryptFailed,
     CallLogSync,
     ReceivedTcToken,
+    ClientExpirationChanged,
     // When adding a variant, mind the 128-kind ceiling below (EventInterest packs
     // each discriminant as a bit in a u128) and keep the guard pointing at the
     // last variant.
@@ -298,7 +303,7 @@ impl EventKind {
 
 // Build-time tripwire: a new variant that would overflow EventInterest's bitmask
 // fails compilation instead of silently corrupting the mask at runtime.
-const _: () = assert!((EventKind::CallLogSync as u8) < EventKind::CAPACITY);
+const _: () = assert!((EventKind::ClientExpirationChanged as u8) < EventKind::CAPACITY);
 
 /// A set of [`EventKind`]s a handler wants delivered. Producers can query the
 /// aggregate interest before building expensive payloads, and dispatch avoids
@@ -631,6 +636,16 @@ impl CoreEventBus {
     }
 }
 
+/// Payload of the retired [`Event::RetiredPushNameUpdate`], kept only so that
+/// variant can keep its position in an index-based `Serialize` format.
+///
+/// Deliberately empty: the fields it used to carry named a comparison this
+/// repository cannot make, and leaving them would keep promising it. Nothing
+/// constructs this and nothing dispatches the variant it fills.
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct RetiredPushNameUpdate {}
+
 #[derive(Debug, Clone, Serialize, bon::Builder)]
 #[non_exhaustive]
 pub struct SelfPushNameUpdated {
@@ -882,6 +897,16 @@ pub enum Event {
     /// messages (plaintext, acked on their own path, never redelivered) and
     /// PDO placeholder recoveries (identified by
     /// `info.unavailable_request_id`) dispatch event-only.
+    ///
+    /// A sender retrying its own outbox resends one message re-encrypted, which
+    /// no ratchet can see as a duplicate. Such a resend collapses to a single
+    /// dispatch, keyed by chat, id and sender, for as long as the
+    /// `dispatched_messages` window holds;
+    /// `stats().messages_suppressed_duplicate` counts them. The collapse covers
+    /// what arrives as a decrypted payload for this device, so a message
+    /// delivered in several `msmsg` parts under one stanza id is out of scope:
+    /// suppressing there could drop a part, and a lost part is worse than a
+    /// duplicate event.
     Messages(MessageBatch),
     Receipt(Receipt),
     /// The server `<ack>`-ed (or nack-ed) an outgoing stanza.
@@ -922,7 +947,17 @@ pub enum Event {
     /// Rejected call-log outcomes (`<terminate reason="accepted_elsewhere"|"rejected_elsewhere">`).
     CallEndedElsewhere(CallEndedElsewhere),
 
-    PushNameUpdate(PushNameUpdate),
+    /// Retired: nothing dispatches this, and nothing can. The payload promised
+    /// an old-name/new-name comparison, and this repository holds no contact
+    /// store to source the previous name from. Read the current name from
+    /// [`crate::types::message::MessageInfo::push_name`] instead.
+    ///
+    /// The variant stays because its *position* is load-bearing, for the same
+    /// reason new variants are appended rather than inserted: an index-based
+    /// `Serialize` format keys variants by position, so dropping one renumbers
+    /// every variant after it and changes how already-stored events decode.
+    RetiredPushNameUpdate(RetiredPushNameUpdate),
+
     SelfPushNameUpdated(SelfPushNameUpdated),
     PinUpdate(PinUpdate),
     MuteUpdate(MuteUpdate),
@@ -1055,9 +1090,13 @@ pub enum Event {
     /// store (e.g. the multi-pod server) can observe arrivals instead of
     /// re-deriving them from message traffic.
     ///
-    /// Last, like every new variant: a binary `Serialize` format writes the
-    /// variant index, so inserting in the middle renumbers everything after it.
+    /// Serialized before [`Event::ClientExpirationChanged`]; keep the two last,
+    /// in this order, because a binary `Serialize` format writes the variant
+    /// index and inserting in the middle renumbers everything after it.
     ReceivedTcToken(ReceivedTcToken),
+
+    /// The server pushed (or withdrew) a retirement deadline for this build.
+    ClientExpirationChanged(ClientExpirationChanged),
 }
 
 /// A trusted-contact privacy token received for a peer.
@@ -1150,7 +1189,7 @@ impl Event {
             Event::IncomingCall(_) => EventKind::IncomingCall,
             Event::MissedCall(_) => EventKind::MissedCall,
             Event::CallEndedElsewhere(_) => EventKind::CallEndedElsewhere,
-            Event::PushNameUpdate(_) => EventKind::PushNameUpdate,
+            Event::RetiredPushNameUpdate(_) => EventKind::RetiredPushNameUpdate,
             Event::SelfPushNameUpdated(_) => EventKind::SelfPushNameUpdated,
             Event::AppStateSyncFailed(_) => EventKind::AppStateSyncFailed,
             Event::PinUpdate(_) => EventKind::PinUpdate,
@@ -1170,6 +1209,7 @@ impl Event {
             Event::ContactRemoved(_) => EventKind::ContactRemoved,
             Event::EncDecryptFailed(_) => EventKind::EncDecryptFailed,
             Event::CallLogSync(_) => EventKind::CallLogSync,
+            Event::ClientExpirationChanged(_) => EventKind::ClientExpirationChanged,
             Event::HistorySync(_) => EventKind::HistorySync,
             Event::OfflineSyncPreview(_) => EventKind::OfflineSyncPreview,
             Event::OfflineSyncCompleted(_) => EventKind::OfflineSyncCompleted,
@@ -1700,13 +1740,32 @@ pub struct DirtyState {
     pub timestamp: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, crate::WireEnum)]
-pub enum DecryptFailMode {
-    #[wire = "show"]
-    Show,
-    #[wire = "hide"]
-    Hide,
+/// The server pushed a retirement deadline for the running client build, via
+/// `<ib><client_expiration>`.
+///
+/// Dispatched only when the deadline actually changed, so a repeated stanza is
+/// silent. `expires_at` is the deadline as recorded, which is never sooner than
+/// three days out even when the server's own answer is; `withdrawn` marks the
+/// stanza that carries no deadline at all, retracting whatever was held.
+///
+/// Consumers own the response. This client keeps connecting until the server
+/// refuses it -- the deadline is notice, not an instruction to stop -- so a
+/// consumer that cares about uptime should treat this as the cue to move to a
+/// newer build before the date arrives.
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct ClientExpirationChanged {
+    /// Unix seconds after which the server expects to stop accepting this
+    /// build. `None` when the deadline was withdrawn.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
+    /// The build the deadline was issued against.
+    pub version: (u32, u32, u32),
+    /// `true` when the server retracted a deadline it had previously set.
+    pub withdrawn: bool,
 }
+
+pub use crate::types::wire_enums::DecryptFailMode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, crate::WireEnum)]
 pub enum UnavailableType {
@@ -2237,16 +2296,6 @@ pub struct ContactUpdate {
     pub timestamp: DateTime<Utc>,
     pub action: Box<wa::sync_action_value::ContactAction>,
     pub from_full_sync: bool,
-}
-
-#[derive(Debug, Clone, Serialize, bon::Builder)]
-#[non_exhaustive]
-pub struct PushNameUpdate {
-    /// The contact who changed their push name.
-    pub jid: Jid,
-    pub message: Box<MessageInfo>,
-    pub old_push_name: String,
-    pub new_push_name: String,
 }
 
 #[derive(Debug, Clone, Serialize, bon::Builder)]

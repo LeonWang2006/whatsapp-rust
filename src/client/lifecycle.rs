@@ -435,6 +435,8 @@ impl Client {
                 .max_capacity(cache_config.session_locks_capacity.max(1))
                 .evict_guard(|m| Arc::strong_count(m) <= 1)
                 .build(),
+            ensure_inflight: Arc::default(),
+            group_metadata_inflight: Arc::default(),
             chat_lanes: Cache::builder()
                 .max_capacity(cache_config.chat_lanes_capacity.max(1))
                 .evict_guard(|lane: &ChatLane| Arc::strong_count(&lane.enqueue_lock) <= 1)
@@ -460,6 +462,8 @@ impl Client {
 
             pending_retries: Arc::new(std::sync::Mutex::new(HashSet::new())),
 
+            pending_lid_refreshes: Arc::new(std::sync::Mutex::new(HashSet::new())),
+
             message_retry_counts: cache_config.message_retry_counts.build_with_ttl(),
 
             session_recreate_history: cache_config.session_recreate_history.build_with_ttl(),
@@ -471,6 +475,9 @@ impl Client {
             ),
 
             undecryptable_dispatched: cache_config.undecryptable_dispatched.build_with_ttl(),
+
+            dispatched_messages: cache_config.dispatched_messages.build_with_ttl(),
+            duplicate_dispatch_suppressed: AtomicU64::new(0),
 
             offline_sync_metrics: Arc::new(OfflineSyncMetrics {
                 active: AtomicBool::new(false),
@@ -519,8 +526,7 @@ impl Client {
             pairing_cancellation_tx: Arc::new(Mutex::new(None)),
             pairing_qr_refresh_tx: Arc::new(Mutex::new(None)),
             pair_code_state: Arc::new(Mutex::new(wacore::pair_code::PairCodeState::default())),
-            passkey_state: Arc::new(Mutex::new(crate::passkey::flow::PasskeyFlowState::default())),
-            passkey_opening: AtomicBool::new(false),
+            subsystems: subsystem::Subsystems::default(),
             signal_flush_state: AtomicU64::new(0),
             signal_flush_lifecycle: Mutex::new(()),
             #[cfg(test)]
@@ -584,18 +590,6 @@ impl Client {
             stanza_interceptors: std::sync::RwLock::new(Arc::new(Vec::new())),
             stanza_interceptor_count: AtomicUsize::new(0),
             next_interceptor_id: AtomicU64::new(0),
-            #[cfg(feature = "voip-runtime")]
-            call_registry: Arc::new(wacore::voip::CallRegistry::new()),
-            #[cfg(feature = "voip-runtime")]
-            pending_call_link_joins: Arc::new(std::sync::Mutex::new(
-                voip::PendingCallLinkJoins::default(),
-            )),
-            #[cfg(feature = "voip-runtime")]
-            pending_call_link_join_lane: Arc::new(Mutex::new(())),
-            #[cfg(feature = "voip-runtime")]
-            answer_transition_locks: std::array::from_fn(|_| Arc::new(Mutex::new(()))),
-            #[cfg(feature = "voip-runtime")]
-            pending_outgoing_calls: Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
 
         let arc = Arc::new(this);
@@ -1315,7 +1309,14 @@ impl Client {
     ///
     /// `fibonacci_backoff(RECONNECT_BACKOFF_STEP)` determines the delay before
     /// the run loop re-connects.  This must be longer than the mock server's
-    /// chatstate TTL (`CHATSTATE_TTL_SECS=3`) so TTL-expiry tests pass.
+    /// chatstate TTL (`CHATSTATE_TTL_SECS=3`) so the TTL-expiry test passes.
+    ///
+    /// Only that one test needs a *timed* window. Everything else that wants the
+    /// client offline while it does something uses [`pause`](Self::pause) and
+    /// [`resume`](Self::resume), which make the window a fact the caller closes
+    /// rather than a delay it hopes is long enough. That is also the answer for
+    /// an embedder that wants a different offline window: this constant is not
+    /// it, and nothing here takes one per call.
     ///
     /// Sequence: fib(0)=1s, fib(1)=1s, fib(2)=2s, fib(3)=3s, **fib(4)=5s**.
     pub const RECONNECT_BACKOFF_STEP: u32 = 4;
@@ -1743,15 +1744,8 @@ impl Client {
         // in this window must see `!is_connected()` and bail instead of registering/connecting a call
         // after this sweep.
         self.is_connected.store(false, Ordering::Release);
-        // Tear down every in-flight VoIP call: the relay socket and signaling are connection-scoped,
-        // so a call can't survive a disconnect/reconnect. Aborts each media task and clears the map.
-        #[cfg(feature = "voip-runtime")]
-        {
-            self.call_registry.abort_all();
-            // Dormant outgoing calls (relay never arrived) live in pending_outgoing_calls, not the
-            // registry, so abort_all misses them. Drain them and notify `ended` so any waiter wakes.
-            crate::voip::facade::drain_pending_outgoing_on_disconnect(self);
-        }
+        // Let each attached subsystem release what this connection owned.
+        subsystem::on_connection_cleanup(self).await;
         // Close the socket as part of cleanup so this path is authoritative
         // even when reached via the run loop's graceful-exit flow (not just
         // `Client::disconnect()`). Transport impls make `disconnect()`
@@ -1787,6 +1781,13 @@ impl Client {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clear();
+        // `pending_lid_refreshes` is deliberately NOT cleared here. Its keys are
+        // released by a `scopeguard` that runs on drop as well as on completion,
+        // so a refresh whose query dies with the socket still frees its own key,
+        // and there is nothing stale left to sweep. Clearing anyway would drop a
+        // reservation belonging to a live task: a refresh spanning a reconnect
+        // would release a key the new connection had since taken, and the peer
+        // would get the duplicate query the set exists to prevent.
         // Commit any accumulated drain batch and settle the Signal cache in
         // ONE permit-held section (see teardown_inbound_commits_bounded):
         // persisting ratchet advances while dropping their uncommitted batch
@@ -2000,6 +2001,209 @@ impl Client {
             // than at each waiter, so a send, an IQ and a retry all get the
             // same verdict.
             && !self.is_paused()
+    }
+
+    /// What the client's connection state means for work handed to it now.
+    ///
+    /// The one place the connection state is turned into an answer, so a
+    /// caller never has to assemble one from the individual flags — and so a
+    /// condition added later is classified once rather than once per reader.
+    ///
+    /// Terminal is asked first. The two are not mutually exclusive during a
+    /// teardown: the stream-error paths set the terminal flags before they
+    /// clear `is_logged_in` and close the transport, so asking about
+    /// reachability first hands out a connection that is already ending.
+    ///
+    /// Reads flags and nothing else, so it costs the same whether the answer
+    /// is acted on or discarded.
+    pub fn reachability(&self) -> Reachability {
+        if self.is_terminal() {
+            return Reachability::Finished;
+        }
+        if self.can_reach_server() {
+            return Reachability::Reachable;
+        }
+        // A client with no supervision loop has no reader, so nothing will ever
+        // answer an IQ and no `<success>` will ever arrive. Not terminal — the
+        // connection is fine and the application may still use it — but nothing
+        // is going to change it either.
+        if !self.is_running.load(Ordering::Relaxed) {
+            return Reachability::Unsupervised;
+        }
+        if self.is_paused() {
+            return Reachability::Paused;
+        }
+        Reachability::Reconnecting
+    }
+
+    /// Wait until this client can reach the server again, or until waiting
+    /// stops being the answer.
+    ///
+    /// Returns the state that ended the wait: [`Reachability::Reachable`] when
+    /// one arrived, and otherwise the reason none will without the caller doing
+    /// something about it. [`Reachability::Reconnecting`] is never returned,
+    /// because it is the one state this waits out.
+    ///
+    /// Bounded by the client's own lifetime rather than by a duration: the
+    /// reconnect backoff is jittered, capped at 900s, and followed by a
+    /// handshake, so any constant here would be wrong in one direction or the
+    /// other. Cancellation belongs to the caller, who is the one that knows how
+    /// long the operation behind the wait is worth: drop the future, or wrap it
+    /// in a timeout of your own.
+    ///
+    /// Waiting restores the ability to ask, never the request that was refused.
+    /// Nothing is re-sent, so a caller that wants its call to happen issues it
+    /// again after this returns — and issues it knowing the answer can be stale
+    /// the moment it is given, since a connection can be lost again between
+    /// this returning and the next call reaching the socket.
+    ///
+    /// Not from an event handler: the bus dispatches on the read loop, so a
+    /// handler that waits here blocks the connection it is waiting for.
+    ///
+    /// A [`pause`](Self::pause) ends the wait rather than being waited out: the
+    /// client does come back, but on [`resume`](Self::resume) rather than on
+    /// its own, and the caller is the side that knows when that is. Sitting
+    /// through it would mean parking for as long as the application cared to
+    /// stay offline, and a caller holding this client is also holding the drop
+    /// that would otherwise have been the only other way out.
+    #[must_use = "the return value says whether a connection arrived or why none will"]
+    pub async fn wait_until_reachable(&self) -> Reachability {
+        self.wait_for_reachability(false).await
+    }
+
+    /// Park until [`Self::reachability`] settles, per
+    /// [`Reachability::settles`].
+    ///
+    /// Both notifiers are registered before the re-check, so a transition
+    /// landing in the gap is not missed. Socket readiness alone is not enough
+    /// to wait on: it fires before login, and nothing fires at all when the
+    /// client stops without a replacement socket. A notification that does not
+    /// settle the question simply loops — the wait ends on the state, never on
+    /// one event, which is also what keeps a wait won just before a teardown
+    /// from being handed a connection that is already going.
+    pub(crate) async fn wait_for_reachability(&self, park_through_pause: bool) -> Reachability {
+        loop {
+            let verdict = self.reachability();
+            if verdict.settles(park_through_pause) {
+                return verdict;
+            }
+            let ready = self.socket_ready_notifier.listen();
+            let session = self.session_state_notifier.listen();
+            let verdict = self.reachability();
+            if verdict.settles(park_through_pause) {
+                return verdict;
+            }
+            futures::pin_mut!(ready);
+            futures::pin_mut!(session);
+            futures::future::select(ready, session).await;
+        }
+    }
+}
+
+/// Whether work handed to the client right now can reach the server, and when
+/// it cannot, what a caller should do about it.
+///
+/// Reported by [`Client::reachability`] and settled by
+/// [`Client::wait_until_reachable`]. The error a refused call returns says what
+/// happened to that attempt; this says what the client is, which is the only
+/// thing that answers "is it worth asking again".
+///
+/// Deliberately a state and not a property of the error. A refusal is a fact
+/// about one instant, and by the time a caller reads it the client may already
+/// have moved on — the connection lost right after a call was admitted, or
+/// restored right after one was refused. Anything derived from the error would
+/// be a snapshot that is stale on arrival; this is re-read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Reachability {
+    /// A request sent now has a socket, an authenticated session and a reader
+    /// to decode the answer.
+    Reachable,
+    /// Between connections, with something driving the client back to one.
+    /// Nothing is re-sent by that: recovery restores the ability to ask, not
+    /// the request that was refused.
+    ///
+    /// The one state [`Client::wait_until_reachable`] waits out, so it is the
+    /// one that call never returns; only [`Client::reachability`] reports it.
+    ///
+    /// Covers a first connection that has not landed yet as well as a session
+    /// being restored, and does not separate them. What a client holds about
+    /// its past does not answer the question a caller is asking about its
+    /// future: a device that authenticated yesterday and has been revoked
+    /// since will never connect again, and one whose first attempt lands
+    /// during a brief outage connects on the next. It is also the state every
+    /// healthy client sits in for the whole of a normal start.
+    ///
+    /// So this says an attempt is being made, never that one will land. Causes
+    /// the client cannot attribute are retried indefinitely by design, a
+    /// handshake torn down before `<success>` reading the same as a server
+    /// that is momentarily unreachable, and a wait on this can go on for as
+    /// long as the process does. The bound belongs to the caller: see
+    /// [`Client::wait_until_reachable`].
+    Reconnecting,
+    /// [`Client::pause`] is in effect. Like [`Self::Reconnecting`] the client
+    /// is not finished, but the thing that ends it is [`Client::resume`], and
+    /// only the application knows when that comes.
+    Paused,
+    /// Nothing is reading this client, so no answer would be decoded and no
+    /// reconnect will be attempted. Not terminal — the application may still
+    /// drive it — but waiting cannot be what fixes it.
+    ///
+    /// Outranks [`Self::Paused`] where both hold: a paused client with no
+    /// reader has nothing to reconnect it either way, and reporting the pause
+    /// would park a wait on a resume that cannot end it. [`Client::run`] parks
+    /// on a pause rather than refusing it, so starting a reader is safe here.
+    Unsupervised,
+    /// The session is over for good: shut down, logged out, replaced, or
+    /// refused in a way no reconnect recovers. Nothing brings one back on its
+    /// own.
+    Finished,
+}
+
+impl Reachability {
+    /// Whether a request sent now can be answered.
+    pub fn is_reachable(self) -> bool {
+        matches!(self, Self::Reachable)
+    }
+
+    /// Whether the client is expected to become [`Self::Reachable`] again with
+    /// no further action from the caller, which is what makes waiting the right
+    /// response rather than giving up.
+    ///
+    /// False for [`Self::Paused`]: the client does come back, but on the
+    /// application's word rather than on its own.
+    ///
+    /// An expectation and not a promise, for the reason given on
+    /// [`Self::Reconnecting`]: true says something is driving the client back,
+    /// and the client cannot tell a cause a retry fixes from one it never
+    /// will.
+    ///
+    /// Matched exhaustively for the same reason the wait's own `settles`
+    /// classifier is: a state added later has to be classified here rather
+    /// than taking an answer by omission.
+    pub fn recovers_on_its_own(self) -> bool {
+        match self {
+            Self::Reconnecting => true,
+            Self::Reachable | Self::Paused | Self::Unsupervised | Self::Finished => false,
+        }
+    }
+
+    /// Whether this is an answer a wait can stop on.
+    ///
+    /// `park_through_pause` is the one policy the two waits differ by. Work
+    /// the client re-issues for itself has nothing to hand a caller and nobody
+    /// to re-issue it later, so it sits through a pause the same way it sits
+    /// through a 900s backoff. A caller waiting on its own behalf is the side
+    /// that decides to resume, so it is told instead.
+    ///
+    /// Matched exhaustively so a state added later has to be classified here
+    /// rather than defaulting to "keep waiting" unnoticed.
+    fn settles(self, park_through_pause: bool) -> bool {
+        match self {
+            Self::Reachable | Self::Finished | Self::Unsupervised => true,
+            Self::Paused => !park_through_pause,
+            Self::Reconnecting => false,
+        }
     }
 }
 
