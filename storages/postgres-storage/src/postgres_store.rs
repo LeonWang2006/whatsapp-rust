@@ -22,7 +22,7 @@ use wacore::appstate::processor::AppStateMutationMAC;
 use wacore::client_profile::ClientProfile;
 use wacore::libsignal::protocol::{KeyPair, PrivateKey, PublicKey};
 use wacore::store::Device as CoreDevice;
-use wacore::store::device::{CachedServerCertChain, DEVICE_PROPS};
+use wacore::store::device::{CachedServerCertChain, DEVICE_PROPS, ServerClientExpiration};
 use wacore::store::error::{Result, StoreError};
 use wacore::store::traits::*;
 
@@ -63,6 +63,7 @@ struct DeviceRow {
     lid_migrated: bool,
     last_signed_pre_key_rotation_ms: i64,
     read_receipts_disabled: bool,
+    server_client_expiration: Option<String>,
 }
 
 /// One pooled `PostgresStore` per device. Cheap to clone — the r2d2 pool is
@@ -222,6 +223,13 @@ impl PostgresStore {
         let lid_migrated = device_data.lid_migrated;
         let last_signed_pre_key_rotation_ms = device_data.last_signed_pre_key_rotation_ms;
         let read_receipts_disabled = device_data.read_receipts_disabled;
+        // JSON rather than a column per field, matching the SQLite backend: the
+        // record is a deadline plus the build it was issued for, and nothing
+        // queries or orders by it.
+        let server_client_expiration: Option<String> = device_data
+            .server_client_expiration
+            .as_ref()
+            .and_then(|v| serde_json::to_string(v).ok());
         let new_lid = device_data
             .lid
             .as_ref()
@@ -263,6 +271,7 @@ impl PostgresStore {
                     device::lid_migrated.eq(lid_migrated),
                     device::last_signed_pre_key_rotation_ms.eq(last_signed_pre_key_rotation_ms),
                     device::read_receipts_disabled.eq(read_receipts_disabled),
+                    device::server_client_expiration.eq(server_client_expiration.clone()),
                 ))
                 .on_conflict(device::id)
                 .do_update()
@@ -296,6 +305,7 @@ impl PostgresStore {
                     device::last_signed_pre_key_rotation_ms
                         .eq(excluded(device::last_signed_pre_key_rotation_ms)),
                     device::read_receipts_disabled.eq(excluded(device::read_receipts_disabled)),
+                    device::server_client_expiration.eq(excluded(device::server_client_expiration)),
                 ))
                 .execute(conn)
                 .map(|_| ())
@@ -344,6 +354,7 @@ impl PostgresStore {
                     device::last_signed_pre_key_rotation_ms
                         .eq(new_device.last_signed_pre_key_rotation_ms),
                     device::read_receipts_disabled.eq(false),
+                    device::server_client_expiration.eq(None::<String>),
                 ))
                 .returning(device::id)
                 .get_result::<i32>(conn)
@@ -431,6 +442,23 @@ impl PostgresStore {
             }
         });
 
+        // The deadline is a perf/UX hint, not load-bearing identity: a corrupt
+        // blob must NOT block startup — log and degrade to None so the next
+        // `<ib><client_expiration>` repopulates it.
+        let server_client_expiration = row.server_client_expiration.as_deref().and_then(|json| {
+            match serde_json::from_str::<ServerClientExpiration>(json) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    log::warn!(
+                        "device {} server_client_expiration JSON failed to decode: {e}; \
+                         dropping it",
+                        self.device_id,
+                    );
+                    None
+                }
+            }
+        });
+
         Ok(Some(CoreDevice {
             pn,
             lid,
@@ -461,6 +489,7 @@ impl PostgresStore {
             lid_migrated: row.lid_migrated,
             last_signed_pre_key_rotation_ms: row.last_signed_pre_key_rotation_ms,
             read_receipts_disabled: row.read_receipts_disabled,
+            server_client_expiration,
         }))
     }
 
