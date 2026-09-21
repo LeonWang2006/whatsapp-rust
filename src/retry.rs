@@ -43,7 +43,7 @@ fn get_bytes_content_ref<'a>(node: &'a NodeRef<'_>) -> Option<&'a [u8]> {
 const RECREATE_SESSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3600);
 
 #[derive(Clone, Copy)]
-enum RetransmissionRoute {
+pub(crate) enum RetransmissionRoute {
     Direct,
     Group,
     Status,
@@ -62,20 +62,20 @@ fn is_own_account_jid(jid: &Jid, own_pn: Option<&Jid>, own_lid: Option<&Jid>) ->
         || own_lid.is_some_and(|lid| jid.is_same_user_as(lid))
 }
 
-struct PreparedRetransmission {
-    route: RetransmissionRoute,
-    chat: Jid,
-    wire_requester: Jid,
-    encryption_jid: Jid,
-    message: wa::Message,
-    message_id: String,
-    retry_count: u8,
-    recipient: Option<Jid>,
-    group_info: Option<Arc<wacore::client::context::GroupInfo>>,
+pub(crate) struct PreparedRetransmission {
+    pub(crate) route: RetransmissionRoute,
+    pub(crate) chat: Jid,
+    pub(crate) wire_requester: Jid,
+    pub(crate) encryption_jid: Jid,
+    pub(crate) message: wa::Message,
+    pub(crate) message_id: String,
+    pub(crate) retry_count: u8,
+    pub(crate) recipient: Option<Jid>,
+    pub(crate) group_info: Option<Arc<wacore::client::context::GroupRoutingInfo>>,
     /// Canonical unpadded protobuf bytes shared with the recent-message cache.
     /// Public retransmissions provide them; the automatic path may fall back
     /// to its already-decoded message when the cache bytes are unavailable.
-    pre_encoded: Option<Arc<Vec<u8>>>,
+    pub(crate) pre_encoded: Option<Arc<Vec<u8>>>,
 }
 
 fn validate_retransmission(
@@ -372,7 +372,7 @@ impl Client {
         let group_info = if matches!(route, RetransmissionRoute::Group) {
             Some(
                 self.groups()
-                    .query_info_with_freshness(&request.chat, request.group_metadata_freshness)
+                    .routing_info_with_freshness(&request.chat, request.group_metadata_freshness)
                     .await?,
             )
         } else {
@@ -512,19 +512,18 @@ impl Client {
         // the scopeguard instead of cloning again.
         let pending = Arc::clone(&self.pending_retries);
         let _guard = scopeguard::guard((), move |()| {
-            pending
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .remove(&processing_key);
+            let mut pending = pending.lock().unwrap_or_else(|p| p.into_inner());
+            pending.remove(&processing_key);
+            crate::client::release_after_burst(&mut pending);
         });
 
         // A retry from a device missing from our registry signals a stale device
         // list for this user, so refresh it (rate-limited, dedup'd) to learn the
         // device for the next send. Done before the message-cache lookup so an
         // evicted retry still triggers it.
-        let sender_device_id = info.requester.device() as u32;
+        let sender_device_id = info.requester.device();
         let device_known = self
-            .has_device(&info.requester.user, sender_device_id)
+            .has_device_for_jid(&info.requester, sender_device_id)
             .await;
         if !device_known {
             // Parity with WA Web's MdRetryFromUnknownDevice WAM (id 2178), which
@@ -655,7 +654,7 @@ impl Client {
         // Fetch group info (cache-first, server on miss) — used for SKDM rotation + addressing_mode.
         // Without this, a cold cache would silently default to PN semantics for LID groups.
         let cached_group_info = if info.chat.is_group() {
-            match self.groups().query_info(&info.chat).await {
+            match self.groups().routing_info(&info.chat).await {
                 Ok(gi) => Some(gi),
                 Err(e) => {
                     log::warn!(
@@ -829,7 +828,7 @@ impl Client {
         Ok(())
     }
 
-    async fn retransmit_message_prepared(
+    pub(crate) async fn retransmit_message_prepared(
         &self,
         request: PreparedRetransmission,
     ) -> Result<(), anyhow::Error> {
@@ -945,7 +944,8 @@ impl Client {
 
         let chat_key = chat.to_string();
         let distribution_guard = self.group_distribution_lock(&chat).await;
-        let group_info = wacore::client::context::GroupInfo::new(
+        let topology_generation = self.device_topology.current();
+        let group_info = wacore::client::context::GroupRoutingInfo::new(
             Vec::new(),
             wacore::types::message::AddressingMode::Lid,
         );
@@ -1000,8 +1000,13 @@ impl Client {
             }
         };
         self.send_retry_stanza(prepared.node).await?;
-        self.update_sender_key_devices(&chat_key, &prepared.skdm_devices)
-            .await;
+        self.update_sender_key_devices(
+            &chat_key,
+            &prepared.skdm_devices,
+            topology_generation,
+            Some(&group_info),
+        )
+        .await;
         drop(distribution_guard);
         for user in &prepared.stale_device_users {
             self.invalidate_device_cache(user).await;
@@ -1434,6 +1439,7 @@ impl Client {
                 device_identity,
                 &fetched_identity,
                 account_identity.as_ref(),
+                requester_jid,
             ) {
                 wacore::adv::AdvValidation::Valid => {}
                 wacore::adv::AdvValidation::Invalid => {
@@ -2123,7 +2129,7 @@ mod tests {
         // Case 1: Device sync DM
         let recipient_lid = Jid::lid("200000000000002");
         let device_sync_info = MessageInfo {
-            id: "DEVICE_SYNC_MSG_001".to_string(),
+            id: "DEVICE_SYNC_MSG_001".into(),
             source: MessageSource {
                 chat: recipient_lid.clone(),
                 sender: our_lid.clone(),
@@ -2156,7 +2162,7 @@ mod tests {
         // Case 2: Peer DM with category="peer"
         let other_pn = Jid::pn("551188888888");
         let peer_info = MessageInfo {
-            id: "PEER123".to_string(),
+            id: "PEER123".into(),
             source: MessageSource {
                 chat: other_pn.clone(),
                 sender: our_pn.clone(),
@@ -2182,7 +2188,7 @@ mod tests {
 
         // Case 3: Group message from our own account
         let group_info = MessageInfo {
-            id: "GROUP123".to_string(),
+            id: "GROUP123".into(),
             source: MessageSource {
                 chat: "123456789@g.us".parse().unwrap(),
                 sender: our_lid.clone(),
@@ -2211,7 +2217,7 @@ mod tests {
 
         // Case 4: DM from someone else
         let other_dm_info = MessageInfo {
-            id: "OTHER123".to_string(),
+            id: "OTHER123".into(),
             source: MessageSource {
                 chat: other_pn.clone(),
                 sender: other_pn.clone(),
@@ -3014,7 +3020,7 @@ mod tests {
                 is_group: true,
                 ..Default::default()
             })
-            .message_ids(vec![msg_id.to_string()])
+            .message_ids(vec![msg_id.into()])
             .timestamp(wacore::time::now_utc())
             .r#type(crate::types::presence::ReceiptType::Retry)
             .offline(false)
@@ -3085,7 +3091,7 @@ mod tests {
                 is_group: chat.is_group(),
                 ..Default::default()
             })
-            .message_ids(vec![msg_id.to_string()])
+            .message_ids(vec![msg_id.into()])
             .timestamp(wacore::time::now_utc())
             .r#type(crate::types::presence::ReceiptType::Retry)
             .offline(offline)
@@ -3372,7 +3378,7 @@ mod tests {
                 sender: peer,
                 ..Default::default()
             })
-            .message_ids(vec!["DMMISS001".to_string()])
+            .message_ids(vec!["DMMISS001".into()])
             .timestamp(wacore::time::now_utc())
             .r#type(crate::types::presence::ReceiptType::Retry)
             .offline(false)
@@ -4057,7 +4063,7 @@ mod tests {
                 is_group: true,
                 ..Default::default()
             })
-            .message_ids(vec![msg_id.to_string()])
+            .message_ids(vec![msg_id.into()])
             .timestamp(wacore::time::now_utc())
             .r#type(crate::types::presence::ReceiptType::Retry)
             .offline(false)
@@ -4159,6 +4165,127 @@ mod tests {
             .ensure_e2e_sessions_resolved(std::slice::from_ref(&resolved_jid))
             .await
             .expect("no-op when session exists");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    async fn retry_key_bundle_validates_hosted_adv_before_installing_session() {
+        use buffa::Message;
+        use wacore::adv::test_util;
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let account = KeyPair::generate(&mut rng);
+        let device = KeyPair::generate(&mut rng);
+        let signed_prekey = KeyPair::generate(&mut rng);
+        let one_time_prekey = KeyPair::generate(&mut rng);
+        let identity = device.public_key.public_key_bytes();
+        let account_key = account.public_key.public_key_bytes();
+        let prekey_signature = device
+            .private_key
+            .calculate_signature(&signed_prekey.public_key.serialize(), &mut rng)
+            .unwrap();
+        for (jid, hosted_device) in test_util::device_cases() {
+            for device_type in test_util::ENCRYPTION_TYPES {
+                let details = wa::ADVDeviceIdentity {
+                    key_index: Some(0),
+                    device_type,
+                    ..Default::default()
+                }
+                .encode_to_vec();
+                let acct_prefix = test_util::account_prefix(device_type);
+                for include_account_key in [false, true] {
+                    let client =
+                        crate::test_utils::create_test_client_with_failing_http("retry_hosted_adv")
+                            .await;
+                    client
+                        .signal_cache
+                        .put_identity(&jid.with_device(0).to_protocol_address(), account_key)
+                        .await;
+                    for valid in [false, true] {
+                        let dev_prefix: &[u8; 2] = if hosted_device == valid {
+                            &[6, 6]
+                        } else {
+                            &[6, 1]
+                        };
+                        let signed = test_util::signed_identity(
+                            &account,
+                            &device,
+                            &details,
+                            acct_prefix,
+                            Some(dev_prefix),
+                            include_account_key,
+                        );
+                        let keys = NodeBuilder::new("keys")
+                            .children([
+                                NodeBuilder::new("type").bytes(vec![5]).build(),
+                                NodeBuilder::new("identity")
+                                    .bytes(identity.to_vec())
+                                    .build(),
+                                OneTimePreKeyNode::new(
+                                    1,
+                                    one_time_prekey.public_key.public_key_bytes().to_vec(),
+                                )
+                                .into_node(),
+                                SignedPreKeyNode::new(
+                                    2,
+                                    signed_prekey.public_key.public_key_bytes().to_vec(),
+                                    prekey_signature.to_vec(),
+                                )
+                                .into_node(),
+                                NodeBuilder::new("device-identity")
+                                    .bytes(waproto::codec::adv_signed_device_identity_to_vec(
+                                        &signed,
+                                    ))
+                                    .build(),
+                            ])
+                            .build();
+                        let receipt = NodeBuilder::new("receipt")
+                            .children([
+                                NodeBuilder::new("registration")
+                                    .bytes(12345u32.to_be_bytes().to_vec())
+                                    .build(),
+                                keys,
+                            ])
+                            .build();
+                        let addr = jid.to_protocol_address();
+                        let result = tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            client.process_retry_key_bundle(
+                                &receipt.as_node_ref(),
+                                &jid,
+                                false,
+                                false,
+                            ),
+                        )
+                        .await
+                        .expect("retry bundle processing must complete");
+                        if valid {
+                            result.unwrap_or_else(|e| panic!("jid={jid} device_type={device_type:?} in_blob={include_account_key}: {e}"));
+                        } else {
+                            assert!(
+                                result
+                                    .unwrap_err()
+                                    .to_string()
+                                    .contains("device-identity ADV validation failed")
+                            );
+                        }
+                        let snapshot = client.persistence_manager.get_device_snapshot();
+                        let session = client
+                            .signal_cache
+                            .peek_session(&addr, &*snapshot.backend)
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            session.is_some(),
+                            valid,
+                            "jid={jid} device_type={device_type:?} in_blob={include_account_key}"
+                        );
+                        if let Some(session) = session {
+                            assert_eq!(session.remote_registration_id().unwrap(), 12345);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -4494,6 +4621,7 @@ mod tests {
         assert!(client.jids_share_user_identity(&lid, &pn).await.unwrap());
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn public_retransmission_recaches_the_supplied_message() {
         let mut config = crate::cache_config::CacheConfig::default();
@@ -4575,7 +4703,7 @@ mod tests {
                 sender: from.parse().unwrap(),
                 ..Default::default()
             })
-            .message_ids(vec!["MSG001".to_string()])
+            .message_ids(vec!["MSG001".into()])
             .timestamp(wacore::time::now_utc())
             .r#type(crate::types::presence::ReceiptType::Retry)
             .offline(false)
@@ -4691,7 +4819,7 @@ mod tests {
                 sender: "236395184570386:33@lid".parse().unwrap(),
                 ..Default::default()
             })
-            .message_ids(vec!["MSG001".to_string()])
+            .message_ids(vec!["MSG001".into()])
             .timestamp(wacore::time::now_utc())
             .r#type(crate::types::presence::ReceiptType::Retry)
             .offline(false)
@@ -4717,7 +4845,7 @@ mod tests {
                 sender: "somebot:4@bot".parse().unwrap(),
                 ..Default::default()
             })
-            .message_ids(vec!["MSG001".to_string()])
+            .message_ids(vec!["MSG001".into()])
             .timestamp(wacore::time::now_utc())
             .r#type(crate::types::presence::ReceiptType::Retry)
             .offline(false)
@@ -4743,7 +4871,7 @@ mod tests {
                 sender: "somebot@bot".parse().unwrap(),
                 ..Default::default()
             })
-            .message_ids(vec!["MSG001".to_string()])
+            .message_ids(vec!["MSG001".into()])
             .timestamp(wacore::time::now_utc())
             .r#type(crate::types::presence::ReceiptType::Retry)
             .offline(false)

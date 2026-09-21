@@ -115,6 +115,7 @@ fn config_for(self_lid: &str, peer_lid: &str, ssrc: u32, direction: CallDirectio
         ssrc,
         audio: wacore::voip::AudioConfig::MLOW_PCM,
         relay_token: vec![0xAB; 16],
+        auth_token: vec![0xCD; 8],
         relay_ip: "203.0.113.7".into(),
         relay_port: 3478,
         integrity_key: b"relay-key".to_vec(),
@@ -184,6 +185,31 @@ fn mlow_encode_reused_output(bencher: Bencher) {
             let f = &frames[*i % frames.len()];
             *i += 1;
             enc.encode_into(black_box(f.as_slice()), output).unwrap();
+            black_box(output.len())
+        });
+}
+
+/// Quantized tone input establishes a separate baseline rather than a direct comparison to the f32 row.
+#[divan::bench]
+fn mlow_encode_i16_reused_output(bencher: Bencher) {
+    bencher
+        .with_inputs(|| {
+            let frames: Vec<Vec<i16>> = (0..STREAM)
+                .map(|i| {
+                    tone_f32(i * SAMPLES)
+                        .iter()
+                        .map(|s| (s * 32768.0) as i16)
+                        .collect()
+                })
+                .collect();
+            (primed_encoder(), frames, 0usize, Vec::with_capacity(2048))
+        })
+        .bench_refs(|(enc, frames, i, output)| {
+            let f = &frames[*i % frames.len()];
+            *i += 1;
+            if let Err(error) = enc.encode_i16_into(black_box(f.as_slice()), output) {
+                panic!("valid i16 benchmark frame failed to encode: {error}");
+            }
             black_box(output.len())
         });
 }
@@ -447,7 +473,21 @@ fn h264_depacketize_fua_stream(bencher: Bencher) {
         out.iter().map(<[u8]>::to_vec).collect()
     };
     bencher
-        .with_inputs(H264Depacketizer::default)
+        .with_inputs(|| {
+            // One keyframe reassembled outside the timed body, then `reset()` (which clears the
+            // buffers but keeps their capacity), so the row measures a steady-state frame the way
+            // the packetize rows above do. A depacketizer straight from `default()` grew its FU
+            // buffer 0 -> 32 KB inside the timed body, and whether glibc could extend that chunk in
+            // place or had to move it decided a third of the row: the same code measured 233 us and
+            // 336 us on two runners whose only difference was the CPU and the libc build.
+            let mut d = H264Depacketizer::default();
+            let last = payloads.len() - 1;
+            for (i, p) in payloads.iter().enumerate() {
+                d.push(i as u16, 90_000, p.as_slice(), i == last);
+            }
+            d.reset();
+            d
+        })
         .bench_refs(|d| {
             let last = payloads.len() - 1;
             for (i, p) in payloads.iter().enumerate() {

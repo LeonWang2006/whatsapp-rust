@@ -278,15 +278,16 @@ impl Client {
     /// Mirrors WA Web's `createLidPnMappings({ mappings, flushImmediately, learningSource })`
     /// call shape: one backend write for N participants instead of N detached
     /// tasks racing each other. The savings are linear in batch size and
-    /// matter most on first `query_info` of large groups.
+    /// matter most on first `routing_info` of large groups.
     ///
     /// `is_offline` mirrors the single-entry path: skip the persist task for
     /// offline replays; mappings are re-learned from the next live event.
     ///
-    /// Takes owned `(lid, phone_number)` pairs; each `String` moves directly
-    /// into the `LidPnEntry` stored in the cache, then (via `into_iter`) into
-    /// the `LidPnMappingEntry` that's persisted — no clones on either step.
-    /// The `Vec` itself is consumed, so no copy of the outer container either.
+    /// Takes owned `(lid, phone_number)` pairs. The record path borrows them,
+    /// so each is copied once into the `Arc<str>` fields of the `LidPnEntry`
+    /// stored in the cache. The entries stay alive across the backend write so
+    /// the persisted markers share those `Arc<str>`s; the storage row copies
+    /// them a second time into its own `String` fields.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.session.learn_lid_pn_batch", level = "debug", skip_all, fields(count = mappings.len(), is_offline = is_offline)))]
     pub(crate) async fn learn_lid_pn_mappings_batch(
         self: &Arc<Self>,
@@ -461,6 +462,16 @@ impl Client {
         phone_number: &str,
         source: LearningSource,
     ) -> RecordOutcome {
+        // Answered before the mutation mutex: this runs for every message
+        // whose sender carries a `sender_alt`, and in the steady state the pair
+        // is already known both ways and persisted, so the answer is `Skipped`.
+        // Taking the process-wide mutex first serialized every chat lane on
+        // the receive path behind a lock that the common case never needed.
+        // The guarded body re-checks under the lock, so a concurrent write
+        // still sees a consistent view.
+        if self.lid_pn_cache.can_skip_relearn(phone_number, lid).await {
+            return RecordOutcome::Skipped;
+        }
         let guard = self.lid_pn_cache.lock_mutation().await;
         self.record_lid_pn_in_memory_guarded(lid, phone_number, source, &guard)
             .await
@@ -569,7 +580,7 @@ impl Client {
         // After the write, not before: a failed persist stays un-marked so the
         // next live message retries instead of skipping.
         self.lid_pn_cache
-            .mark_persisted(&storage_entry.phone_number, &storage_entry.lid)
+            .mark_persisted(&entry.phone_number, &entry.lid)
             .await;
 
         if needs_migration {
@@ -607,11 +618,11 @@ impl Client {
     ) -> Result<Vec<LidPnMappingEntry>> {
         use anyhow::anyhow;
 
-        // Consume entries so `lid`/`phone_number` move into storage rather
-        // than being cloned. Only `learning_source` is allocated, and only
-        // because `LidPnMappingEntry.learning_source` is a `String` field.
+        // The storage row copies `lid`/`phone_number` into `String`s because
+        // `LidPnMappingEntry` is a `String` type; the cache's persisted marker
+        // keeps sharing the entry's `Arc<str>` pair instead.
         let storage: Vec<LidPnMappingEntry> = entries
-            .into_iter()
+            .iter()
             .map(|entry| LidPnMappingEntry {
                 lid: entry.lid.to_string(),
                 phone_number: entry.phone_number.to_string(),
@@ -627,7 +638,7 @@ impl Client {
             .await
             .map_err(|e| anyhow!("persisting LID-PN mapping batch: {e}"))?;
 
-        for entry in &storage {
+        for entry in &entries {
             self.lid_pn_cache
                 .mark_persisted(&entry.phone_number, &entry.lid)
                 .await;
@@ -1147,7 +1158,7 @@ impl Client {
         self.get_lid_pn_entry_by_user(&jid.user, is_lid).await
     }
 
-    async fn get_lid_pn_entry_by_user(
+    pub(crate) async fn get_lid_pn_entry_by_user(
         &self,
         user: &str,
         is_lid: bool,
@@ -1325,10 +1336,9 @@ impl Client {
         }
         let pending = Arc::clone(&self.pending_lid_refreshes);
         let _guard = scopeguard::guard((), move |()| {
-            pending
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .remove(&key);
+            let mut pending = pending.lock().unwrap_or_else(|p| p.into_inner());
+            pending.remove(&key);
+            super::release_after_burst(&mut pending);
         });
 
         // Persists through `add_lid_pn_mapping`, so a corrected pair is durable
@@ -1636,7 +1646,10 @@ mod tests {
             .await;
         assert_eq!(retry.migration_flags, vec![true]);
 
-        client.lid_pn_cache.mark_persisted(phone, lid).await;
+        client
+            .lid_pn_cache
+            .mark_persisted(&Arc::from(phone), &Arc::from(lid))
+            .await;
         let durable = client
             .record_lid_pn_batch_in_memory(mapping(), LearningSource::Other)
             .await;
@@ -2345,8 +2358,8 @@ mod tests {
         // from "migration never called".
         backend
             .update_device_list(DeviceListRecord {
-                user: pn.to_string(),
-                devices: vec![DeviceInfo::new(3, None)],
+                user: pn.into(),
+                devices: [DeviceInfo::new(3, None)].into(),
                 timestamp: wacore::time::now_secs(),
                 phash: None,
                 raw_id: None,
@@ -2388,7 +2401,7 @@ mod tests {
             "migration must delete the old PN-keyed device row"
         );
         let lid_row = backend.get_devices(lid).await.unwrap().unwrap();
-        assert_eq!(lid_row.devices[0].device_id, 3);
+        assert_eq!(lid_row.devices[0].device_id(), 3);
         // And the mapping resolves from both directions.
         assert_eq!(
             client

@@ -58,8 +58,8 @@ use anyhow::anyhow;
 use log::warn;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use wacore_binary::Jid;
 use wacore_binary::NodeRef;
+use wacore_binary::{CompactString, Jid};
 
 #[cfg(test)]
 use wacore_binary::builder::NodeBuilder;
@@ -112,7 +112,7 @@ pub enum UsyncContext {
 pub struct IsOnWhatsAppUser {
     pub jid: Jid,
     /// Helps server optimize the lookup (WA Web pre-populates this from its LID cache).
-    pub known_lid: Option<wacore_binary::CompactString>,
+    pub known_lid: Option<CompactString>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -164,6 +164,11 @@ pub struct IsOnWhatsAppResult {
     pub business_error: Option<UsyncSubprotocolError>,
     /// Verified business name (decoded from `<business><verified_name>`), if any.
     pub verified_name: Option<VerifiedName>,
+    /// Meta username, without the display-only `@` prefix. `None` means the
+    /// server reported no username, which is also how it reports one that was
+    /// deleted; it is never an empty string.
+    pub username: Option<CompactString>,
+    pub username_error: Option<UsyncSubprotocolError>,
 }
 
 /// User information from usync.
@@ -185,6 +190,10 @@ pub struct UserInfo {
     /// returns (device 0 is the primary). Empty if the server omitted it.
     pub devices: Vec<u16>,
     pub devices_error: Option<UsyncSubprotocolError>,
+    /// Meta username, without the display-only `@` prefix. See
+    /// [`IsOnWhatsAppResult::username`].
+    pub username: Option<CompactString>,
+    pub username_error: Option<UsyncSubprotocolError>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -284,6 +293,42 @@ fn project_business(
     }
 }
 
+/// Username carried by a successful `<contact>` result, if any.
+fn contact_username(user: &UsyncUserResult) -> Option<CompactString> {
+    match user.protocol(UsyncProtocolKind::Contact) {
+        Some(UsyncProtocolResult::Contact(UsyncOutcome::Value(contact))) => contact
+            .username
+            .clone()
+            .filter(|username| !username.is_empty()),
+        _ => None,
+    }
+}
+
+/// The server publishes a username on two independent channels: the `username`
+/// attribute of the `<contact>` result, and the `<username>` subprotocol result.
+///
+/// A `<username>` *value* is the whole answer, an empty one included: WhatsApp
+/// Web reads a present-but-empty node as a deletion (`WAWebHandleUsernameSync`),
+/// so letting the contact attribute fill that in would republish a username the
+/// server just retracted. A `<username>` *error* is the opposite case, and the
+/// distinction is the point: a subprotocol that failed has retracted nothing, so
+/// a username the contact result supplied on its own still stands and is
+/// reported next to the error rather than in place of it.
+fn project_username(
+    user: &UsyncUserResult,
+) -> (Option<CompactString>, Option<UsyncSubprotocolError>) {
+    match user.protocol(UsyncProtocolKind::Username) {
+        Some(UsyncProtocolResult::Username(UsyncOutcome::Value(username))) => (
+            username.clone().filter(|username| !username.is_empty()),
+            None,
+        ),
+        Some(UsyncProtocolResult::Username(UsyncOutcome::Error(error))) => {
+            (contact_username(user), Some((**error).clone()))
+        }
+        _ => (contact_username(user), None),
+    }
+}
+
 pub(crate) fn project_lid_mapping(user: &UsyncUserResult) -> Option<UsyncLidMapping> {
     let user_jid = user.id.as_ref()?;
     if user_jid.server.is_lid_family() {
@@ -333,13 +378,20 @@ fn device_list_identity_matches(
 }
 
 fn is_on_whatsapp_query(spec: &IsOnWhatsAppSpec) -> UsyncQuery {
-    let mut protocols = Vec::with_capacity(3);
+    let mut protocols = Vec::with_capacity(4);
     if spec.query_type == IsOnWhatsAppQueryType::Pn {
         protocols.push(UsyncProtocol::Contact {
             addressing_mode: UsyncAddressingMode::Pn,
         });
     }
-    protocols.extend([UsyncProtocol::Lid, UsyncProtocol::BusinessVerifiedName]);
+    // WhatsApp Web's own existence query (WAWebQueryExistsJob.queryExist) asks
+    // for the username subprotocol on both its PN and LID paths, ungated; the
+    // `username_search` flag only gates what the UI does with the answer.
+    protocols.extend([
+        UsyncProtocol::Lid,
+        UsyncProtocol::BusinessVerifiedName,
+        UsyncProtocol::Username,
+    ]);
 
     let users = spec
         .users
@@ -377,6 +429,9 @@ impl IqSpec for IsOnWhatsAppSpec {
     fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, anyhow::Error> {
         let response = parse_usync_response(response)?;
         reject_result_errors(&response, LEGACY_RESULT_PROTOCOLS)?;
+        // A username the server declines to answer for is not a reason to fail
+        // an existence check, which is what callers actually asked for.
+        warn_result_error(&response, UsyncProtocolKind::Username);
 
         let mut results = Vec::with_capacity(response.users.len());
         for user in response.users {
@@ -385,7 +440,7 @@ impl IqSpec for IsOnWhatsAppSpec {
             };
             let (is_registered, contact_error) = match user.protocol(UsyncProtocolKind::Contact) {
                 Some(UsyncProtocolResult::Contact(UsyncOutcome::Value(contact))) => {
-                    (contact.contact_type == "in", None)
+                    (contact.contact_type == CONTACT_TYPE_IN, None)
                 }
                 Some(UsyncProtocolResult::Contact(UsyncOutcome::Error(error))) => {
                     (false, Some((**error).clone()))
@@ -394,6 +449,7 @@ impl IqSpec for IsOnWhatsAppSpec {
             };
             let (lid, lid_error) = project_lid(&user);
             let (is_business, verified_name, business_error) = project_business(&user);
+            let (username, username_error) = project_username(&user);
 
             results.push(IsOnWhatsAppResult {
                 jid,
@@ -405,10 +461,187 @@ impl IqSpec for IsOnWhatsAppSpec {
                 is_business,
                 business_error,
                 verified_name,
+                username,
+                username_error,
             });
         }
 
         Ok(results)
+    }
+}
+
+/// `<contact type>` for a user that is reachable on WhatsApp.
+const CONTACT_TYPE_IN: &str = "in";
+/// `<contact type>` for a user that is not.
+const CONTACT_TYPE_OUT: &str = "out";
+
+/// Shortest username the official client will send to the server
+/// (`WAWebUsernameConstants.USERNAME_MIN_LENGTH`).
+pub const USERNAME_MIN_LENGTH: usize = 3;
+/// Longest username the official client will send to the server
+/// (`WAWebUsernameConstants.USERNAME_MAX_LENGTH`).
+pub const USERNAME_MAX_LENGTH: usize = 35;
+
+/// Why a username lookup could not be built.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum UsernameLookupError {
+    #[error(
+        "username length {length} is outside the {USERNAME_MIN_LENGTH}..={USERNAME_MAX_LENGTH} the server accepts"
+    )]
+    InvalidLength { length: usize },
+    #[error("the username query is not a valid usync query: {0}")]
+    Query(#[from] UsyncValidationError),
+}
+
+/// What the server said about a username.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum UsernameLookup {
+    /// No account answers to this username, or it is not reachable from here.
+    /// This is the `<contact type="out">` case, and also an empty result list.
+    NotFound,
+    /// The username exists but the server withheld the identity behind it: the
+    /// lookup has to be repeated with the account's username key.
+    KeyRequired {
+        /// Username as the server spelled it back, when it did.
+        username: Option<CompactString>,
+    },
+    /// The username resolved to an account.
+    Found(UsernameLookupUser),
+}
+
+/// The account a username resolved to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct UsernameLookupUser {
+    /// Identity the server returned. The query addresses contacts by LID, so
+    /// this is normally a LID.
+    pub jid: Jid,
+    /// Phone-number JID, when the server disclosed one on `<business>`.
+    pub pn_jid: Option<Jid>,
+    /// Username as the server spelled it back.
+    pub username: Option<CompactString>,
+    pub is_business: bool,
+    /// Verified business name (decoded from `<business><verified_name>`), if any.
+    pub verified_name: Option<VerifiedName>,
+}
+
+/// Look an account up by its Meta username.
+///
+/// **Experimental.** The request is built exactly as WhatsApp Web's
+/// `WAWebQueryExistsJob.queryUsernameExists` builds it, but no capture of a
+/// server answering it backs this: only the request shape is verified. Treat a
+/// failure as "unsupported for this account" rather than as a bug.
+///
+/// An account may protect its username with a key (the 4-digit "username key"
+/// WhatsApp Web calls a pin). Without it the server answers
+/// [`UsernameLookup::KeyRequired`] instead of an identity.
+#[derive(Debug, Clone)]
+pub struct UsernameLookupSpec {
+    query: UsyncQuery,
+    sid: String,
+}
+
+impl UsernameLookupSpec {
+    /// `username` is the bare handle, with no `@` prefix.
+    pub fn new(
+        username: &str,
+        username_key: Option<&str>,
+        sid: impl Into<String>,
+    ) -> Result<Self, UsernameLookupError> {
+        let length = username.chars().count();
+        if !(USERNAME_MIN_LENGTH..=USERNAME_MAX_LENGTH).contains(&length) {
+            return Err(UsernameLookupError::InvalidLength { length });
+        }
+        let mut user = UsyncUser::from_username(username);
+        if let Some(key) = username_key {
+            user = user.with_username_pin(key);
+        }
+        // Contact addressing is LID here because the query has no phone number
+        // to address by, and `<business pn_jid>` is what discloses the PN.
+        let query = UsyncQuery::new(
+            UsyncMode::Query,
+            UsyncContext::Interactive,
+            vec![
+                UsyncProtocol::Contact {
+                    addressing_mode: UsyncAddressingMode::Lid,
+                },
+                UsyncProtocol::BusinessVerifiedName,
+            ],
+            vec![user],
+        )?;
+        Ok(Self {
+            query,
+            sid: sid.into(),
+        })
+    }
+}
+
+impl IqSpec for UsernameLookupSpec {
+    type Response = UsernameLookup;
+
+    fn build_iq(&self) -> InfoQuery<'static> {
+        self.query.build_info_query(&self.sid)
+    }
+
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, anyhow::Error> {
+        let response = parse_usync_response(response)?;
+        reject_result_errors(&response, LEGACY_RESULT_PROTOCOLS)?;
+
+        let Some(user) = response.users.into_iter().next() else {
+            return Ok(UsernameLookup::NotFound);
+        };
+        // The contact result is the whole answer to a username lookup, so
+        // anything short of a successful one must not read as a resolved or
+        // key-gated account: `find_by_username` would persist a LID/PN pair off
+        // it. WhatsApp Web reads `contact.type` unconditionally here, which says
+        // it never expects the node to be missing either.
+        let contact = match user.protocol(UsyncProtocolKind::Contact) {
+            Some(UsyncProtocolResult::Contact(UsyncOutcome::Value(contact))) => contact,
+            Some(UsyncProtocolResult::Contact(UsyncOutcome::Error(error))) => {
+                return Err(anyhow!(usync_subprotocol_error_message(
+                    UsyncProtocolKind::Contact.as_str(),
+                    error
+                )));
+            }
+            _ => return Err(anyhow!("username lookup answered without a contact result")),
+        };
+        // WA Web only rejects "out" here, while the PN path of the same job
+        // requires "in". Take the stricter reading: a type this parser cannot
+        // name is not a confirmation, and a false `Found` writes an identity
+        // mapping to the LID/PN cache.
+        if contact.contact_type == CONTACT_TYPE_OUT {
+            return Ok(UsernameLookup::NotFound);
+        }
+        if contact.contact_type != CONTACT_TYPE_IN {
+            return Err(anyhow!(
+                "username lookup answered with an unknown contact type: {}",
+                contact.contact_type
+            ));
+        }
+        let username = contact
+            .username
+            .clone()
+            .filter(|username| !username.is_empty());
+        let (is_business, verified_name, _) = project_business(&user);
+        let pn_jid = match user.protocol(UsyncProtocolKind::Business) {
+            Some(UsyncProtocolResult::Business(UsyncOutcome::Value(business))) => {
+                business.pn_jid.clone()
+            }
+            _ => None,
+        };
+
+        let Some(jid) = user.id else {
+            return Ok(UsernameLookup::KeyRequired { username });
+        };
+        Ok(UsernameLookup::Found(UsernameLookupUser {
+            jid,
+            pn_jid,
+            username,
+            is_business,
+            verified_name,
+        }))
     }
 }
 
@@ -465,6 +698,7 @@ fn user_info_query(spec: &UserInfoSpec) -> UsyncQuery {
             UsyncProtocol::Picture,
             UsyncProtocol::DevicesV2,
             UsyncProtocol::Lid,
+            UsyncProtocol::Username,
         ],
         users,
     )
@@ -480,6 +714,7 @@ impl IqSpec for UserInfoSpec {
     fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response, anyhow::Error> {
         let response = parse_usync_response(response)?;
         reject_result_errors(&response, LEGACY_RESULT_PROTOCOLS)?;
+        warn_result_error(&response, UsyncProtocolKind::Username);
 
         let mut results = HashMap::with_capacity(response.users.len());
         for user in response.users {
@@ -506,6 +741,7 @@ impl IqSpec for UserInfoSpec {
                 _ => (None, None),
             };
             let (is_business, verified_name, business_error) = project_business(&user);
+            let (username, username_error) = project_username(&user);
             let (devices, devices_error) = match user.protocol(UsyncProtocolKind::Devices) {
                 Some(UsyncProtocolResult::Devices(UsyncOutcome::Value(devices))) => (
                     devices
@@ -536,6 +772,8 @@ impl IqSpec for UserInfoSpec {
                     verified_name,
                     devices,
                     devices_error,
+                    username,
+                    username_error,
                 },
             );
         }
@@ -1980,5 +2218,460 @@ mod tests {
             parse(real).expect("real name").name.as_deref(),
             Some("Acme")
         );
+    }
+
+    /// `<user>` wrapper for a usync `type="result"` response.
+    fn usync_result(users: Vec<Node>) -> Node {
+        NodeBuilder::new("iq")
+            .attr("type", "result")
+            .children([NodeBuilder::new("usync")
+                .children([NodeBuilder::new("list").children(users).build()])
+                .build()])
+            .build()
+    }
+
+    fn pn_spec() -> IsOnWhatsAppSpec {
+        IsOnWhatsAppSpec::new(
+            vec![pn_user("1234567890")],
+            "test-sid",
+            IsOnWhatsAppQueryType::Pn,
+        )
+    }
+
+    #[test]
+    fn is_on_whatsapp_surfaces_the_username_on_the_contact_node() {
+        let spec = pn_spec();
+        let response = usync_result(vec![
+            NodeBuilder::new("user")
+                .attr("jid", "1234567890@s.whatsapp.net")
+                .children([NodeBuilder::new("contact")
+                    .attr("type", "in")
+                    .attr("username", "example.handle")
+                    .build()])
+                .build(),
+        ]);
+
+        let results = spec.parse_response(&response.as_node_ref()).unwrap();
+        assert_eq!(results[0].username.as_deref(), Some("example.handle"));
+        assert!(results[0].username_error.is_none());
+    }
+
+    #[test]
+    fn is_on_whatsapp_prefers_the_username_subprotocol_over_the_contact_attribute() {
+        let spec = pn_spec();
+        let response = usync_result(vec![
+            NodeBuilder::new("user")
+                .attr("jid", "1234567890@s.whatsapp.net")
+                .children([
+                    NodeBuilder::new("contact")
+                        .attr("type", "in")
+                        .attr("username", "stale.handle")
+                        .build(),
+                    NodeBuilder::new("username")
+                        .string_content("fresh.handle")
+                        .build(),
+                ])
+                .build(),
+        ]);
+
+        let results = spec.parse_response(&response.as_node_ref()).unwrap();
+        assert_eq!(results[0].username.as_deref(), Some("fresh.handle"));
+    }
+
+    #[test]
+    fn is_on_whatsapp_absent_username_stays_absent() {
+        let spec = pn_spec();
+        let response = usync_result(vec![
+            NodeBuilder::new("user")
+                .attr("jid", "1234567890@s.whatsapp.net")
+                .children([
+                    NodeBuilder::new("contact").attr("type", "in").build(),
+                    // An empty <username/> is how the server reports a deleted one.
+                    NodeBuilder::new("username").build(),
+                ])
+                .build(),
+            NodeBuilder::new("user")
+                .attr("jid", "1234567891@s.whatsapp.net")
+                .children([
+                    NodeBuilder::new("contact").attr("type", "in").build(),
+                    NodeBuilder::new("username").string_content("").build(),
+                ])
+                .build(),
+        ]);
+
+        let results = spec.parse_response(&response.as_node_ref()).unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|result| result.username.is_none()));
+    }
+
+    #[test]
+    fn is_on_whatsapp_username_error_does_not_drop_the_user() {
+        let spec = pn_spec();
+        let response = usync_result(vec![
+            NodeBuilder::new("user")
+                .attr("jid", "1234567890@s.whatsapp.net")
+                .children([
+                    NodeBuilder::new("contact").attr("type", "in").build(),
+                    NodeBuilder::new("username")
+                        .children([NodeBuilder::new("error").attr("code", "429").build()])
+                        .build(),
+                ])
+                .build(),
+        ]);
+
+        let results = spec.parse_response(&response.as_node_ref()).unwrap();
+        assert!(results[0].is_registered);
+        assert!(results[0].username.is_none());
+        assert_eq!(
+            results[0].username_error.as_ref().and_then(|e| e.code),
+            Some(429)
+        );
+    }
+
+    #[test]
+    fn is_on_whatsapp_query_asks_for_the_username_subprotocol() {
+        for query_type in [IsOnWhatsAppQueryType::Pn, IsOnWhatsAppQueryType::Lid] {
+            let jid = match query_type {
+                IsOnWhatsAppQueryType::Pn => Jid::pn("1234567890"),
+                IsOnWhatsAppQueryType::Lid => Jid::lid("100000001"),
+            };
+            let spec = IsOnWhatsAppSpec::new(
+                vec![IsOnWhatsAppUser {
+                    jid,
+                    known_lid: None,
+                }],
+                "test-sid",
+                query_type,
+            );
+            let iq = spec.build_iq();
+            let Some(NodeContent::Nodes(nodes)) = &iq.content else {
+                panic!("Expected NodeContent::Nodes");
+            };
+            let query = nodes[0].get_optional_child("query").unwrap();
+            let username = query.get_optional_child("username").unwrap();
+            assert!(username.attrs.is_empty());
+            // The user node carries no username: nothing here is a lookup by one.
+            let user = nodes[0]
+                .get_optional_child("list")
+                .and_then(|list| list.get_children_by_tag("user").next())
+                .unwrap();
+            assert!(user.get_optional_child("username").is_none());
+        }
+    }
+
+    #[test]
+    fn user_info_query_asks_for_the_username_subprotocol() {
+        let jid: Jid = "1234567890@s.whatsapp.net".parse().unwrap();
+        let spec = UserInfoSpec::new(vec![jid], "test-sid");
+        let iq = spec.build_iq();
+
+        let Some(NodeContent::Nodes(nodes)) = &iq.content else {
+            panic!("Expected NodeContent::Nodes");
+        };
+        let query = nodes[0].get_optional_child("query").unwrap();
+        assert!(query.get_optional_child("username").is_some());
+    }
+
+    #[test]
+    fn user_info_surfaces_the_username() {
+        let jid: Jid = "1234567890@s.whatsapp.net".parse().unwrap();
+        let spec = UserInfoSpec::new(vec![jid.clone()], "test-sid");
+        let response = usync_result(vec![
+            NodeBuilder::new("user")
+                .attr("jid", "1234567890@s.whatsapp.net")
+                .children([NodeBuilder::new("username")
+                    .string_content("example.handle")
+                    .build()])
+                .build(),
+        ]);
+
+        let results = spec.parse_response(&response.as_node_ref()).unwrap();
+        assert_eq!(
+            results.get(&jid).unwrap().username.as_deref(),
+            Some("example.handle")
+        );
+    }
+
+    #[test]
+    fn username_lookup_builds_the_official_contact_node() {
+        let spec = UsernameLookupSpec::new("example.handle", Some("1234"), "sid-1").unwrap();
+        let iq = spec.build_iq();
+
+        assert_eq!(iq.namespace, "usync");
+        let Some(NodeContent::Nodes(nodes)) = &iq.content else {
+            panic!("Expected NodeContent::Nodes");
+        };
+        let usync = &nodes[0];
+        assert!(usync.attrs.get("mode").is_some_and(|s| s == "query"));
+        assert!(
+            usync
+                .attrs
+                .get("context")
+                .is_some_and(|s| s == "interactive")
+        );
+
+        let query = usync.get_optional_child("query").unwrap();
+        let contact = query.get_optional_child("contact").unwrap();
+        assert!(
+            contact
+                .attrs
+                .get("addressing_mode")
+                .is_some_and(|s| s == "lid")
+        );
+        assert!(query.get_optional_child("business").is_some());
+        // No username subprotocol: the answer rides on <contact>, as WA Web's
+        // queryUsernameExists expects.
+        assert!(query.get_optional_child("username").is_none());
+
+        let user_contact = usync
+            .get_optional_child("list")
+            .and_then(|list| list.get_children_by_tag("user").next())
+            .and_then(|user| user.get_optional_child("contact"))
+            .unwrap();
+        assert_eq!(
+            user_contact.attrs.get("username").unwrap(),
+            "example.handle"
+        );
+        assert_eq!(user_contact.attrs.get("pin").unwrap(), "1234");
+    }
+
+    #[test]
+    fn username_lookup_rejects_lengths_the_server_would_not_accept() {
+        for username in ["", "ab", &"a".repeat(USERNAME_MAX_LENGTH + 1)] {
+            let error = UsernameLookupSpec::new(username, None, "sid-1").unwrap_err();
+            assert_eq!(
+                error,
+                UsernameLookupError::InvalidLength {
+                    length: username.chars().count()
+                }
+            );
+        }
+        assert!(UsernameLookupSpec::new("abc", None, "sid-1").is_ok());
+    }
+
+    #[test]
+    fn username_lookup_finds_the_account_behind_the_handle() {
+        let spec = UsernameLookupSpec::new("example.handle", None, "sid-1").unwrap();
+        let response = usync_result(vec![
+            NodeBuilder::new("user")
+                .attr("jid", "100000001@lid")
+                .children([
+                    NodeBuilder::new("contact")
+                        .attr("type", "in")
+                        .attr("username", "example.handle")
+                        .build(),
+                    NodeBuilder::new("business")
+                        .attr("pn_jid", "1234567890@s.whatsapp.net")
+                        .children([NodeBuilder::new("verified_name")
+                            .attr("name", "Acme")
+                            .build()])
+                        .build(),
+                ])
+                .build(),
+        ]);
+
+        let UsernameLookup::Found(user) = spec.parse_response(&response.as_node_ref()).unwrap()
+        else {
+            panic!("expected a resolved account");
+        };
+        assert_eq!(user.jid, Jid::lid("100000001"));
+        assert_eq!(
+            user.pn_jid.as_ref().map(|jid| jid.user.as_str()),
+            Some("1234567890")
+        );
+        assert_eq!(user.username.as_deref(), Some("example.handle"));
+        assert!(user.is_business);
+        assert_eq!(
+            user.verified_name.and_then(|name| name.name).as_deref(),
+            Some("Acme")
+        );
+    }
+
+    #[test]
+    fn username_lookup_reports_a_withheld_identity_as_key_required() {
+        let spec = UsernameLookupSpec::new("example.handle", None, "sid-1").unwrap();
+        let response = usync_result(vec![
+            NodeBuilder::new("user")
+                .children([NodeBuilder::new("contact")
+                    .attr("type", "in")
+                    .attr("username", "example.handle")
+                    .build()])
+                .build(),
+        ]);
+
+        assert_eq!(
+            spec.parse_response(&response.as_node_ref()).unwrap(),
+            UsernameLookup::KeyRequired {
+                username: Some("example.handle".into())
+            }
+        );
+    }
+
+    #[test]
+    fn username_lookup_reports_an_unknown_handle_as_not_found() {
+        let spec = UsernameLookupSpec::new("example.handle", None, "sid-1").unwrap();
+        let out = usync_result(vec![
+            NodeBuilder::new("user")
+                .attr("jid", "100000001@lid")
+                .children([NodeBuilder::new("contact").attr("type", "out").build()])
+                .build(),
+        ]);
+        assert_eq!(
+            spec.parse_response(&out.as_node_ref()).unwrap(),
+            UsernameLookup::NotFound
+        );
+
+        let empty = usync_result(Vec::new());
+        assert_eq!(
+            spec.parse_response(&empty.as_node_ref()).unwrap(),
+            UsernameLookup::NotFound
+        );
+    }
+
+    /// A `<user>` the contact subprotocol never spoke for is not a resolution,
+    /// however much of it the server filled in.
+    #[test]
+    fn username_lookup_refuses_to_resolve_without_a_contact_result() {
+        let spec = UsernameLookupSpec::new("example.handle", None, "sid-1").unwrap();
+        let response = usync_result(vec![
+            NodeBuilder::new("user")
+                .attr("jid", "100000001@lid")
+                .children([NodeBuilder::new("business").build()])
+                .build(),
+        ]);
+
+        let error = spec
+            .parse_response(&response.as_node_ref())
+            .expect_err("a user with no contact result cannot resolve a handle")
+            .to_string();
+        assert!(error.contains("contact result"), "{error}");
+    }
+
+    /// A deletion the server reports through the subprotocol must not be undone
+    /// by the `<contact>` attribute the same response happens to carry.
+    #[test]
+    fn is_on_whatsapp_empty_username_result_outranks_the_contact_attribute() {
+        let spec = pn_spec();
+        let response = usync_result(vec![
+            NodeBuilder::new("user")
+                .attr("jid", "1234567890@s.whatsapp.net")
+                .children([
+                    NodeBuilder::new("contact")
+                        .attr("type", "in")
+                        .attr("username", "stale.handle")
+                        .build(),
+                    NodeBuilder::new("username").build(),
+                ])
+                .build(),
+        ]);
+
+        let results = spec.parse_response(&response.as_node_ref()).unwrap();
+        assert_eq!(results[0].username, None);
+    }
+
+    /// A rate-limited subprotocol has retracted nothing, so a username the
+    /// contact result supplied on its own survives next to the error.
+    #[test]
+    fn is_on_whatsapp_username_error_keeps_what_the_contact_result_said() {
+        let spec = pn_spec();
+        let errored = |contact: Node| {
+            usync_result(vec![
+                NodeBuilder::new("user")
+                    .attr("jid", "1234567890@s.whatsapp.net")
+                    .children([
+                        contact,
+                        NodeBuilder::new("username")
+                            .children([NodeBuilder::new("error").attr("code", "429").build()])
+                            .build(),
+                    ])
+                    .build(),
+            ])
+        };
+
+        let with_attribute = errored(
+            NodeBuilder::new("contact")
+                .attr("type", "in")
+                .attr("username", "example.handle")
+                .build(),
+        );
+        let results = spec.parse_response(&with_attribute.as_node_ref()).unwrap();
+        assert_eq!(results[0].username.as_deref(), Some("example.handle"));
+        assert_eq!(
+            results[0].username_error.as_ref().and_then(|e| e.code),
+            Some(429)
+        );
+
+        // Nothing to fall back on: the error is all there is to report.
+        let without = errored(NodeBuilder::new("contact").attr("type", "in").build());
+        let results = spec.parse_response(&without.as_node_ref()).unwrap();
+        assert_eq!(results[0].username, None);
+        assert!(results[0].username_error.is_some());
+    }
+
+    #[test]
+    fn username_lookup_refuses_to_resolve_a_failed_contact() {
+        let spec = UsernameLookupSpec::new("example.handle", None, "sid-1").unwrap();
+        let response = usync_result(vec![
+            NodeBuilder::new("user")
+                .attr("jid", "100000001@lid")
+                .children([NodeBuilder::new("contact")
+                    .children([NodeBuilder::new("error")
+                        .attr("code", "403")
+                        .attr("text", "forbidden")
+                        .build()])
+                    .build()])
+                .build(),
+        ]);
+
+        let error = spec
+            .parse_response(&response.as_node_ref())
+            .expect_err("a failed contact subprotocol cannot resolve a handle")
+            .to_string();
+        assert!(error.contains("contact"), "{error}");
+        assert!(error.contains("403"), "{error}");
+    }
+
+    /// A `pn_jid` the server spelled wrong is one user's bonus field, not a
+    /// reason to reject the batch it rode in on.
+    #[test]
+    fn a_malformed_business_pn_jid_does_not_reject_the_response() {
+        let spec = pn_spec();
+        let response = usync_result(vec![
+            NodeBuilder::new("user")
+                .attr("jid", "1234567890@s.whatsapp.net")
+                .children([
+                    NodeBuilder::new("contact").attr("type", "in").build(),
+                    NodeBuilder::new("business")
+                        .attr("pn_jid", "not a jid")
+                        .build(),
+                ])
+                .build(),
+        ]);
+
+        let results = spec
+            .parse_response(&response.as_node_ref())
+            .expect("the response still parses");
+        assert!(results[0].is_registered);
+        assert!(results[0].is_business);
+    }
+
+    /// Only "in" is a confirmation. A type this parser cannot name must not
+    /// resolve a handle, because `find_by_username` caches what it resolves.
+    #[test]
+    fn username_lookup_refuses_an_unknown_contact_type() {
+        let spec = UsernameLookupSpec::new("example.handle", None, "sid-1").unwrap();
+        let response = usync_result(vec![
+            NodeBuilder::new("user")
+                .attr("jid", "100000001@lid")
+                .children([NodeBuilder::new("contact").attr("type", "sideways").build()])
+                .build(),
+        ]);
+
+        let error = spec
+            .parse_response(&response.as_node_ref())
+            .expect_err("an unnameable contact type cannot resolve a handle")
+            .to_string();
+        assert!(error.contains("unknown contact type"), "{error}");
+        assert!(error.contains("sideways"), "{error}");
     }
 }

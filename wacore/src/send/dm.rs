@@ -38,19 +38,22 @@ pub(crate) fn partition_dm_devices(
     }
 
     PartitionedDmDevices {
-        devices: all_devices,
+        // Frozen once the partition is settled: nothing appends to it
+        // afterwards, and the fan-out build over-reserves, so the boxed slice
+        // keeps a resident DM memo from parking that slack.
+        devices: all_devices.into_boxed_slice(),
         recipient_count,
     }
 }
 
 pub(crate) struct PartitionedDmDevices {
-    devices: Vec<Jid>,
+    devices: Box<[Jid]>,
     recipient_count: usize,
 }
 
 impl crate::stats::HeapSize for PartitionedDmDevices {
     fn heap_bytes(&self) -> usize {
-        self.devices.capacity() * size_of::<Jid>()
+        self.devices.len() * size_of::<Jid>()
             + self.devices.iter().map(|j| j.heap_bytes()).sum::<usize>()
     }
 }
@@ -95,6 +98,28 @@ pub enum NoRecipientDeviceError {
     Unresolved,
 }
 
+/// The server named a device 0 as gone while the send was establishing
+/// sessions for it.
+///
+/// Kept apart from [`NoRecipientDeviceError`] because it can name our own
+/// primary as easily as the peer's, and the two ask for different things: this
+/// says one identity's device list is stale on a device that owns its chat, so
+/// the stanza is not built at all. Nothing was on the wire, and the useful
+/// retry is one that resolves devices again.
+#[derive(Debug, thiserror::Error)]
+#[error("the server rejected the primary device with code {code}")]
+#[non_exhaustive]
+pub struct PrimaryDeviceRejected {
+    /// The `<error code>` the server attached to it.
+    pub code: u16,
+}
+
+impl PrimaryDeviceRejected {
+    pub fn new(code: u16) -> Self {
+        Self { code }
+    }
+}
+
 impl NoRecipientDeviceError {
     fn encryption_failed(attempted: usize, source: Option<anyhow::Error>) -> Self {
         Self::EncryptionFailed {
@@ -107,10 +132,55 @@ impl NoRecipientDeviceError {
     }
 }
 
+/// What the recipient half of a DM fan-out managed to encrypt for.
+///
+/// A DM whose fan-out lost some but not all of the recipient's devices still
+/// builds a stanza, is acked, and returns a real message id, so this is the
+/// only place the loss is visible. `skipped_primary` is called out separately
+/// because a recipient's phone holds the chat whether or not they have a
+/// companion linked and open: a stanza that reached only companions is the one
+/// a recipient is most likely to never see.
+///
+/// Zero-valued for a self-chat, which has no recipient half at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct RecipientFanout {
+    /// Recipient devices the fan-out attempted.
+    pub addressed: usize,
+    /// Of those, how many produced a `<to><enc>` node.
+    pub encrypted: usize,
+    /// The recipient's device 0 was among the devices that encrypted for
+    /// nothing. Says nothing about how many others were skipped; `addressed`
+    /// against `encrypted` answers that.
+    pub skipped_primary: bool,
+    /// The server answered 406 (unregistered) for at least one of them.
+    pub had_unregistered_device: bool,
+}
+
+impl RecipientFanout {
+    /// Some recipient device was addressed and dropped. The total-loss case
+    /// never reaches a caller: it is [`NoRecipientDeviceError`].
+    pub fn is_partial(&self) -> bool {
+        self.encrypted < self.addressed
+    }
+}
+
 /// Result of `prepare_dm_stanza` — carries the stanza node and the
 /// locally computed phash for server ACK validation.
+///
+/// Sealed: it is a return type, and every field it has grown was a fact the
+/// send already knew and threw away. Sealing it means the next one costs
+/// nobody a compile error.
+#[non_exhaustive]
 pub struct PreparedDmStanza {
     pub node: Node,
+    /// What the recipient half of the fan-out reached. See [`RecipientFanout`].
+    pub recipient_fanout: RecipientFanout,
+    /// Every device, either half, that was addressed and produced no `<enc>`.
+    /// Empty on a complete fan-out. These hold no copy of the message, so a
+    /// repair driven by a later device-list disagreement has to treat them as
+    /// unreached even though the send named them.
+    pub unreached_devices: Vec<Jid>,
     /// Locally computed phash from the sent device set. Not sent on the
     /// wire (WA Web only sends phash for groups). Used by the caller to
     /// compare against the server's ACK phash for device-list drift detection.
@@ -205,6 +275,17 @@ pub async fn prepare_dm_stanza(
     let recipient_devices = resolved_devices.recipient_devices();
     let own_other_devices = resolved_devices.own_other_devices();
     let total_devices = resolved_devices.devices().len();
+    // The memoized addresses are parallel to `devices()`, which is the
+    // recipient partition followed by our companions. A list of any other
+    // length is not one this set produced, so it is ignored rather than
+    // trusted, and the fan-out resolves per device as it does without a memo.
+    let (recipient_addresses, own_addresses) = match resolved_devices.signal_addressing() {
+        Some(addressing) if addressing.encryption().len() == total_devices => {
+            let (recipient, own) = addressing.encryption().split_at(recipient_devices.len());
+            (Some(recipient), Some(own))
+        }
+        _ => (None, None),
+    };
 
     let phash = resolved_devices.phash();
 
@@ -229,6 +310,8 @@ pub async fn prepare_dm_stanza(
 
     let mut participant_nodes = Vec::with_capacity(total_devices);
     let mut includes_prekey_message = false;
+    let mut recipient_fanout = RecipientFanout::default();
+    let mut unreached_devices: Vec<Jid> = Vec::new();
 
     let hide_decrypt_fail = should_hide_decrypt_fail_for_send(edit, message);
 
@@ -252,9 +335,17 @@ pub async fn prepare_dm_stanza(
             hide_decrypt_fail,
             mediatype,
             &mut participant_nodes,
+            recipient_addresses,
         )
         .await?;
         includes_prekey_message = includes_prekey_message || summary.includes_prekey_message;
+        recipient_fanout = RecipientFanout {
+            addressed: recipient_devices.len(),
+            encrypted: summary.encrypted_devices,
+            skipped_primary: summary.skipped_primary,
+            had_unregistered_device: summary.had_unregistered_device,
+        };
+        unreached_devices = summary.dropped_devices;
         // The recipient half wrote into an empty buffer, so an emptiness test
         // here is a recipient-node count without walking anything. Bailing
         // before the own half also keeps a companion's sender chain from
@@ -283,9 +374,11 @@ pub async fn prepare_dm_stanza(
             hide_decrypt_fail,
             mediatype,
             &mut participant_nodes,
+            own_addresses,
         )
         .await?;
         includes_prekey_message = includes_prekey_message || summary.includes_prekey_message;
+        unreached_devices.extend(summary.dropped_devices);
     }
 
     // Only reachable for a self-chat now (the recipient half returns above):
@@ -347,6 +440,8 @@ pub async fn prepare_dm_stanza(
 
     Ok(PreparedDmStanza {
         node: stanza,
+        recipient_fanout,
+        unreached_devices,
         phash,
         message_secret: reporting_result.map(|r| r.message_secret),
     })
@@ -597,8 +692,29 @@ where
 mod partition_tests {
     use super::*;
 
+    /// Classification is in place, so a fan-out that drops nothing keeps the
+    /// caller's allocation: the freeze into a boxed slice is a no-op when the
+    /// input was already exact, and no per-partition `Vec` is ever built.
     #[test]
-    fn partition_dm_devices_reuses_input_allocation() {
+    fn partition_dm_devices_reuses_an_exact_input_allocation() {
+        let own_jid = Jid::lid_device("123456789".to_owned(), 7);
+        // `vec![]` allocates exactly three slots, so the freeze below has no
+        // slack to hand back and must leave the buffer where it is.
+        let devices = vec![
+            Jid::lid_device("987654321".to_owned(), 0),
+            Jid::lid_device("123456789".to_owned(), 0),
+            Jid::lid_device("987654321".to_owned(), 1),
+        ];
+        let allocation = devices.as_ptr();
+
+        let partitioned = partition_dm_devices(devices, &own_jid, None);
+
+        assert_eq!(partitioned.devices.as_ptr(), allocation);
+        assert_eq!(partitioned.devices.len(), 3);
+    }
+
+    #[test]
+    fn partition_dm_devices_splits_recipients_from_own_devices() {
         let own_jid = Jid::lid_device("123456789".to_owned(), 7);
         let devices = vec![
             Jid::lid_device("987654321".to_owned(), 0),
@@ -606,13 +722,12 @@ mod partition_tests {
             own_jid.clone(),
             Jid::lid_device("987654321".to_owned(), 1),
         ];
-        let allocation = devices.as_ptr();
-        let capacity = devices.capacity();
 
         let partitioned = partition_dm_devices(devices, &own_jid, None);
 
-        assert_eq!(partitioned.devices.as_ptr(), allocation);
-        assert_eq!(partitioned.devices.capacity(), capacity);
+        // The sending device is dropped, so the frozen slice holds exactly the
+        // three survivors rather than the four slots it was built in.
+        assert_eq!(partitioned.devices.len(), 3);
         assert_eq!(partitioned.valid_devices().len(), 3);
         assert_eq!(partitioned.recipient_devices().len(), 2);
         assert_eq!(partitioned.own_other_devices().len(), 1);

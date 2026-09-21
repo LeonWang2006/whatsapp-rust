@@ -9,44 +9,131 @@ use portable_atomic::AtomicU64;
 
 use crate::cache::Cache;
 use crate::cache_config::CacheEntryConfig;
+use wacore::stats::hash_table_bytes;
 use wacore_binary::Jid;
 
-/// Pre-parsed, pre-indexed sender key device map for one group.
+/// One tracked device of a user: which device it is, and whether it holds the
+/// group's sender key.
 ///
 /// `has_key` is an [`AtomicBool`] so `markForgetSenderKey` can flip one device
 /// cold in place, matching WA Web's per-device participant-record update,
 /// instead of invalidating the whole group and forcing the next send to re-read
-/// and re-parse every row from the DB. An in-place flip keeps the same `Arc`, so
-/// `generation` is the version stamp the `skdm_warm_memo` compares to notice the
-/// change (pointer identity alone cannot).
+/// and re-parse every row from the DB.
+#[derive(Debug)]
+struct DeviceWarmState {
+    device_id: u16,
+    has_key: AtomicBool,
+}
+
+/// Pre-parsed, pre-indexed sender key device map for one group.
+///
+/// A user's devices are a compact slice, not a nested `HashMap`. WA gives a
+/// user a handful of devices, so a per-user table spends more on buckets than
+/// it holds and a scan over three or four 4-byte entries beats hashing a `u16`;
+/// the slice also stays sorted by device id, which puts the primary — the one
+/// device every warm check has to consult — first.
+///
+/// An in-place flip keeps the same `Arc`, so `generation` is the version stamp
+/// the `skdm_warm_memo` compares to notice the change (pointer identity alone
+/// cannot).
 #[derive(Debug)]
 pub(crate) struct SenderKeyDeviceMap {
-    /// user → (device_id → has_key)
-    devices: HashMap<Arc<str>, HashMap<u16, AtomicBool>>,
+    /// user → its devices, sorted by device id.
+    ///
+    /// Plain `Box<str>` keys: the sharing this map needs lives one level up
+    /// (`Arc<SenderKeyDeviceMap>` in the cache), so per-user reference counts
+    /// would buy nothing.
+    devices: HashMap<Box<str>, Box<[DeviceWarmState]>>,
     /// Bumped on every in-place warm-state change. Same freshness contract the
     /// device-registry generation gives membership.
     generation: AtomicU64,
 }
 
+/// The state of `device_id` within one user's devices.
+///
+/// A linear scan, not a binary search: a user has a handful of devices, and at
+/// that size the branch-free walk over 4-byte entries wins outright — the sort
+/// is there for the primary shortcut below, not for this.
+fn device_state(states: &[DeviceWarmState], device_id: u16) -> Option<&DeviceWarmState> {
+    states.iter().find(|state| state.device_id == device_id)
+}
+
+/// Order a user's devices by id. Insertion sort because the slice is a handful
+/// of entries built once per group load; a generic `sort_unstable_by` here
+/// would instantiate pdqsort for a new element type, which #1353 measured at
+/// 15.6 KiB of `.text`.
+fn sort_by_device_id(states: &mut [DeviceWarmState]) {
+    for i in 1..states.len() {
+        let mut j = i;
+        while j > 0 && states[j - 1].device_id > states[j].device_id {
+            states.swap(j - 1, j);
+            j -= 1;
+        }
+    }
+}
+
 impl SenderKeyDeviceMap {
     pub fn from_db_rows(rows: &[(String, bool)]) -> Self {
-        let mut devices: HashMap<Arc<str>, HashMap<u16, AtomicBool>> =
-            HashMap::with_capacity(rows.len());
+        // Deliberately unsized: `rows` counts devices, not users, so reserving
+        // by it over-allocates the outer table by however many devices a user
+        // averages — three, in a group whose members carry companions.
+        let mut by_user: HashMap<Box<str>, Vec<DeviceWarmState>> = HashMap::new();
 
         for (jid_str, has_key) in rows {
             match jid_str.parse::<Jid>() {
                 Ok(jid) => {
-                    let user: Arc<str> = Arc::from(jid.user.as_str());
-                    devices
-                        .entry(user)
-                        .or_default()
-                        .insert(jid.device, AtomicBool::new(*has_key));
+                    // `Box<str>: Borrow<str>`, so the repeat rows of a user
+                    // that already has an entry cost a lookup instead of a
+                    // fresh allocation per device.
+                    match by_user.get_mut(jid.user.as_str()) {
+                        Some(states) => match device_state(states, jid.device) {
+                            // Two rows can collapse onto one (user, device):
+                            // this indexes the PARSED jid's user and device,
+                            // so rows differing only in server — the same
+                            // member left behind under both `@s.whatsapp.net`
+                            // and `@lid` by an addressing-mode migration —
+                            // land on the same slot. Conflicting
+                            // values resolve to cold, never to warm — the
+                            // whole map already reads a missing entry as cold
+                            // because redistributing a sender key nobody
+                            // needed is free, while skipping one a device did
+                            // need leaves that device unable to read the
+                            // message. Order-independent, so it cannot matter
+                            // which row the backend happened to return first.
+                            Some(existing) => {
+                                if !*has_key {
+                                    existing.has_key.store(false, Ordering::Relaxed);
+                                }
+                            }
+                            None => states.push(DeviceWarmState {
+                                device_id: jid.device,
+                                has_key: AtomicBool::new(*has_key),
+                            }),
+                        },
+                        None => {
+                            by_user.insert(
+                                Box::from(jid.user.as_str()),
+                                vec![DeviceWarmState {
+                                    device_id: jid.device,
+                                    has_key: AtomicBool::new(*has_key),
+                                }],
+                            );
+                        }
+                    }
                 }
                 Err(e) => {
                     log::warn!("Skipping malformed device JID '{}': {}", jid_str, e);
                 }
             }
         }
+
+        let devices = by_user
+            .into_iter()
+            .map(|(user, mut states)| {
+                sort_by_device_id(&mut states);
+                (user, states.into_boxed_slice())
+            })
+            .collect();
 
         Self {
             devices,
@@ -72,9 +159,8 @@ impl SenderKeyDeviceMap {
     #[cfg(test)]
     pub fn device_has_key(&self, user: &str, device: u16) -> Option<bool> {
         Some(
-            self.devices
-                .get(user)?
-                .get(&device)?
+            device_state(self.devices.get(user)?, device)?
+                .has_key
                 .load(Ordering::Relaxed),
         )
     }
@@ -84,13 +170,40 @@ impl SenderKeyDeviceMap {
     /// so the two device lookups share a single outer (user-string) hash instead
     /// of re-hashing the user per call. A missing entry counts as cold.
     pub fn device_and_primary_warm(&self, user: &str, device: u16) -> bool {
-        let Some(by_device) = self.devices.get(user) else {
+        let Some(states) = self.devices.get(user) else {
             return false;
         };
-        by_device
-            .get(&device)
-            .is_some_and(|k| k.load(Ordering::Relaxed))
-            && by_device.get(&0).is_some_and(|k| k.load(Ordering::Relaxed))
+        // Sorted by device id, so the primary is the first entry when it is
+        // present at all — the check every warm device pays is a single load.
+        let primary_warm = states
+            .first()
+            .is_some_and(|state| state.device_id == 0 && state.has_key.load(Ordering::Relaxed));
+        primary_warm
+            && (device == 0
+                || device_state(states, device)
+                    .is_some_and(|state| state.has_key.load(Ordering::Relaxed)))
+    }
+
+    /// Estimated bytes retained beyond this struct, including the hash table,
+    /// boxed user strings, and device slices.
+    ///
+    /// One definition, shared by the cache's `memory_stats` and by the test
+    /// that pins the per-device bound — a second copy would let the report and
+    /// the bound drift apart, and the bound is the only thing standing between
+    /// a layout change and a silent regression.
+    pub(crate) fn retained_bytes(&self) -> usize {
+        // The one table left goes through `hash_table_bytes`, which accounts
+        // for the buckets hashbrown really owns rather than the entries that
+        // fit in them; the per-user slices are exact, so they are summed by
+        // iteration.
+        hash_table_bytes(
+            self.devices.capacity(),
+            size_of::<(Box<str>, Box<[DeviceWarmState]>)>(),
+        ) + self
+            .devices
+            .iter()
+            .map(|(user, states)| user.len() + states.len() * size_of::<DeviceWarmState>())
+            .sum::<usize>()
     }
 }
 
@@ -136,9 +249,9 @@ impl SenderKeyDeviceCache {
         };
         let mut changed = false;
         for jid in devices {
-            if let Some(by_device) = map.devices.get(jid.user.as_str())
-                && let Some(flag) = by_device.get(&jid.device)
-                && flag.swap(false, Ordering::Relaxed)
+            if let Some(states) = map.devices.get(jid.user.as_str())
+                && let Some(state) = device_state(states, jid.device)
+                && state.has_key.swap(false, Ordering::Relaxed)
             {
                 // Only a real high→low transition is a warm-state change; a
                 // device already cold must not advance the generation, or a
@@ -168,7 +281,7 @@ impl SenderKeyDeviceCache {
             .filter_map(|(group_jid, map)| {
                 map.devices
                     .get(user)
-                    .and_then(|devmap| devmap.get(&device_id))
+                    .and_then(|states| device_state(states, device_id))
                     .map(|_| group_jid.as_ref().clone())
             })
             .collect();
@@ -179,20 +292,17 @@ impl SenderKeyDeviceCache {
 
     /// Approximate entry count plus estimated retained bytes.
     pub(crate) async fn memory_stats(&self) -> wacore::stats::CollectionStats {
-        // Slot allocations use capacity() (outer and inner maps alike);
-        // per-entry heap is summed by iteration.
         self.inner
-            .memory_stats(|k, v| {
-                k.capacity()
-                    + v.devices.capacity() * size_of::<(Arc<str>, HashMap<u16, AtomicBool>)>()
-                    + v.devices
-                        .iter()
-                        .map(|(user, by_device)| {
-                            user.len() + by_device.capacity() * size_of::<(u16, AtomicBool)>()
-                        })
-                        .sum::<usize>()
-            })
+            .memory_stats(|k, v| k.capacity() + v.retained_bytes())
             .await
+    }
+
+    /// Sweep maps idle past their TTI. Driven by
+    /// [`Client::run_cache_maintenance`].
+    ///
+    /// [`Client::run_cache_maintenance`]: crate::client::Client::run_cache_maintenance
+    pub(crate) async fn run_pending_tasks(&self) {
+        self.inner.run_pending_tasks().await;
     }
 }
 
@@ -320,6 +430,85 @@ mod tests {
         assert!(!m.device_and_primary_warm("999", 0));
     }
 
+    /// The warm gate reads the primary off the front of the slice, so the sort
+    /// is load-bearing: rows arrive in whatever order the DB hands them, and an
+    /// unsorted slice would report a user with a warm primary as cold and
+    /// redistribute their sender key on every single send.
+    /// The index keys on the parsed jid's user and device, so rows differing
+    /// only in server collapse onto one slot — the shape an addressing-mode
+    /// migration leaves behind, with the same member stored under both
+    /// `@s.whatsapp.net` and `@lid`. Whichever order they arrive in, the
+    /// collapse must land cold: a spurious redistribution costs one SKDM,
+    /// while a spurious warm reading skips a distribution the device needed
+    /// and leaves it unable to read the message.
+    #[test]
+    fn conflicting_duplicate_rows_collapse_to_cold() {
+        for rows in [
+            [
+                ("111:0@lid".to_string(), true),
+                ("111:0@s.whatsapp.net".to_string(), false),
+            ],
+            [
+                ("111:0@lid".to_string(), false),
+                ("111:0@s.whatsapp.net".to_string(), true),
+            ],
+        ] {
+            let m = SenderKeyDeviceMap::from_db_rows(&rows);
+            assert_eq!(
+                m.device_has_key("111", 0),
+                Some(false),
+                "conflicting rows {rows:?} must read cold"
+            );
+            assert!(!m.device_and_primary_warm("111", 0));
+        }
+
+        // Agreeing duplicates keep their value — the collapse must not turn a
+        // genuinely warm device cold and redistribute on every send.
+        let m = SenderKeyDeviceMap::from_db_rows(&[
+            ("111:0@lid".to_string(), true),
+            ("111:0@s.whatsapp.net".to_string(), true),
+        ]);
+        assert_eq!(m.device_has_key("111", 0), Some(true));
+        assert!(m.device_and_primary_warm("111", 0));
+    }
+
+    #[test]
+    fn devices_are_ordered_whatever_order_the_rows_arrive_in() {
+        let m = SenderKeyDeviceMap::from_db_rows(&[
+            ("111:9@lid".to_string(), true),
+            ("111:5@lid".to_string(), true),
+            ("111:0@lid".to_string(), true),
+            ("222:3@lid".to_string(), true),
+            ("222:0@lid".to_string(), false),
+        ]);
+
+        assert!(m.device_and_primary_warm("111", 9));
+        assert!(m.device_and_primary_warm("111", 5));
+        assert!(m.device_and_primary_warm("111", 0));
+        // Primary cold, and it is not the first row of its user either.
+        assert!(!m.device_and_primary_warm("222", 3));
+        assert!(!m.device_and_primary_warm("222", 0));
+        // Every device is still individually addressable after the reorder.
+        assert_eq!(m.device_has_key("111", 9), Some(true));
+        assert_eq!(m.device_has_key("222", 3), Some(true));
+        assert_eq!(m.device_has_key("222", 0), Some(false));
+    }
+
+    /// A user whose primary row is missing entirely: the shortcut must read
+    /// that as cold rather than mistaking the lowest device it does have for
+    /// the primary.
+    #[test]
+    fn a_user_without_a_primary_row_is_cold() {
+        let m = SenderKeyDeviceMap::from_db_rows(&[
+            ("111:5@lid".to_string(), true),
+            ("111:9@lid".to_string(), true),
+        ]);
+
+        assert!(!m.device_and_primary_warm("111", 5));
+        assert!(!m.device_and_primary_warm("111", 9));
+        assert_eq!(m.device_has_key("111", 5), Some(true));
+    }
+
     #[test]
     fn from_db_rows_skips_malformed_and_keeps_valid() {
         // A corrupt or partially-migrated row must not poison the whole map: bad
@@ -336,6 +525,46 @@ mod tests {
         // The malformed rows produced no entries at all.
         assert_eq!(m.device_has_key("not-a-jid", 0), None);
         assert_eq!(m.device_has_key("111", 1), None);
+    }
+
+    /// A group's sender-key map stays resident for as long as the group is
+    /// warm, and there is one per group, so its cost per tracked device is a
+    /// bound rather than a comment. Uses the same 1024x3 shape as the device
+    /// memo test in `device_registry`, since the two sit side by side behind
+    /// every group send. Budget: rebaseline per
+    /// [layout asserts](../agent_docs/layout_asserts.md).
+    #[test]
+    fn retained_bytes_per_device_stay_bounded() {
+        const USERS: usize = 1024;
+        const DEVICES_PER_USER: usize = 3;
+
+        let mut rows = Vec::with_capacity(USERS * DEVICES_PER_USER);
+        for i in 0..USERS {
+            for device in 0..DEVICES_PER_USER {
+                rows.push((format!("1000000{i:08}:{device}@lid"), true));
+            }
+        }
+        let map = SenderKeyDeviceMap::from_db_rows(&rows);
+        let expected = hash_table_bytes(
+            map.devices.capacity(),
+            size_of::<(Box<str>, Box<[DeviceWarmState]>)>(),
+        ) + map
+            .devices
+            .iter()
+            .map(|(user, states)| user.len() + states.len() * size_of::<DeviceWarmState>())
+            .sum::<usize>();
+        assert_eq!(
+            map.retained_bytes(),
+            expected,
+            "sender-key accounting must not retain the removed Arc headers"
+        );
+
+        let per_device =
+            (size_of::<SenderKeyDeviceMap>() + map.retained_bytes()) / (USERS * DEVICES_PER_USER);
+        assert!(
+            per_device <= 36,
+            "a warm 1024-user sender-key map must stay within 36 B per device, got {per_device}"
+        );
     }
 
     #[tokio::test]

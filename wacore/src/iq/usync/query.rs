@@ -1022,6 +1022,15 @@ pub struct UsyncDevicesResult {
 pub struct UsyncBusinessResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verified_name: Option<VerifiedName>,
+    /// Phone-number JID the server attaches to `<business>` when the queried
+    /// user was addressed by LID. It is the only place a username lookup can
+    /// learn the PN, since such a query never carries one.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_usync_jid"
+    )]
+    pub pn_jid: Option<Jid>,
 }
 
 /// About/status payload. WhatsApp Web consumes only `status`, while the
@@ -1481,7 +1490,17 @@ fn parse_business(node: &NodeRef<'_>) -> Result<UsyncBusinessResult, anyhow::Err
         }
         _ => None,
     };
-    Ok(UsyncBusinessResult { verified_name })
+    // Deliberately not `finish()`ed: `optional_jid` records a malformed value as
+    // an error, and this parser's failure rejects the whole usync response. A
+    // bonus disclosure on one user must not cost the answer for every other.
+    let pn_jid = node
+        .attrs()
+        .optional_jid(ATTR_PN_JID)
+        .map(|jid| jid.to_non_ad());
+    Ok(UsyncBusinessResult {
+        verified_name,
+        pn_jid,
+    })
 }
 
 fn parse_features(node: &NodeRef<'_>) -> Result<Vec<UsyncFeatureResult>, anyhow::Error> {
@@ -2420,6 +2439,7 @@ mod tests {
                                 issuer: None,
                                 certificate: Some(Vec::new()),
                             }),
+                            pn_jid: None,
                         },
                     ))),
                     UsyncProtocolResult::Bot(UsyncOutcome::Value(Box::new(
@@ -2463,8 +2483,14 @@ mod tests {
         );
     }
 
+    /// Budget: the sparse result rides along on every usync response.
+    /// Rebaseline per [layout asserts](../../../../agent_docs/layout_asserts.md).
     #[test]
     fn sparse_result_layout_stays_bounded() {
-        assert!(size_of::<UsyncProtocolResult>() <= 96);
+        assert!(
+            size_of::<UsyncProtocolResult>() <= 96,
+            "UsyncProtocolResult grew to {} B (budget 96)",
+            size_of::<UsyncProtocolResult>()
+        );
     }
 }

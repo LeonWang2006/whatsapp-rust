@@ -1,141 +1,16 @@
 //! Audio format and I/O contracts shared by the sans-I/O engine and platform drivers.
 
-use bytes::Bytes;
-use wacore_binary::Jid;
+use super::rtp::RTP_PAYLOAD_TYPE_MLOW_RED;
 
-use super::rtp::{
-    RTP_PAYLOAD_TYPE_MLOW, RTP_PAYLOAD_TYPE_MLOW_RED, RTP_PAYLOAD_TYPE_OPUS,
-    RTP_PAYLOAD_TYPE_WHATSAPP_AUDIO,
+// The fundamental format types now live in the neutral contract, so the control plane can name
+// them without the engine. Re-exported here so every historical `crate::voip::audio::*` (and
+// `crate::voip::*`) path resolves to the one type. The payload-inspecting helpers below are a
+// second inherent `impl` on `AudioFormat`, allowed because it is the same crate.
+pub use crate::voip_control::audio_format::{
+    AudioCodec, AudioFormat, AudioIo, AudioRtpProfile, RTP_PAYLOAD_TYPE_MLOW, is_mlow_embedded_opus,
 };
 
-/// Codec carried inside WhatsApp's audio RTP payload.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum AudioCodec {
-    Mlow,
-    Opus,
-}
-
-/// RTP payload family selected for the call independently from the encoded bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum AudioRtpProfile {
-    /// WhatsApp MLOW framing: PT 120/121 with the in-profile Opus escape.
-    Mlow,
-    /// Native Opus bytes. Payload type and clock remain independently negotiated.
-    StandardOpus,
-}
-
-/// Where encoding and decoding happen.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum AudioIo {
-    /// The core converts 16-bit PCM using its built-in codec.
-    Pcm,
-    /// The application supplies and consumes complete codec payloads.
-    Encoded,
-}
-
-/// Fixed audio timing for one call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct AudioFormat {
-    /// Codec bytes supplied by the encoded source.
-    pub codec: AudioCodec,
-    /// RTP family negotiated with the peer. This is not implied by [`Self::codec`].
-    pub rtp_profile: AudioRtpProfile,
-    /// `<audio rate=…>` value used by call signaling.
-    pub signaling_rate: u32,
-    /// PCM rate expected by a codec adapter, when one is used.
-    pub sample_rate: u32,
-    pub channels: u8,
-    /// PCM samples represented by one encoded payload, per channel.
-    pub samples_per_frame: u32,
-    /// RTP clock used for reception statistics.
-    pub rtp_clock_rate: u32,
-    /// RTP timestamp increment after each encoded payload.
-    pub rtp_timestamp_step: u32,
-    /// RTP payload type advertised by the selected WhatsApp media profile.
-    pub rtp_payload_type: u8,
-}
-
 impl AudioFormat {
-    /// The implemented MLOW operating point: mono, 16 kHz, 60 ms.
-    pub const MLOW_16KHZ_60MS: Self = Self {
-        codec: AudioCodec::Mlow,
-        rtp_profile: AudioRtpProfile::Mlow,
-        signaling_rate: 16_000,
-        sample_rate: 16_000,
-        channels: 1,
-        samples_per_frame: 960,
-        rtp_clock_rate: 16_000,
-        rtp_timestamp_step: 960,
-        rtp_payload_type: RTP_PAYLOAD_TYPE_MLOW,
-    };
-
-    /// Standard Opus/CELT carried through MLOW's native escape.
-    ///
-    /// The Opus packet must be CELT-only and use MLOW's rewritten TOC. The RTP clock remains the
-    /// negotiated MLOW clock.
-    pub const OPUS_MLOW_16KHZ_60MS: Self = Self {
-        codec: AudioCodec::Opus,
-        rtp_profile: AudioRtpProfile::Mlow,
-        signaling_rate: 16_000,
-        sample_rate: 16_000,
-        channels: 1,
-        samples_per_frame: 960,
-        rtp_clock_rate: 16_000,
-        rtp_timestamp_step: 960,
-        rtp_payload_type: RTP_PAYLOAD_TYPE_MLOW,
-    };
-
-    /// Native Opus using WhatsApp's default PT 120 and 16 kHz RTP clock.
-    ///
-    /// Capability v1 index 31 disables MLOW decoding independently from PT and clock selection.
-    pub const OPUS_16KHZ_60MS: Self = Self {
-        codec: AudioCodec::Opus,
-        rtp_profile: AudioRtpProfile::StandardOpus,
-        signaling_rate: 16_000,
-        sample_rate: 16_000,
-        channels: 1,
-        samples_per_frame: 960,
-        rtp_clock_rate: 16_000,
-        rtp_timestamp_step: 960,
-        rtp_payload_type: RTP_PAYLOAD_TYPE_WHATSAPP_AUDIO,
-    };
-
-    /// Native Opus with a 16 kHz codec adapter and RFC 7587's 48 kHz RTP clock.
-    pub const OPUS_RFC7587_16KHZ_60MS: Self = Self {
-        codec: AudioCodec::Opus,
-        rtp_profile: AudioRtpProfile::StandardOpus,
-        signaling_rate: 16_000,
-        sample_rate: 16_000,
-        channels: 1,
-        samples_per_frame: 960,
-        rtp_clock_rate: 48_000,
-        rtp_timestamp_step: 2_880,
-        rtp_payload_type: RTP_PAYLOAD_TYPE_OPUS,
-    };
-
-    /// RFC 7587 Opus timing. Useful for interop experiments with external RTP-aware codecs.
-    pub const OPUS_RFC7587_48KHZ_60MS: Self = Self {
-        codec: AudioCodec::Opus,
-        rtp_profile: AudioRtpProfile::StandardOpus,
-        signaling_rate: 16_000,
-        sample_rate: 48_000,
-        channels: 1,
-        samples_per_frame: 2_880,
-        rtp_clock_rate: 48_000,
-        rtp_timestamp_step: 2_880,
-        rtp_payload_type: RTP_PAYLOAD_TYPE_OPUS,
-    };
-
-    pub const fn accepts_rtp_payload_type(self, payload_type: u8) -> bool {
-        payload_type == self.rtp_payload_type
-            || matches!(self.rtp_profile, AudioRtpProfile::Mlow)
-                && payload_type == RTP_PAYLOAD_TYPE_MLOW_RED
-    }
-
     /// Identify the actual inbound codec after the negotiated RTP profile is known.
     pub fn inbound_codec(self, payload_type: u8, payload: &[u8]) -> AudioCodec {
         match self.rtp_profile {
@@ -149,6 +24,27 @@ impl AudioFormat {
         }
     }
 
+    /// Whether this payload is MLOW's escape, as opposed to native Opus that merely looks like one.
+    ///
+    /// The marker alone cannot answer it: `is_mlow_embedded_opus` tests the top two bits, and every
+    /// native Opus CELT config (24..=31) sets them -- a native 60 ms CELT packet starts 0xC3. Read
+    /// on the marker alone, native CELT is called an escape and has a TOC that was never rewritten
+    /// rewritten again, which does not decode.
+    ///
+    /// What separates them is the same arithmetic the content probe rests on. An escape's low TOC
+    /// bit means "multiple frames", not an Opus frame count, so read back as Opus it is code 0 or
+    /// code 1 -- one or two CELT frames, at most 40 ms. It can therefore never claim the negotiated
+    /// packet duration, while native CELT at that duration claims it exactly. Parsing as Opus at
+    /// this format's own cadence is thus a property only the native packet has.
+    #[must_use]
+    pub fn payload_is_mlow_escape(self, payload: &[u8]) -> bool {
+        matches!(self.rtp_profile, AudioRtpProfile::Mlow)
+            && is_mlow_embedded_opus(payload)
+            && crate::voip::opus_packet_shape(payload)
+                .and_then(|shape| shape.total_samples(self.rtp_clock_rate))
+                != Some(self.rtp_timestamp_step)
+    }
+
     /// Reject raw Opus that the MLOW receiver would parse as proprietary codec data.
     pub fn accepts_encoded_payload(self, payload: &[u8]) -> bool {
         !payload.is_empty()
@@ -158,20 +54,63 @@ impl AudioFormat {
             ) || is_mlow_embedded_opus(payload)
                 || payload == [0x90])
     }
+}
 
-    pub(crate) fn is_valid(self) -> bool {
-        self.signaling_rate != 0
-            && self.sample_rate != 0
-            && self.channels != 0
-            && self.samples_per_frame != 0
-            && self.rtp_clock_rate != 0
-            && self.rtp_timestamp_step != 0
-            && self.rtp_payload_type <= 127
+impl AudioFormat {
+    /// Validate a neutral format as an engine format.
+    ///
+    /// Same type now; returns `None` when the result would be invalid (a zero timing or channel
+    /// value), matching the old conversion's contract.
+    #[must_use]
+    pub(crate) fn from_neutral(format: crate::voip_control::MediaAudioFormat) -> Option<Self> {
+        format.is_valid().then_some(format)
     }
 }
 
-fn is_mlow_embedded_opus(payload: &[u8]) -> bool {
-    payload.first().is_some_and(|byte| byte & 0xC0 == 0xC0)
+/// An audio codec the core cannot implement, supplied by the platform.
+///
+/// `wacore` is sans-io and builds for wasm32 and ESP32, so it cannot link libopus. MLow is pure
+/// Rust and lives here; standard Opus does not. This is the seam: a runtime that has libopus hands
+/// one of these to the engine, and one that does not passes `None` and gets an honest
+/// [`crate::voip::CallEvent::AudioSilent`] instead of a call that pretends.
+///
+/// Implementations are stateful and per call. The engine owns exactly one and drives it from a
+/// single task, so the bound is `Send` and not `Send + Sync`: nothing here is ever shared by
+/// reference, and requiring `Sync` would exclude every real codec binding (libopus's decoder is
+/// `Send` but not `Sync`) for a guarantee no caller needs.
+pub trait ForeignAudioCodec: crate::sync_marker::MaybeSend {
+    /// Decode one payload, appending samples to `out`. `out` is reused across calls and arrives
+    /// empty; append rather than assigning so the caller keeps its allocation.
+    fn decode(&mut self, payload: &[u8], out: &mut Vec<i16>) -> Result<(), ForeignCodecError>;
+
+    /// Append `samples` of concealment for a packet that was lost or could not be decoded.
+    fn conceal(&mut self, samples: usize, out: &mut Vec<i16>);
+
+    /// Encode one frame of PCM, appending to `out` under the same contract as `decode`.
+    fn encode(&mut self, pcm: &[i16], out: &mut Vec<u8>) -> Result<(), ForeignCodecError>;
+}
+
+/// Makes one [`ForeignAudioCodec`] per stream that needs one.
+///
+/// A group call needs a decoder PER PARTICIPANT: these codecs carry inter-frame state, so feeding
+/// two speakers through one instance corrupts both. A single injected codec cannot serve them, and
+/// the engine cannot clone one, so a runtime that has libopus supplies this instead and the engine
+/// mints a decoder the first time each participant is heard from.
+pub trait ForeignAudioCodecFactory: crate::sync_marker::MaybeSend {
+    /// A fresh decoder, or `None` if one cannot be built right now. `None` is reported the same way
+    /// a missing codec is on the direct path: honest silence, never a pretend decode.
+    fn create(&self) -> Option<Box<dyn ForeignAudioCodec>>;
+}
+
+/// Why an injected codec refused a frame. Deliberately opaque: the engine counts and conceals, and
+/// the specific complaint belongs in the implementation's own log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ForeignCodecError {
+    #[error("the payload is not valid for this codec")]
+    InvalidPayload,
+    #[error("the frame size is not one this codec accepts")]
+    BadFrameSize,
 }
 
 /// Failure while translating between RFC Opus and MLOW's CELT packet header.
@@ -413,11 +352,42 @@ impl AudioConfig {
         io: AudioIo::Pcm,
     };
 
+    /// The other half of the swappable pair, for a peer outside the MLOW rollout.
+    ///
+    /// PCM I/O admits exactly these two formats, so they are named rather than left to a general
+    /// constructor: this one needs a [`ForeignAudioCodec`], since standard Opus is not something
+    /// `wacore` can implement, and the engine reports [`crate::voip::CallEvent::AudioSilent`]
+    /// rather than pretending when none was installed.
+    pub const OPUS_PCM: Self = Self {
+        format: AudioFormat::OPUS_16KHZ_60MS,
+        io: AudioIo::Pcm,
+    };
+
     pub const fn encoded(format: AudioFormat) -> Self {
         Self {
             format,
             io: AudioIo::Encoded,
         }
+    }
+
+    /// Build a config from the neutral seam's flat [`MediaAudioSpec`].
+    ///
+    /// Counterpart to [`AudioFormat::from_neutral`]: `AudioConfig` is also `#[non_exhaustive]`, so a
+    /// backend outside this crate cannot assemble one from fields.
+    ///
+    /// [`MediaAudioSpec`]: crate::voip_control::MediaAudioSpec
+    #[must_use]
+    pub(crate) fn from_neutral(spec: crate::voip_control::MediaAudioSpec) -> Option<Self> {
+        use crate::voip_control::MediaAudioIo;
+
+        let format = AudioFormat::from_neutral(spec.format)?;
+        Some(Self {
+            format,
+            io: match spec.io {
+                MediaAudioIo::Pcm => AudioIo::Pcm,
+                MediaAudioIo::Encoded => AudioIo::Encoded,
+            },
+        })
     }
 }
 
@@ -428,41 +398,58 @@ impl Default for AudioConfig {
 }
 
 /// One decrypted codec payload received from the peer.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct EncodedAudioFrame {
-    pub format: AudioFormat,
-    /// Codec detected within the negotiated RTP profile for this packet.
-    pub codec: AudioCodec,
-    pub data: Bytes,
-    /// Actual RTP payload type. MLOW redundancy uses PT 121 while the primary format uses PT 120.
-    pub payload_type: u8,
-    pub sequence_number: u16,
-    pub timestamp: u32,
-    pub marker: bool,
-    /// Group sender identity. Absent on 1:1 audio.
-    pub sender: Option<Jid>,
-    /// Group sender device identity. Absent on 1:1 audio.
-    pub device: Option<Jid>,
-    /// Relay participant id from the authoritative roster.
-    pub pid: Option<u32>,
-}
+///
+/// This is the neutral [`MediaEncodedFrame`](crate::voip_control::MediaEncodedFrame) under its
+/// historical engine name: one definition, so the engine's payload and the public event's payload
+/// cannot drift.
+pub use crate::voip_control::MediaEncodedFrame as EncodedAudioFrame;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // The comparison exists so that "nothing to re-signal" stays true of any pair it admits. It
+    // checked every RTP timing field and not the signalling rate -- which is the one thing in an
+    // `AudioFormat` the peer learns from the `<audio rate>` rather than from the packets. A format
+    // on this payload type signalled at another rate could therefore be switched live to the
+    // built-in 16 kHz sibling, mid-call, against a peer that was told something else.
+    #[test]
+    fn a_sibling_has_to_agree_on_the_rate_the_peer_was_signalled() {
+        let standard = AudioFormat::MLOW_16KHZ_60MS;
+        assert_eq!(
+            standard.sibling_for(AudioCodec::Opus),
+            Some(AudioFormat::OPUS_16KHZ_60MS),
+            "the one documented interchangeable pair still swaps"
+        );
+
+        let resignalled = AudioFormat {
+            signaling_rate: 8_000,
+            ..AudioFormat::MLOW_16KHZ_60MS
+        };
+        assert_eq!(
+            resignalled.sibling_for(AudioCodec::Opus),
+            None,
+            "but not into a format the peer was never told about"
+        );
+    }
+
     #[test]
     fn native_opus_codec_selection_is_independent_from_rtp_clock_profile() {
         let native = AudioFormat::OPUS_16KHZ_60MS;
         assert_eq!(native.rtp_profile, AudioRtpProfile::StandardOpus);
-        assert_eq!(native.rtp_payload_type, RTP_PAYLOAD_TYPE_WHATSAPP_AUDIO);
+        assert_eq!(
+            native.rtp_payload_type,
+            crate::voip::rtp::RTP_PAYLOAD_TYPE_WHATSAPP_AUDIO
+        );
         assert_eq!(native.rtp_clock_rate, 16_000);
         assert_eq!(native.rtp_timestamp_step, 960);
 
         let rfc7587 = AudioFormat::OPUS_RFC7587_16KHZ_60MS;
         assert_eq!(rfc7587.rtp_profile, AudioRtpProfile::StandardOpus);
-        assert_eq!(rfc7587.rtp_payload_type, RTP_PAYLOAD_TYPE_OPUS);
+        assert_eq!(
+            rfc7587.rtp_payload_type,
+            crate::voip::rtp::RTP_PAYLOAD_TYPE_OPUS
+        );
         assert_eq!(rfc7587.rtp_clock_rate, 48_000);
         assert_eq!(rfc7587.rtp_timestamp_step, 2_880);
     }
@@ -473,7 +460,10 @@ mod tests {
         assert!(
             AudioFormat::OPUS_MLOW_16KHZ_60MS.accepts_rtp_payload_type(RTP_PAYLOAD_TYPE_MLOW_RED)
         );
-        assert!(!AudioFormat::OPUS_MLOW_16KHZ_60MS.accepts_rtp_payload_type(RTP_PAYLOAD_TYPE_OPUS));
+        assert!(
+            !AudioFormat::OPUS_MLOW_16KHZ_60MS
+                .accepts_rtp_payload_type(crate::voip::rtp::RTP_PAYLOAD_TYPE_OPUS)
+        );
     }
 
     #[test]

@@ -94,7 +94,7 @@ async fn test_ack_behavior_for_incoming_stanzas() {
     // status@broadcast gets the transport <ack> as a fallback so that
     // drop paths in process_group_enc_batch (expired status, missing
     // sender key, decrypt error) don't leave the server retransmitting.
-    // The success path also emits <receipt context="status">; the
+    // The success path also emits <receipt class="status">; the
     // duplicate is tolerated.
     let mut status_attrs = Attrs::new();
     status_attrs.insert("from".to_string(), "status@broadcast".to_string());
@@ -1039,10 +1039,10 @@ async fn test_offline_sync_lifecycle() {
     info!("✅ test_offline_sync_lifecycle passed");
 }
 
-/// Test that establish_primary_phone_session_immediate returns error when no PN is set.
+/// Test that log_primary_phone_session_state returns error when no PN is set.
 /// This verifies the "not logged in" guard works.
 #[tokio::test]
-async fn test_establish_primary_phone_session_fails_without_pn() {
+async fn test_primary_phone_session_probe_fails_without_pn() {
     let backend = Arc::new(
         crate::store::SqliteStore::new("file:memdb_no_pn?mode=memory&cache=shared")
             .await
@@ -1063,11 +1063,11 @@ async fn test_establish_primary_phone_session_fails_without_pn() {
     .await;
 
     // No PN set, so this should fail
-    let result = client.establish_primary_phone_session_immediate().await;
+    let result = client.log_primary_phone_session_state().await;
 
     assert!(
         result.is_err(),
-        "establish_primary_phone_session_immediate should fail when no PN is set"
+        "log_primary_phone_session_state should fail when no PN is set"
     );
 
     let err = result.unwrap_err();
@@ -1078,12 +1078,12 @@ async fn test_establish_primary_phone_session_fails_without_pn() {
         err
     );
 
-    info!("✅ test_establish_primary_phone_session_fails_without_pn passed");
+    info!("✅ test_primary_phone_session_probe_fails_without_pn passed");
 }
 
 /// Test that ensure_e2e_sessions waits for offline sync to complete.
 /// This is the CRITICAL difference between ensure_e2e_sessions and
-/// establish_primary_phone_session_immediate.
+/// log_primary_phone_session_state.
 #[tokio::test]
 async fn test_ensure_e2e_sessions_waits_for_offline_sync() {
     use std::sync::atomic::Ordering;
@@ -1197,16 +1197,11 @@ async fn ensure_sessions_warm_cache_short_circuits() {
         .expect("cached session must satisfy ensure without network");
 }
 
-/// Integration test: Verify that the immediate session establishment does NOT
-/// wait for offline sync. This is critical for PDO to work during offline sync.
-///
-/// The flow is:
-/// 1. Login -> establish_primary_phone_session_immediate() is called
-/// 2. This should NOT wait for offline sync (flag is false at this point)
-/// 3. After session is established, offline messages arrive
-/// 4. When decryption fails, PDO can immediately send to device 0
+/// Integration test: the primary-phone probe answers from local state alone —
+/// it never blocks on the offline drain, which is what would make it unsafe to
+/// run at login at all.
 #[tokio::test]
-async fn test_immediate_session_does_not_wait_for_offline_sync() {
+async fn test_primary_phone_session_probe_does_not_wait_for_offline_sync() {
     use std::sync::atomic::Ordering;
     use wacore_binary::Jid;
 
@@ -1221,7 +1216,7 @@ async fn test_immediate_session_does_not_wait_for_offline_sync() {
             .expect("persistence manager should initialize"),
     );
 
-    // Set a PN so establish_primary_phone_session_immediate doesn't fail early
+    // Set a PN so log_primary_phone_session_state doesn't fail early
     pm.modify_device(|device| {
         device.pn = Some(Jid::pn("559999999999"));
     })
@@ -1239,7 +1234,7 @@ async fn test_immediate_session_does_not_wait_for_offline_sync() {
     // Flag is false (offline sync not complete - simulating login state)
     assert!(!client.offline_sync_completed.load(Ordering::Relaxed));
 
-    // Call establish_primary_phone_session_immediate
+    // Call log_primary_phone_session_state
     // It should NOT wait for offline sync - it should proceed immediately
     let start = wacore::time::Instant::now();
 
@@ -1247,7 +1242,7 @@ async fn test_immediate_session_does_not_wait_for_offline_sync() {
     // but the important thing is that it doesn't WAIT for offline sync
     let result = tokio::time::timeout(
         Duration::from_millis(500),
-        client.establish_primary_phone_session_immediate(),
+        client.log_primary_phone_session_state(),
     )
     .await;
 
@@ -1256,36 +1251,34 @@ async fn test_immediate_session_does_not_wait_for_offline_sync() {
     // The call should complete (or fail) quickly, NOT wait for 10 second timeout
     assert!(
         result.is_ok(),
-        "establish_primary_phone_session_immediate should not wait for offline sync, timed out"
+        "log_primary_phone_session_state should not wait for offline sync, timed out"
     );
 
     // It should complete in < 500ms (not 10 second wait)
     assert!(
         elapsed.as_millis() < 500,
-        "establish_primary_phone_session_immediate should not wait, took {:?}",
+        "log_primary_phone_session_state should not wait, took {:?}",
         elapsed
     );
 
     // The actual result might be an error (no network), but that's fine
     // The important thing is it didn't wait for offline sync
     info!(
-        "establish_primary_phone_session_immediate completed in {:?} (result: {:?})",
+        "log_primary_phone_session_state completed in {:?} (result: {:?})",
         elapsed,
         result.unwrap().is_ok()
     );
 
-    info!("✅ test_immediate_session_does_not_wait_for_offline_sync passed");
+    info!("✅ test_primary_phone_session_probe_does_not_wait_for_offline_sync passed");
 }
 
-/// Integration test: Verify that establish_primary_phone_session_immediate
-/// skips establishment when a session already exists.
+/// Integration test: the probe reports an existing session and touches nothing.
 ///
-/// This is the CRITICAL fix for MAC verification failures:
-/// - BUG (before fix): Called process_prekey_bundle() unconditionally,
-///   replacing the existing session with a new one
-/// - RESULT: Remote device still uses old session state, causing MAC failures
+/// It once called `process_prekey_bundle()` unconditionally, replacing a live
+/// session with a fresh one while the remote device kept using the old state —
+/// which is how MAC verification started failing. It must stay read-only.
 #[tokio::test]
-async fn test_establish_session_skips_when_exists() {
+async fn test_primary_phone_session_probe_leaves_an_existing_session_alone() {
     use wacore::libsignal::protocol::SessionRecord;
     use wacore::libsignal::store::SessionStore;
     use wacore::types::jid::JidExt;
@@ -1302,12 +1295,13 @@ async fn test_establish_session_skips_when_exists() {
             .expect("persistence manager should initialize"),
     );
 
-    // Set a PN so the function doesn't fail early
+    // A PN so the probe does not fail early, and a LID so it reaches the
+    // session check at all: without an own LID it returns before probing.
     let own_pn = Jid::pn("559999999999");
-    pm.modify_device(|device| {
-        device.pn = Some(own_pn.clone());
-    })
-    .await;
+    pm.process_command(DeviceCommand::SetId(Some(own_pn.clone())))
+        .await;
+    pm.process_command(DeviceCommand::SetLid(Some(Jid::lid("100000000000002"))))
+        .await;
 
     // Pre-populate a session for the primary phone JID (device 0)
     let primary_phone_jid = own_pn.with_device(0);
@@ -1315,9 +1309,8 @@ async fn test_establish_session_skips_when_exists() {
 
     // Create a dummy session record
     let dummy_session = SessionRecord::new_fresh();
-    {
-        let device_arc = pm.get_device_arc().await;
-        let device = device_arc.read().await;
+    let record_before = {
+        let device = pm.get_device_snapshot();
         device
             .store_session(&signal_addr, &dummy_session)
             .await
@@ -1329,7 +1322,13 @@ async fn test_establish_session_skips_when_exists() {
             .await
             .expect("Failed to check session");
         assert!(exists, "Session should exist after store");
-    }
+        device
+            .load_session(&signal_addr)
+            .await
+            .expect("Failed to load the stored session")
+            .serialize()
+            .expect("a stored session serializes")
+    };
 
     let (client, _rx) = Client::new(
         Arc::new(crate::runtime_impl::TokioRuntime),
@@ -1340,28 +1339,39 @@ async fn test_establish_session_skips_when_exists() {
     )
     .await;
 
-    // Call establish_primary_phone_session_immediate
+    // Call log_primary_phone_session_state
     // It should return Ok(()) immediately without fetching prekeys
-    let result = client.establish_primary_phone_session_immediate().await;
+    let result = client.log_primary_phone_session_state().await;
 
     assert!(
         result.is_ok(),
-        "establish_primary_phone_session_immediate should succeed when session exists"
+        "log_primary_phone_session_state should succeed when session exists"
     );
 
-    // Verify the session was NOT replaced (still has the same record)
-    // This is the critical assertion - if session was replaced, it would cause MAC failures
+    // The critical assertion: a replaced record is what caused the MAC failures,
+    // and `contains_session` alone cannot tell a replaced record from the original.
+    // A missing session loads as a fresh record, so existence is still checked
+    // separately.
     {
-        let device_arc = pm.get_device_arc().await;
-        let device = device_arc.read().await;
+        let device = pm.get_device_snapshot();
         let exists = device
             .contains_session(&signal_addr)
             .await
             .expect("Failed to check session");
         assert!(exists, "Session should still exist after the call");
+        let record_after = device
+            .load_session(&signal_addr)
+            .await
+            .expect("Failed to load the session after the probe")
+            .serialize()
+            .expect("a stored session serializes");
+        assert_eq!(
+            record_after, record_before,
+            "the probe must leave the existing session record untouched"
+        );
     }
 
-    info!("✅ test_establish_session_skips_when_exists passed");
+    info!("✅ test_primary_phone_session_probe_leaves_an_existing_session_alone passed");
 }
 
 /// Integration test: Verify that the session check prevents MAC failures
@@ -2408,13 +2418,34 @@ fn test_encrypt_identity_notification_omits_type() {
         .build();
 
     assert!(
-        is_encrypt_identity_notification(&node.as_node_ref()),
+        is_encrypt_notification(&node.as_node_ref()),
         "identity-change notification ACK must omit type to match WA Web"
     );
 }
 
+/// Every `<notification type="encrypt">` acks without a `type`, not just the
+/// identity-change one. The three WA Web handlers this mirrors are named at
+/// `encode_ack_bytes`.
 #[test]
-fn test_device_notification_is_not_encrypt_identity() {
+fn test_encrypt_count_and_digest_notifications_also_omit_type() {
+    for child in ["count", "pq_count", "digest"] {
+        let node = NodeBuilder::new("notification")
+            .attr("from", "s.whatsapp.net")
+            .attr("id", "4128735302")
+            .attr("type", "encrypt")
+            .children([NodeBuilder::new(child).build()])
+            .build();
+
+        let ack = build_ack_node(&node.as_node_ref(), None).expect("ack");
+        assert!(
+            ack.attrs.get("type").is_none(),
+            "<{child}> encrypt notification ack must omit type to match WA Web"
+        );
+    }
+}
+
+#[test]
+fn test_device_notification_is_not_an_encrypt_notification() {
     let node = NodeBuilder::new("notification")
         .attr("from", "186303081611421@lid")
         .attr("id", "269488578")
@@ -2423,8 +2454,8 @@ fn test_device_notification_is_not_encrypt_identity() {
         .build();
 
     assert!(
-        !is_encrypt_identity_notification(&node.as_node_ref()),
-        "device notification is not an encrypt+identity notification"
+        !is_encrypt_notification(&node.as_node_ref()),
+        "device notification is not an encrypt notification"
     );
 }
 
@@ -2957,7 +2988,7 @@ fn test_message_ack_source_node_own_device_addressing() {
     // Own-account branch: sender == `from` (device-qualified), chat is the
     // device-stripped recipient. `to` must come from sender, not chat.
     let info = MessageInfo {
-        id: "AC055553E56A2C12DE592DAD6353C477".to_string(),
+        id: "AC055553E56A2C12DE592DAD6353C477".into(),
         source: MessageSource {
             sender: "236395184570386@lid".parse().expect("sender"),
             chat: "156535032389744@lid".parse().expect("chat"),
@@ -3002,7 +3033,7 @@ fn test_message_ack_source_node_own_device_addressing() {
 fn test_message_ack_source_node_incoming_dm_addressing() {
     use crate::types::message::{MessageInfo, MessageSource};
     let info = MessageInfo {
-        id: "MSGID".to_string(),
+        id: "MSGID".into(),
         source: MessageSource {
             sender: "5511999998888:3@s.whatsapp.net".parse().expect("sender"),
             chat: "5511999998888@s.whatsapp.net".parse().expect("chat"),
@@ -3036,7 +3067,7 @@ fn test_message_ack_source_node_incoming_dm_addressing() {
 fn test_message_ack_source_node_status_addressing() {
     use crate::types::message::{MessageInfo, MessageSource};
     let info = MessageInfo {
-        id: "STATUSMSG".to_string(),
+        id: "STATUSMSG".into(),
         source: MessageSource {
             chat: "status@broadcast".parse().expect("status chat"),
             sender: "181531758878822@lid".parse().expect("participant"),
@@ -3075,7 +3106,7 @@ fn test_message_ack_source_node_group_addressing() {
     use crate::types::message::{MessageInfo, MessageSource};
     // Group branch: chat == group `from`, sender == participant.
     let info = MessageInfo {
-        id: "GROUPMSGID".to_string(),
+        id: "GROUPMSGID".into(),
         source: MessageSource {
             chat: "120363011111111111@g.us".parse().expect("group"),
             sender: "181531758878822@lid".parse().expect("participant"),
@@ -3174,6 +3205,50 @@ fn test_fibonacci_backoff_max_900s() {
     );
 }
 
+/// The sequence stops changing at the cap, so the work of computing it must
+/// stop there too. The counter feeding this is only reset by a connection that
+/// stays up 30 s, so on a link that flaps for weeks it is the one input here
+/// with no natural bound.
+#[test]
+fn fibonacci_backoff_stops_at_the_cap_instead_of_counting_out_the_attempt() {
+    let capped = fibonacci_backoff(20);
+    let far_past_the_cap = fibonacci_backoff(u32::MAX);
+    for (label, delay) in [
+        ("attempt 20", capped),
+        ("attempt u32::MAX", far_past_the_cap),
+    ] {
+        let ms = delay.as_millis() as u64;
+        assert!(
+            (810_000..=990_000).contains(&ms),
+            "{label} should be the 900s cap (±10% jitter), got {ms}ms"
+        );
+    }
+}
+
+/// The counter itself saturates, so a month of flapping cannot run it up (or,
+/// with the 429 handler adding five at a time, wrap it). The delay is pinned at
+/// the cap long before the ceiling, so nothing about the schedule moves.
+#[test]
+fn reconnect_attempts_saturate_at_the_ceiling() {
+    assert_eq!(next_backoff_attempt(0), 1);
+    assert_eq!(
+        next_backoff_attempt(MAX_BACKOFF_ATTEMPTS - 1),
+        MAX_BACKOFF_ATTEMPTS
+    );
+    assert_eq!(
+        next_backoff_attempt(MAX_BACKOFF_ATTEMPTS),
+        MAX_BACKOFF_ATTEMPTS
+    );
+    assert_eq!(next_backoff_attempt(u32::MAX), MAX_BACKOFF_ATTEMPTS);
+    const {
+        assert!(
+            MAX_BACKOFF_ATTEMPTS > 17,
+            "the ceiling must sit past the attempt at which the delay reaches \
+             its cap, so saturating never changes a wait"
+        )
+    };
+}
+
 #[test]
 fn test_fibonacci_backoff_first_attempt_is_1s() {
     let delay = fibonacci_backoff(0);
@@ -3188,25 +3263,57 @@ fn test_fibonacci_backoff_first_attempt_is_1s() {
 
 #[test]
 fn should_reset_backoff_requires_uptime_window_and_no_penalty() {
-    let start = 1_000_000i64;
-    let stable = start + Client::STABLE_CONNECTION_RESET_MS;
+    let start = wacore::time::Instant::ZERO + Duration::from_secs(1_000);
+    let window = Client::STABLE_CONNECTION_RESET;
+    let stable = start + window;
     // Never authenticated this cycle → not stable, whatever the clock says.
-    assert!(!should_reset_backoff(0, 1_000_000, false));
+    assert!(!should_reset_backoff(None, stable, false));
     // Authenticated but dropped inside the 30s window → keep escalating.
     assert!(!should_reset_backoff(
-        start,
-        start + Client::STABLE_CONNECTION_RESET_MS - 1,
+        Some(start),
+        start + window - Duration::from_millis(1),
         false
     ));
     // Survived the full window with no penalty → reset the backoff.
-    assert!(should_reset_backoff(start, stable, false));
-    assert!(should_reset_backoff(start, start + 60_000, false));
+    assert!(should_reset_backoff(Some(start), stable, false));
+    assert!(should_reset_backoff(
+        Some(start),
+        start + Duration::from_secs(60),
+        false
+    ));
     // An explicit penalty (429 / manual reconnect) survives even a stable
     // connection (WA Web cancelReset).
-    assert!(!should_reset_backoff(start, stable, true));
-    assert!(!should_reset_backoff(start, start + 60_000, true));
-    // A backwards clock jump must not underflow into a spurious reset.
-    assert!(!should_reset_backoff(start, start - 5_000, false));
+    assert!(!should_reset_backoff(Some(start), stable, true));
+    assert!(!should_reset_backoff(
+        Some(start),
+        start + Duration::from_secs(60),
+        true
+    ));
+}
+
+/// The stability window is real elapsed time: a connection one second old is
+/// not thirty seconds stable, so the guard against a flapping server holds.
+///
+/// This is the window's arithmetic, not the clock-jump regression. A wall-clock
+/// reading can no longer reach this predicate at all, because `connected_at` is
+/// an `Instant` and the compiler rejects a millisecond timestamp in its place;
+/// what pins the anchor itself to the monotonic clock is
+/// `wire_bookkeeping_reads_the_clock_only_where_a_value_is_used`.
+#[test]
+fn only_elapsed_time_opens_the_stability_window() {
+    let connected_at = wacore::time::Instant::now();
+    let a_moment_later = connected_at + Duration::from_secs(1);
+    assert!(!should_reset_backoff(
+        Some(connected_at),
+        a_moment_later,
+        false
+    ));
+    // Real elapsed time still resets it.
+    assert!(should_reset_backoff(
+        Some(connected_at),
+        connected_at + Client::STABLE_CONNECTION_RESET,
+        false
+    ));
 }
 
 // ── stream error tests ─────────────────────────────────────────────
@@ -3219,6 +3326,14 @@ async fn test_stream_error_401_disables_reconnect() {
     assert!(
         !client.enable_auto_reconnect.load(Ordering::Relaxed),
         "401 should disable auto-reconnect"
+    );
+    assert_eq!(
+        client
+            .protocol_terminal_reason
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref(),
+        Some(&ProtocolTerminalReason::StreamErrorCode(401))
     );
 }
 
@@ -3454,6 +3569,245 @@ async fn test_custom_cache_config_is_respected() {
 }
 
 #[tokio::test]
+async fn runtime_cache_config_propagates_nondefault_settings() {
+    use crate::cache_config::{CacheEntryConfig, CacheStores, MsgSecretPolicy, MsgSecretRetention};
+    use std::time::Duration;
+
+    struct StubStore;
+    #[async_trait::async_trait]
+    impl crate::cache_store::CacheStore for StubStore {
+        async fn get(&self, _: &str, _: &str) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        async fn set(&self, _: &str, _: &str, _: &[u8], _: Option<Duration>) -> Result<()> {
+            Ok(())
+        }
+        async fn delete(&self, _: &str, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn clear(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct StubResolver;
+    #[async_trait::async_trait]
+    impl crate::cache_config::OriginalMessageResolver for StubResolver {
+        async fn resolve_msg_secret(&self, _: &str, _: &str, _: &str) -> Option<[u8; 32]> {
+            Some([0xABu8; 32])
+        }
+    }
+
+    let store: Arc<dyn crate::cache_store::CacheStore> = Arc::new(StubStore);
+    let resolver: Arc<dyn crate::cache_config::OriginalMessageResolver> = Arc::new(StubResolver);
+    let config = CacheConfig {
+        group_cache: CacheEntryConfig::new(Some(Duration::from_secs(60)), 10),
+        recent_messages: CacheEntryConfig::new(Some(Duration::from_secs(300)), 64),
+        sent_message_ttl_secs: 60,
+        msg_secret_policy: MsgSecretPolicy::Full,
+        msg_secret_retention: MsgSecretRetention {
+            text: Duration::from_secs(7 * 86_400),
+            poll_event: Duration::from_secs(7 * 86_400),
+            bot: Duration::from_secs(7 * 86_400),
+        },
+        seed_msg_secrets_from_history: false,
+        original_message_resolver: Some(Arc::clone(&resolver)),
+        msg_secret_resolver_timeout: Duration::from_secs(1),
+        cache_stores: CacheStores {
+            group_cache: Some(Arc::clone(&store)),
+            ..Default::default()
+        },
+        ..CacheConfig::default()
+    };
+    let client = crate::test_utils::create_test_client_with_config(
+        "runtime_config_propagates",
+        Arc::new(MockHttpClient),
+        config,
+    )
+    .await;
+
+    assert_eq!(client.cache_config.group_cache.capacity, 10);
+    assert_eq!(
+        client.cache_config.group_cache.timeout,
+        Some(Duration::from_secs(60))
+    );
+    assert!(
+        client.cache_config.group_cache_store.is_some(),
+        "custom group-cache store must be retained for lazy init"
+    );
+    assert!(client.cache_config.recent_messages_enabled);
+    assert_eq!(client.cache_config.sent_message_ttl_secs, 60);
+    assert_eq!(client.cache_config.msg_secret_policy, MsgSecretPolicy::Full);
+    assert_eq!(
+        client.cache_config.msg_secret_retention.text,
+        Duration::from_secs(7 * 86_400)
+    );
+    assert!(!client.cache_config.seed_msg_secrets_from_history);
+    assert!(client.cache_config.original_message_resolver.is_some());
+    assert_eq!(
+        client.cache_config.msg_secret_resolver_timeout,
+        Duration::from_secs(1)
+    );
+    // Lazy init must reuse the retained store, not build a local cache.
+    let _ = client.get_group_cache();
+    assert!(client.group_cache.get().is_some());
+}
+
+#[tokio::test]
+async fn runtime_cache_config_honors_disabled_recent_cache() {
+    let client = crate::test_utils::create_test_client_with_config(
+        "runtime_config_recent_disabled",
+        Arc::new(MockHttpClient),
+        CacheConfig::default(),
+    )
+    .await;
+    assert!(
+        !client.cache_config.recent_messages_enabled,
+        "default capacity 0 must surface as disabled"
+    );
+    let chat: Jid = "120363000000000099@g.us".parse().unwrap();
+    assert!(
+        client.peek_recent_message(&chat, "MISSING").await.is_none(),
+        "disabled L1 must fall through to the DB miss path"
+    );
+}
+
+/// PR #1482 replaced the per-client `cache_config: CacheConfig` field with
+/// the runtime-retained `RuntimeCacheConfig` (456 B down to 136 B on the
+/// structs). A struct-level delta alone does not prove the per-client saving,
+/// since neighbor-field padding could absorb part of it. The current fixed
+/// client layout is 4312 B before feature-sized fields. The history-sync
+/// admission policy is an immutable optional `Arc`, so it avoids the
+/// synchronization-cell cost of the former `OnceLock` field.
+///
+/// Rebaseline: the failure message prints the current size; set the base just
+/// above it. Test cfg only: `#[cfg(test)]` fields shift the number versus a
+/// production build. General procedure:
+/// [layout asserts](../../agent_docs/layout_asserts.md).
+#[test]
+fn client_size_pins_runtime_cache_config_saving() {
+    use std::mem::size_of;
+
+    // Measured fixed part of `size_of::<Client>()` at the head of the #1482
+    // follow-ups, default features, no subsystem attached. Every
+    // size-varying attachment is measured in this same build and stacked on
+    // top, so no feature combination false-fails: only an unaccounted layout
+    // move trips the assert.
+    let mut expected = 4312 + size_of::<subsystem::Subsystems>();
+    if cfg!(feature = "client-lifecycle") {
+        expected += size_of::<std::sync::Mutex<()>>() + size_of::<Option<Arc<()>>>();
+    }
+    if cfg!(feature = "plugins") {
+        expected += size_of::<Option<Arc<()>>>();
+    }
+    assert_eq!(
+        size_of::<Client>(),
+        expected,
+        "Client layout moved; if a field was added or removed on purpose, \
+         re-measure with `cargo test -p whatsapp-rust --lib \
+         client_size_pins_runtime_cache_config_saving` under default, \
+         `--features client-lifecycle,plugins`, and the CI feature set, \
+         then update the base",
+    );
+}
+
+#[tokio::test]
+async fn non_group_cache_stores_are_owned_by_live_caches_only() {
+    use crate::cache_config::CacheStores;
+    use std::time::Duration;
+
+    struct StubStore;
+    #[async_trait::async_trait]
+    impl crate::cache_store::CacheStore for StubStore {
+        async fn get(&self, _: &str, _: &str) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        async fn set(&self, _: &str, _: &str, _: &[u8], _: Option<Duration>) -> Result<()> {
+            Ok(())
+        }
+        async fn delete(&self, _: &str, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn clear(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    let lid_store: Arc<dyn crate::cache_store::CacheStore> = Arc::new(StubStore);
+    let registry_store: Arc<dyn crate::cache_store::CacheStore> = Arc::new(StubStore);
+    let group_store: Arc<dyn crate::cache_store::CacheStore> = Arc::new(StubStore);
+    let config = CacheConfig {
+        cache_stores: CacheStores {
+            group_cache: Some(Arc::clone(&group_store)),
+            device_registry_cache: Some(Arc::clone(&registry_store)),
+            lid_pn_cache: Some(Arc::clone(&lid_store)),
+        },
+        ..CacheConfig::default()
+    };
+    let client = crate::test_utils::create_test_client_with_config(
+        "non_group_store_lifetime",
+        Arc::new(MockHttpClient),
+        config,
+    )
+    .await;
+
+    // Device-registry store: same allocation, held once by the test plus once
+    // by the live cache.
+    let retained_registry = client
+        .device_registry_cache
+        .custom_store_for_tests()
+        .expect("device-registry cache must retain its custom store");
+    assert!(
+        Arc::ptr_eq(&registry_store, &retained_registry),
+        "device-registry cache must reuse the configured store allocation"
+    );
+    drop(retained_registry);
+    assert_eq!(
+        Arc::strong_count(&registry_store),
+        2,
+        "device-registry store must be owned by the test handle plus the live cache only"
+    );
+
+    // LID-PN store: same allocation in both direction maps, held once by the
+    // test plus twice by the cache.
+    let retained_lid = client.lid_pn_cache.custom_stores_for_tests();
+    assert_eq!(
+        retained_lid.len(),
+        2,
+        "LID-PN cache must back both direction maps with the custom store"
+    );
+    for store in &retained_lid {
+        assert!(
+            Arc::ptr_eq(&lid_store, store),
+            "LID-PN cache must reuse the configured store allocation"
+        );
+    }
+    drop(retained_lid);
+    assert_eq!(
+        Arc::strong_count(&lid_store),
+        3,
+        "LID-PN store must be owned by the test handle plus the two live direction maps only"
+    );
+
+    // Control: the group store stays pinned by the runtime config for lazy init.
+    let retained_group = client
+        .cache_config
+        .group_cache_store
+        .clone()
+        .expect("group-cache store must be retained for lazy init");
+    assert!(
+        Arc::ptr_eq(&group_store, &retained_group),
+        "group cache must reuse the configured store allocation"
+    );
+    drop(retained_group);
+    assert_eq!(
+        Arc::strong_count(&group_store),
+        2,
+        "group store must be owned by the test handle plus the runtime config only"
+    );
+}
+
+#[tokio::test]
 async fn held_group_distribution_lane_survives_capacity_pressure() {
     let config = CacheConfig {
         group_distribution_locks_capacity: 1,
@@ -3499,6 +3853,7 @@ async fn active_chat_lane_survives_capacity_pressure() {
             ChatLane {
                 enqueue_lock: Arc::new(Mutex::new(())),
                 queue_tx,
+                worker_running: Arc::new(Mutex::new(())),
             },
             queue_rx,
         )
@@ -3966,7 +4321,7 @@ async fn a_panicking_observer_leaves_the_client_sending() {
 
 fn receipt_test_info(id: &str) -> Arc<crate::types::message::MessageInfo> {
     Arc::new(crate::types::message::MessageInfo {
-        id: id.to_string(),
+        id: id.into(),
         source: crate::types::message::MessageSource {
             chat: "15550001111@s.whatsapp.net".parse().unwrap(),
             sender: "15550001111@s.whatsapp.net".parse().unwrap(),
@@ -4723,6 +5078,11 @@ async fn stats_snapshot_reflects_counters() {
 /// A clock read leaves the module on wasm32/embedded, so the wire path owes a
 /// budget: only the send that arms the dead-socket anchor may date itself, and
 /// only one stamp may be spent per received transport event.
+///
+/// It also owes a *clock*. Every stamp here anchors a deadline the keepalive
+/// measures elapsed time against, so all of them are monotonic: a wall-clock
+/// read on this path is a timeout a system-clock adjustment can fire, which is
+/// what killed a healthy socket in issue #1376.
 #[test]
 fn wire_bookkeeping_reads_the_clock_only_where_a_value_is_used() {
     use wacore::time::clock_reads;
@@ -4732,7 +5092,7 @@ fn wire_bookkeeping_reads_the_clock_only_where_a_value_is_used() {
     let arming = clock_reads::snapshot();
     stats.record_frame_sent(10);
     assert_eq!(
-        clock_reads::since(arming).wall,
+        clock_reads::since(arming).monotonic,
         1,
         "the send that arms the anchor dates it"
     );
@@ -4742,7 +5102,7 @@ fn wire_bookkeeping_reads_the_clock_only_where_a_value_is_used() {
         stats.record_frame_sent(10);
     }
     assert_eq!(
-        clock_reads::since(armed).wall,
+        clock_reads::since(armed).monotonic,
         0,
         "sends under an already-armed anchor have nothing to date"
     );
@@ -4751,7 +5111,7 @@ fn wire_bookkeeping_reads_the_clock_only_where_a_value_is_used() {
     stats.mark_recv_activity();
     stats.record_recv_batch(100, 1);
     assert_eq!(
-        clock_reads::since(recv).wall,
+        clock_reads::since(recv).monotonic,
         1,
         "a single-frame batch is stamped once, at arrival"
     );
@@ -4760,7 +5120,7 @@ fn wire_bookkeeping_reads_the_clock_only_where_a_value_is_used() {
     stats.mark_recv_activity();
     stats.record_recv_batch(100, 4);
     assert_eq!(
-        clock_reads::since(long_batch).wall,
+        clock_reads::since(long_batch).monotonic,
         2,
         "a long batch re-stamps on completion so a slow drain is not read as silence"
     );
@@ -4768,9 +5128,42 @@ fn wire_bookkeeping_reads_the_clock_only_where_a_value_is_used() {
     let rearm = clock_reads::snapshot();
     stats.record_frame_sent(10);
     assert_eq!(
-        clock_reads::since(rearm).wall,
+        clock_reads::since(rearm).monotonic,
         1,
         "the receive cancelled the anchor, so this send arms it again"
+    );
+
+    let whole_path = clock_reads::snapshot();
+    stats.record_frame_sent(10);
+    stats.mark_recv_activity();
+    stats.record_recv_batch(100, 4);
+    stats.record_frame_sent(10);
+    assert_eq!(
+        clock_reads::since(whole_path).wall,
+        0,
+        "a wall-clock stamp here is a watchdog deadline a clock adjustment can move"
+    );
+}
+
+/// The public snapshot still answers "last seen at T" in the wall-clock frame a
+/// consumer reads it in, even though the field behind it is monotonic.
+#[test]
+fn the_snapshot_still_reports_last_receive_as_a_wall_clock_instant() {
+    let stats = wacore::stats::SessionStats::new();
+    assert_eq!(
+        stats.snapshot().last_data_received_ms,
+        0,
+        "nothing received yet"
+    );
+
+    let before = wacore::time::now_millis().max(0) as u64;
+    stats.mark_recv_activity();
+    let reported = stats.snapshot().last_data_received_ms;
+    let after = wacore::time::now_millis().max(0) as u64;
+
+    assert!(
+        (before..=after).contains(&reported),
+        "expected a wall-clock instant inside [{before}, {after}], got {reported}"
     );
 }
 
@@ -4819,8 +5212,10 @@ async fn memory_report_display_sections_stay_aligned() {
     let ttl_start = rendered
         .find("--- TTL-bounded caches ---")
         .expect("ttl section");
+    let lid_pn_start = rendered.find("--- LID/PN maps").expect("lid/pn section");
     let signal_start = rendered.find("--- Signal store").expect("signal section");
-    let ttl_block = &rendered[ttl_start..signal_start];
+    let ttl_block = &rendered[ttl_start..lid_pn_start];
+    let lid_pn_block = &rendered[lid_pn_start..signal_start];
 
     for name in [
         "group_cache:",
@@ -4834,6 +5229,23 @@ async fn memory_report_display_sections_stay_aligned() {
             "{name} must render under the TTL-bounded heading, got:\n{rendered}"
         );
     }
+    // No TTL bounds these; a contact-list-sized map rendered as a TTL-bounded
+    // cache would make sustained growth read as normal cache activity.
+    for name in [
+        "lid_pn (lid):",
+        "lid_pn (pn):",
+        "lid_pn (hash):",
+        "lid_pn (persisted):",
+    ] {
+        assert!(
+            lid_pn_block.contains(name),
+            "{name} must render under the LID/PN heading, got:\n{rendered}"
+        );
+        assert!(
+            !ttl_block.contains(name),
+            "{name} must not render as a TTL-bounded cache, got:\n{rendered}"
+        );
+    }
     for name in [
         "signal_sessions:",
         "signal_identities:",
@@ -4844,6 +5256,23 @@ async fn memory_report_display_sections_stay_aligned() {
             "{name} must render under the Signal heading, got:\n{rendered}"
         );
     }
+
+    // The lanes are capped; their queues are not, so the backlog belongs with
+    // the drain-bounded collections, not beside the lane count.
+    let capacity_start = rendered
+        .find("--- Capacity-only caches ---")
+        .expect("capacity section");
+    let unbounded_start = rendered
+        .find("--- Unbounded collections ---")
+        .expect("unbounded section");
+    assert!(
+        !rendered[capacity_start..unbounded_start].contains("chat_lane_backlog:"),
+        "chat_lane_backlog must not render as capacity-bounded, got:\n{rendered}"
+    );
+    assert!(
+        rendered[unbounded_start..signal_start].contains("chat_lane_backlog:"),
+        "chat_lane_backlog must render under the unbounded heading, got:\n{rendered}"
+    );
 
     // The last two `collections()` entries are transient retention, one section
     // each. Their order is what the two boundary constants encode, so a cache
@@ -4902,6 +5331,332 @@ async fn memory_report_counts_the_offline_device_sync_queue() {
     assert_eq!(client.memory_report().await.pending_device_sync, 0);
 }
 
+/// The LID/PN cache's side maps grow with the contact list for the process
+/// lifetime, one entry per identifier and one per persisted pair, and were
+/// invisible to the report; the counts must surface and the bytes must be the
+/// table alone, since both maps hold the entry's own strings.
+#[tokio::test]
+async fn memory_report_counts_lid_pn_side_maps() {
+    let client = crate::test_utils::create_test_client_with_name("lid_pn_side_maps").await;
+    let before = client.memory_report().await;
+    assert_eq!(before.lid_pn_contact_hash_entries.entries, 0);
+    assert_eq!(before.lid_pn_persisted_entries.entries, 0);
+
+    let entry = crate::lid_pn_cache::LidPnEntry::new(
+        "100000000000002".to_string(),
+        "19045550180".to_string(),
+        LearningSource::Usync,
+    );
+    client.lid_pn_cache.add(&entry).await;
+    client
+        .lid_pn_cache
+        .mark_persisted(&entry.phone_number, &entry.lid)
+        .await;
+
+    let report = client.memory_report().await;
+    assert_eq!(
+        report.lid_pn_contact_hash_entries.entries, 2,
+        "both sides of a pair are hash-indexed"
+    );
+    assert_eq!(report.lid_pn_persisted_entries.entries, 1);
+    assert!(
+        report.lid_pn_contact_hash_entries.bytes > 0 && report.lid_pn_persisted_entries.bytes > 0,
+        "table structure is charged even though the strings are the entry's"
+    );
+    assert!(
+        report.lid_pn_contact_hash_entries.bytes < report.lid_pn_lid_entries.bytes,
+        "a side map must not re-charge the payload the entry map already counts"
+    );
+    let names: Vec<&str> = report
+        .unbounded_counts()
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    assert!(names.contains(&"lid_pn_contact_hash_entries"));
+    assert!(names.contains(&"lid_pn_persisted_entries"));
+}
+
+/// A lane's queue is unbounded and each queued message retains its frame, so
+/// a stuck worker is a backlog the report has to show; the lane count alone
+/// reads the same whether the queues are empty or a million deep.
+#[tokio::test]
+async fn memory_report_sums_chat_lane_backlog() {
+    let client = crate::test_utils::create_test_client_with_name("chat_lane_backlog").await;
+    assert_eq!(client.memory_report().await.chat_lane_backlog, 0);
+
+    // A lane with no worker: nothing drains what is enqueued.
+    let chat: Jid = "120363000000000042@g.us".parse().unwrap();
+    let (queue_tx, _queue_rx) = async_channel::unbounded();
+    let lane = ChatLane {
+        enqueue_lock: Arc::new(Mutex::new(())),
+        queue_tx,
+        worker_running: Arc::new(Mutex::new(())),
+    };
+    client.chat_lanes.insert(chat.clone(), lane.clone()).await;
+    for id in ["A", "B", "C"] {
+        let node = NodeBuilder::new("message")
+            .attr("from", chat.clone())
+            .attr("id", id)
+            .build();
+        lane.try_enqueue(node_to_owned_ref(node))
+            .expect("an unbounded lane queue accepts every message");
+    }
+
+    let report = client.memory_report().await;
+    assert_eq!(report.chat_lanes, 1);
+    assert_eq!(report.chat_lane_backlog, 3);
+    assert!(
+        report
+            .unbounded_counts()
+            .contains(&("chat_lane_backlog", 3)),
+        "the backlog is a drain-bounded collection, so the soak compares it"
+    );
+}
+
+/// An online device refresh releases its dedup entry when it finishes. Left
+/// in place, the entry outlived the refresh by the whole connection: the user
+/// was retained until teardown, and a later unknown device from them never
+/// triggered another refresh.
+#[tokio::test]
+async fn online_device_sync_releases_its_dedup_entry() {
+    let client = crate::test_utils::create_test_client_with_name("online_device_sync").await;
+    let jid: Jid = "19045550180@s.whatsapp.net".parse().unwrap();
+
+    // Not connected, so the refresh fails; the release must not depend on it
+    // succeeding.
+    client
+        .schedule_unknown_device_sync(jid.clone(), false)
+        .await;
+    for _ in 0..1_000 {
+        if client.pending_device_sync.len() == 0 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        client.pending_device_sync.len(),
+        0,
+        "the dedup entry must leave with the refresh that took it"
+    );
+    assert!(
+        client.pending_device_sync.add(&jid),
+        "a later unknown device from the same user triggers a refresh again"
+    );
+}
+
+/// A runtime may drop a spawned future before its first poll. The release
+/// guard is built before the spawn and moved into the task, so even then the
+/// dedup entry leaves with the work it was deduplicating.
+#[tokio::test]
+async fn online_device_sync_releases_its_dedup_entry_when_never_polled() {
+    let pm = Arc::new(
+        PersistenceManager::new(crate::test_utils::create_test_backend().await)
+            .await
+            .expect("persistence manager should initialize"),
+    );
+    let (client, _rx) = Client::new_with_cache_config(
+        Arc::new(DropSpawnRuntime),
+        pm,
+        Arc::new(crate::transport::mock::MockTransportFactory::new()),
+        Arc::new(MockHttpClient),
+        None,
+        CacheConfig::default(),
+    )
+    .await;
+    let jid: Jid = "19045550180@s.whatsapp.net".parse().unwrap();
+
+    client
+        .schedule_unknown_device_sync(jid.clone(), false)
+        .await;
+    assert_eq!(
+        client.pending_device_sync.len(),
+        0,
+        "a task dropped before its first poll must still release its entry"
+    );
+    assert!(client.pending_device_sync.add(&jid));
+}
+
+/// Expired entries leave a quiet cache only when something sweeps: nothing
+/// accesses them and nothing inserts, so without the maintenance tick the
+/// dedup gates hold five-minute-old keys for weeks.
+#[tokio::test]
+async fn cache_maintenance_sweeps_expired_entries() {
+    let mut cache_config = CacheConfig::default();
+    cache_config.dispatched_messages =
+        crate::cache_config::CacheEntryConfig::new(Some(Duration::from_millis(20)), 64);
+    let client = crate::test_utils::create_test_client_with_config(
+        "cache_maintenance",
+        Arc::new(MockHttpClient),
+        cache_config,
+    )
+    .await;
+
+    let chat: Jid = "19045550180@s.whatsapp.net".parse().unwrap();
+    let info = Arc::new(crate::types::message::MessageInfo {
+        id: "3EB0EXPIRING".into(),
+        source: crate::types::message::MessageSource {
+            chat: chat.clone(),
+            sender: chat,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    client
+        .mark_message_dispatched(&info, &wa::Message::default())
+        .await;
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert_eq!(
+        client.dispatched_messages.entry_count(),
+        1,
+        "a quiet cache keeps its expired entry until swept"
+    );
+
+    client.run_cache_maintenance().await;
+    assert_eq!(client.dispatched_messages.entry_count(), 0);
+    assert_eq!(client.memory_report().await.dispatched_messages, 0);
+}
+
+/// Startup reaps what expired while the process was closed, without waiting for
+/// a connection to reach the keepalive tick. `expires_at = 0` (never) and
+/// future deadlines must survive.
+#[tokio::test]
+async fn startup_maintenance_sweeps_expired_secrets_without_a_connection() {
+    use wacore::store::traits::MsgSecretEntry;
+
+    let now = wacore::time::now_secs();
+    let backend = crate::test_utils::create_test_backend().await;
+    backend
+        .put_msg_secrets(vec![
+            MsgSecretEntry {
+                chat: "19045550180@s.whatsapp.net".into(),
+                sender: "19045550180@s.whatsapp.net".into(),
+                msg_id: "STARTUP_NEVER".into(),
+                secret: [1u8; 32],
+                expires_at: 0,
+                message_ts: 0,
+            },
+            MsgSecretEntry {
+                chat: "19045550180@s.whatsapp.net".into(),
+                sender: "19045550180@s.whatsapp.net".into(),
+                msg_id: "STARTUP_FUTURE".into(),
+                secret: [2u8; 32],
+                expires_at: now + 86_400,
+                message_ts: 0,
+            },
+            MsgSecretEntry {
+                chat: "19045550180@s.whatsapp.net".into(),
+                sender: "19045550180@s.whatsapp.net".into(),
+                msg_id: "STARTUP_EXPIRED".into(),
+                secret: [3u8; 32],
+                expires_at: now - 86_400,
+                message_ts: 0,
+            },
+        ])
+        .await
+        .expect("seed secrets");
+
+    let client = crate::test_utils::create_test_client_with_backend(Arc::clone(&backend)).await;
+    // Construction spawns the sweep detached; run the startup body directly so
+    // the test is deterministic instead of racing a task.
+    client.run_startup_retention_cleanup().await;
+
+    let present = |id: &'static str| {
+        let backend = Arc::clone(&backend);
+        async move {
+            backend
+                .get_msg_secret(
+                    "19045550180@s.whatsapp.net",
+                    "19045550180@s.whatsapp.net",
+                    id,
+                )
+                .await
+                .expect("lookup")
+                .is_some()
+        }
+    };
+    assert!(
+        present("STARTUP_NEVER").await,
+        "expires_at = 0 must survive"
+    );
+    assert!(
+        present("STARTUP_FUTURE").await,
+        "a future deadline must survive"
+    );
+    assert!(
+        !present("STARTUP_EXPIRED").await,
+        "the startup pass must reap a passed deadline"
+    );
+}
+
+/// The startup pass must not touch the pending-inbound durability buffer: a
+/// message whose hook has not committed is still replayable, and deleting its
+/// buffered copy before the server redelivers it turns the redelivery into an
+/// acked duplicate that never reaches the hook.
+#[tokio::test]
+async fn startup_maintenance_leaves_the_pending_inbound_buffer_alone() {
+    use crate::store::SqliteStore;
+    use portable_atomic::AtomicU64;
+    use std::sync::atomic::Ordering;
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let unique_id = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let db_name = format!(
+        "file:startup_pending_{}_{}?mode=memory&cache=shared",
+        std::process::id(),
+        unique_id
+    );
+    let sqlite = SqliteStore::new(&db_name)
+        .await
+        .expect("backend initializes");
+    let shared = sqlite.shared();
+    let store: Arc<dyn crate::store::traits::Backend> = Arc::new(sqlite);
+    let chat = "19045550180@s.whatsapp.net";
+    store
+        .store_pending_inbound(chat, chat, "STARTUP_PENDING", b"plaintext")
+        .await
+        .expect("seed pending inbound");
+
+    // Age the row past the 7-day pending-inbound TTL so a full sweep would
+    // delete it. The backend trait has no UPDATE, so this goes through the
+    // store's own query handle.
+    shared
+        .run(|conn| {
+            use diesel::RunQueryDsl;
+            diesel::sql_query(
+                "UPDATE pending_inbound_messages SET inserted_at = 0 WHERE id = 'STARTUP_PENDING';",
+            )
+            .execute(conn)
+            .map_err(|e| crate::store::error::StoreError::Database(Box::new(e)))?;
+            Ok(())
+        })
+        .await
+        .expect("age the row");
+
+    let client = crate::test_utils::create_test_client_with_backend(Arc::clone(&store)).await;
+    client.run_startup_retention_cleanup().await;
+
+    assert!(
+        store
+            .get_pending_inbound(chat, chat, "STARTUP_PENDING")
+            .await
+            .expect("lookup")
+            .is_some(),
+        "the startup pass must preserve a buffered message awaiting redelivery"
+    );
+
+    // The control: the full sweep does prune it, so the assertion above is
+    // about the scope, not about a row that could never be deleted.
+    client.run_retention_cleanup(7200).await;
+    assert!(
+        store
+            .get_pending_inbound(chat, chat, "STARTUP_PENDING")
+            .await
+            .expect("lookup")
+            .is_none(),
+        "the keepalive sweep must still prune an expired pending-inbound row"
+    );
+}
+
 #[tokio::test]
 async fn memory_report_on_fresh_client() {
     // recent_messages is capacity-0 (disabled) by default; enable it so the
@@ -4928,7 +5683,7 @@ async fn memory_report_on_fresh_client() {
     // Retained bytes must appear once something is cached.
     let key = ChatMessageId::new(
         "559980000001@s.whatsapp.net".parse().unwrap(),
-        "3EB0TESTMSGID".to_string(),
+        "3EB0TESTMSGID".into(),
     );
     client
         .recent_messages
@@ -4944,6 +5699,23 @@ async fn memory_report_on_fresh_client() {
     assert!(report.total_estimated_bytes() >= 2048);
     // Display must render without panicking.
     let _ = report.to_string();
+}
+
+#[tokio::test]
+async fn memory_report_tracks_core_event_handler_table() {
+    let client = crate::test_utils::create_test_client_with_name("memory_event_handlers").await;
+    assert_eq!(client.memory_report().await.core_event_handlers.entries, 0);
+
+    let (handler, _events) = wacore::types::events::ChannelEventHandler::new();
+    let subscription = client.subscribe_handler(handler);
+    let retained = client.memory_report().await.core_event_handlers;
+    assert_eq!(retained.entries, 1);
+    assert!(retained.bytes > 0);
+
+    assert!(subscription.unsubscribe());
+    let released = client.memory_report().await.core_event_handlers;
+    assert_eq!(released.entries, 0);
+    assert_eq!(released.bytes, 0);
 }
 
 /// resource_report (workstream F) composes the client's own memory_report with
@@ -5250,6 +6022,8 @@ fn phash_waiter_sweep_drops_only_entries_that_lived_through_a_sweep() {
             expected: wacore_binary::CompactString::from("hash"),
             jid: "13135550100@s.whatsapp.net".parse().expect("valid jid"),
             invalidate_group_cache: false,
+            dm_devices: None,
+            dm_unreached: Vec::new(),
             registered_epoch,
         })
     };
@@ -7154,4 +7928,668 @@ async fn reading_reachability_costs_nothing_on_the_reachable_path() {
         assert!(!client.reachability().recovers_on_its_own());
     });
     assert_eq!(allocations, 0);
+}
+
+// ── Interrupted offline resume (issue #1377) ────────────────────────────────
+
+async fn offline_resume_test_client() -> Arc<Client> {
+    let backend = crate::test_utils::create_test_backend().await;
+    let pm = Arc::new(
+        PersistenceManager::new(backend)
+            .await
+            .expect("persistence manager should initialize"),
+    );
+    let (client, _rx) = Client::new(
+        Arc::new(crate::runtime_impl::TokioRuntime),
+        pm,
+        Arc::new(crate::transport::mock::MockTransportFactory::new()),
+        Arc::new(MockHttpClient),
+        None,
+    )
+    .await;
+    client
+}
+
+/// Put the client in the state the log in issue #1377 shows: a preview
+/// announced `total`, the resume armed, and `delivered` stanzas arrived.
+async fn arm_offline_drain(client: &Arc<Client>, total: usize, delivered: usize) {
+    client
+        .offline_sync_metrics
+        .total_messages
+        .store(total, Ordering::Release);
+    client
+        .offline_sync_metrics
+        .processed_messages
+        .store(delivered, Ordering::Release);
+    client
+        .offline_sync_metrics
+        .active
+        .store(true, Ordering::Release);
+    // The send fails (no socket) and is logged; the arming that precedes it is
+    // what this helper is after.
+    offline_resume::send_first_batch(Arc::clone(client), total).await;
+}
+
+/// Stand in for the next connection opening, after a fixture has torn the
+/// previous one down by hand.
+///
+/// `connect_internal` resets the per-connection shutdown notifier before it
+/// publishes a socket, and that notifier is sticky: without this step the
+/// teardown's fired signal still stands on the "new" connection, and everything
+/// that watches it — the offline-delivery wait, the inactivity watchdog —
+/// correctly stands down on sight.
+fn open_next_connection_for_test(client: &Arc<Client>) {
+    client.reset_connection_shutdown();
+}
+
+fn drain_offline_sync_events(
+    rx: &async_channel::Receiver<Arc<Event>>,
+) -> (Vec<(i32, i32)>, Vec<i32>) {
+    let mut interrupted = Vec::new();
+    let mut completed = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        match &*event {
+            Event::OfflineSyncInterrupted(e) => {
+                interrupted.push((e.total, e.delivered));
+            }
+            Event::OfflineSyncCompleted(e) => completed.push(e.count),
+            _ => {}
+        }
+    }
+    (interrupted, completed)
+}
+
+/// Regression for issue #1377: a connection that dies mid-drain used to end the
+/// resume in total silence — no completion, no anything — and the consumer had
+/// only the absence of an event to go on.
+#[tokio::test]
+async fn interrupted_offline_resume_reports_a_terminal_event() {
+    use wacore::types::events::ChannelEventHandler;
+
+    let client = offline_resume_test_client().await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    arm_offline_drain(&client, 711, 5).await;
+    client.cleanup_connection_state().await;
+
+    let (interrupted, completed) = drain_offline_sync_events(&rx);
+    assert_eq!(
+        interrupted,
+        vec![(711, 5)],
+        "a teardown mid-drain must report exactly one OfflineSyncInterrupted carrying both counts"
+    );
+    assert!(
+        completed.is_empty(),
+        "an interrupted drain must not claim completion, got {completed:?}"
+    );
+}
+
+/// The event is the *end* of one resume, not a per-teardown tick: the reset in
+/// `connect()` runs over the same state and must stay silent.
+#[tokio::test]
+async fn interrupted_offline_resume_reports_once() {
+    use wacore::types::events::ChannelEventHandler;
+
+    let client = offline_resume_test_client().await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    arm_offline_drain(&client, 711, 5).await;
+    client.cleanup_connection_state().await;
+    client
+        .abandon_offline_sync_if_interrupted(client.connection_generation.load(Ordering::Acquire));
+    client
+        .abandon_offline_sync_if_interrupted(client.connection_generation.load(Ordering::Acquire));
+
+    let (interrupted, _) = drain_offline_sync_events(&rx);
+    assert_eq!(interrupted.len(), 1, "got {interrupted:?}");
+}
+
+/// The happy path is untouched: a drain that reaches its end marker completes
+/// once with its count, and the teardown that follows adds nothing.
+#[tokio::test]
+async fn completed_offline_resume_is_not_reported_as_interrupted() {
+    use wacore::types::events::ChannelEventHandler;
+
+    let client = offline_resume_test_client().await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    arm_offline_drain(&client, 711, 711).await;
+    client.complete_offline_sync(711).await;
+    client.wait_for_offline_delivery_end().await;
+    assert!(client.offline_sync_completed.load(Ordering::Acquire));
+
+    client.cleanup_connection_state().await;
+
+    let (interrupted, completed) = drain_offline_sync_events(&rx);
+    assert_eq!(
+        completed,
+        vec![711],
+        "completion fires once, with its count"
+    );
+    assert!(
+        interrupted.is_empty(),
+        "a completed drain is never interrupted, got {interrupted:?}"
+    );
+}
+
+/// One resume produces one terminal event, never both.
+///
+/// The finisher runs detached and can pass its generation check just before a
+/// teardown bumps it, so the two publications can be in flight for the same
+/// drain. This drives that interleaving directly: the teardown reports the
+/// interruption while `offline_sync_completed` is still false, and the
+/// finisher then arrives with its completion.
+#[tokio::test]
+async fn one_resume_never_reports_both_terminal_events() {
+    use wacore::types::events::ChannelEventHandler;
+
+    let client = offline_resume_test_client().await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    arm_offline_drain(&client, 711, 700).await;
+    client
+        .abandon_offline_sync_if_interrupted(client.connection_generation.load(Ordering::Acquire));
+    client.complete_offline_sync(711).await;
+
+    let (interrupted, completed) = drain_offline_sync_events(&rx);
+    assert_eq!(
+        interrupted.len() + completed.len(),
+        1,
+        "exactly one terminal event per resume, got interrupted={interrupted:?} completed={completed:?}"
+    );
+    assert!(
+        !client.offline_sync_completed.load(Ordering::Acquire),
+        "the loser publishes nothing at all: the winner's teardown owns this state"
+    );
+}
+
+/// The teardown reports the interruption under the generation it is retiring,
+/// which is what silences that drain's own finisher afterwards.
+///
+/// Stamping the generation it just installed instead would leave the stale
+/// finisher free to contradict the interruption, and would claim the slot the
+/// next drain needs.
+#[tokio::test]
+async fn a_teardown_reports_under_the_generation_it_retires() {
+    use wacore::types::events::ChannelEventHandler;
+
+    let client = offline_resume_test_client().await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    arm_offline_drain(&client, 711, 700).await;
+    let retired = client.connection_generation.load(Ordering::Acquire);
+    client.cleanup_connection_state().await;
+
+    assert!(
+        !client.claim_offline_terminal_report(retired),
+        "the retired drain's finisher finds its slot taken by its own teardown"
+    );
+
+    let (interrupted, completed) = drain_offline_sync_events(&rx);
+    assert_eq!(
+        (interrupted.len(), completed.len()),
+        (1, 0),
+        "the interruption stands; got interrupted={interrupted:?} completed={completed:?}"
+    );
+}
+
+/// And the next drain still reports its own outcome: nothing has to reopen the
+/// guard, the newer generation's higher stamp does it.
+#[tokio::test]
+async fn a_later_drain_still_reports_its_own_outcome() {
+    use wacore::types::events::ChannelEventHandler;
+
+    let client = offline_resume_test_client().await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    arm_offline_drain(&client, 711, 700).await;
+    client.cleanup_connection_state().await;
+    open_next_connection_for_test(&client);
+
+    // The real path: an `<ib><offline_preview count>` on the next connection,
+    // processed inline like any other stanza.
+    let preview = NodeBuilder::new("ib")
+        .children([NodeBuilder::new("offline_preview")
+            .attr("count", "25")
+            .build()])
+        .build();
+    client
+        .process_node(crate::test_utils::node_to_owned_ref(&preview))
+        .await;
+    // The preview handler arms the coordinator from a spawned task; wait for
+    // that rather than racing it, so this really does cover the preview path.
+    crate::test_utils::poll_until("the new preview arms a drain", || {
+        client.offline_batch.is_armed()
+    })
+    .await;
+    client.complete_offline_sync(25).await;
+    client.wait_for_offline_delivery_end().await;
+
+    let (interrupted, completed) = drain_offline_sync_events(&rx);
+    assert_eq!(interrupted.len(), 1, "the first drain's interruption");
+    assert_eq!(completed, vec![25], "the second drain's own completion");
+}
+
+/// A finisher descheduled past its own connection can neither contradict the
+/// interruption its teardown reported nor steal the slot a later drain needs.
+///
+/// This is the interleaving that ruled out a boolean guard something has to
+/// clear: whoever cleared it handed the stale finisher its slot back.
+#[tokio::test]
+async fn a_finisher_left_behind_by_two_connections_reports_nothing() {
+    use wacore::types::events::ChannelEventHandler;
+
+    let client = offline_resume_test_client().await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    // The drain that will be interrupted, and the teardown that reports it.
+    arm_offline_drain(&client, 711, 5).await;
+    let stale_generation = client.connection_generation.load(Ordering::Acquire);
+    client.cleanup_connection_state().await;
+
+    // A whole new connection and a new drain, which reports its own outcome.
+    open_next_connection_for_test(&client);
+    let live_generation = client.connection_generation.load(Ordering::Acquire);
+    arm_offline_drain(&client, 25, 25).await;
+    client
+        .complete_offline_sync_for_generation(25, live_generation)
+        .await;
+    client.wait_for_offline_delivery_end().await;
+
+    // Only now does the finisher from the first drain get to run.
+    assert!(
+        !client.claim_offline_terminal_report(stale_generation),
+        "a finisher two connections behind must not publish"
+    );
+
+    let (interrupted, completed) = drain_offline_sync_events(&rx);
+    assert_eq!(interrupted.len(), 1, "the first drain's interruption");
+    assert_eq!(completed, vec![25], "the second drain's own completion");
+}
+
+/// A completion descheduled past its own connection must not consume the
+/// finisher guard the next connection needs.
+///
+/// With a plain boolean the stale call claimed it after the teardown cleared
+/// it, and the next drain's completion then found the guard taken and never
+/// started a finisher, so that drain reported nothing at all.
+#[tokio::test]
+async fn a_stale_completion_does_not_consume_the_next_connection_finisher() {
+    use wacore::types::events::ChannelEventHandler;
+
+    let client = offline_resume_test_client().await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    arm_offline_drain(&client, 711, 5).await;
+    let stale_generation = client.connection_generation.load(Ordering::Acquire);
+    client.cleanup_connection_state().await;
+
+    // The stale completion runs late, against a connection that is gone.
+    client
+        .complete_offline_sync_for_generation(711, stale_generation)
+        .await;
+
+    // The next connection's drain still gets its own finisher and its own event.
+    open_next_connection_for_test(&client);
+    let live_generation = client.connection_generation.load(Ordering::Acquire);
+    arm_offline_drain(&client, 25, 25).await;
+    client
+        .complete_offline_sync_for_generation(25, live_generation)
+        .await;
+    client.wait_for_offline_delivery_end().await;
+
+    let (interrupted, completed) = drain_offline_sync_events(&rx);
+    assert_eq!(interrupted.len(), 1, "the first drain's interruption");
+    assert_eq!(completed, vec![25], "the second drain still completes");
+}
+
+/// The wait belongs to a connection, so it must end when that connection does
+/// — and it must not mark the sync complete on the way out.
+///
+/// Every caller of this helper (the post-login task, the prekey-low top-up, the
+/// dirty-bits handler, the send path's session pre-flight) was otherwise parked
+/// here for the full timeout after the socket was already gone. Over a month of
+/// reconnects that is one such task per reconnect, each holding the client and
+/// each waiting on a connection that no longer exists.
+#[tokio::test(start_paused = true)]
+async fn wait_for_offline_delivery_end_returns_when_its_connection_ends() {
+    let client = offline_resume_test_client().await;
+    arm_offline_drain(&client, 711, 5).await;
+
+    let started = tokio::time::Instant::now();
+    let waiter = {
+        let client = client.clone();
+        tokio::spawn(async move {
+            client
+                .wait_for_offline_delivery_end_with_timeout(Duration::from_secs(60))
+                .await;
+        })
+    };
+
+    // Sticky, so this cannot lose the race against the waiter's subscription:
+    // a signal fired first is still observed by a later subscriber.
+    client.notify_connection_shutdown();
+
+    tokio::time::timeout(Duration::from_secs(600), waiter)
+        .await
+        .expect("the wait must end with its connection")
+        .expect("the waiting task must not panic");
+
+    assert!(
+        started.elapsed() < Duration::from_secs(60),
+        "the wait ran for {:?}; a teardown must release it rather than let it \
+         serve out the timeout",
+        started.elapsed()
+    );
+    assert!(
+        !client.offline_sync_completed.load(Ordering::Relaxed),
+        "a sync belonging to a connection that ended must not be marked complete"
+    );
+}
+
+/// The inactivity watchdog waits a minute at a time, and its whole job is to
+/// complete a drain the *server* stopped feeding. A drain the *connection*
+/// stopped feeding is the other case — the backlog was never acked and the
+/// server redelivers it — so a teardown has to stop the watchdog rather than
+/// let it wake a minute later and declare the resume finished.
+#[tokio::test(start_paused = true)]
+async fn the_inactivity_watchdog_stops_with_its_connection() {
+    let client = offline_resume_test_client().await;
+    // Arms the coordinator and spawns the production watchdog.
+    arm_offline_drain(&client, 711, 5).await;
+
+    client.notify_connection_shutdown();
+
+    // Well past the window the watchdog would otherwise have completed in.
+    tokio::time::sleep(Duration::from_secs(600)).await;
+
+    assert!(
+        !client.offline_sync_completed.load(Ordering::Acquire),
+        "a resume whose connection ended is reported as interrupted, not \
+         completed by a watchdog that outlived it"
+    );
+}
+
+/// The startup waiter reports a teardown as soon as it happens.
+///
+/// A teardown ends this wait's answer but never notifies
+/// `offline_sync_notifier`, so a single await on that notifier sat out the
+/// caller's whole timeout before reporting a connection that had been gone the
+/// entire time.
+#[tokio::test]
+async fn wait_for_startup_sync_reports_a_teardown_without_waiting_out_its_timeout() {
+    let client = offline_resume_test_client().await;
+
+    let started = wacore::time::Instant::now();
+    let waiter = tokio::spawn({
+        let client = Arc::clone(&client);
+        async move { client.wait_for_startup_sync(Duration::from_secs(30)).await }
+    });
+    crate::test_utils::wait_for_notifier_listeners(&client.offline_sync_notifier, 1).await;
+
+    // The teardown lands under the parked waiter, and never notifies it.
+    client.connection_generation.fetch_add(1, Ordering::SeqCst);
+
+    let result = waiter.await.expect("waiter task must not panic");
+    let waited = started.elapsed();
+
+    assert!(result.is_err(), "a dead connection cannot have synced");
+    assert!(
+        waited < Duration::from_secs(5),
+        "reported after {waited:?}, which means it sat out the timeout"
+    );
+}
+
+/// `async_lock::Semaphore` does not report its count, so ask it the question
+/// the drain actually asks: can two stanzas be in flight at once?
+fn concurrent_permits(client: &Arc<Client>) -> bool {
+    let semaphore = client.read_message_semaphore().1;
+    let first = semaphore.try_acquire_arc();
+    let second = semaphore.try_acquire_arc();
+    first.is_some() && second.is_some()
+}
+
+/// Exactly one, not merely "not two": a drain that could acquire nothing at
+/// all would satisfy the negation of [`concurrent_permits`] while being just
+/// as broken.
+fn exactly_one_permit(client: &Arc<Client>) -> bool {
+    let semaphore = client.read_message_semaphore().1;
+    let first = semaphore.try_acquire_arc();
+    let second = semaphore.try_acquire_arc();
+    first.is_some() && second.is_none()
+}
+
+/// A finisher that arrives after its teardown cannot widen the semaphore the
+/// next drain needs narrow.
+///
+/// This is the sequential half of the invariant: the finisher's own late
+/// publication is refused. The contended half, that the reset itself sits
+/// inside the lock, is [`the_permit_reset_is_inside_the_terminal_lock`].
+#[tokio::test]
+async fn a_late_finisher_cannot_widen_the_next_drains_semaphore() {
+    let client = offline_resume_test_client().await;
+
+    arm_offline_drain(&client, 711, 700).await;
+    let stale_generation = client.connection_generation.load(Ordering::Acquire);
+    client.enter_live_mode_for_tests();
+    assert!(
+        concurrent_permits(&client),
+        "live mode is the wide semaphore"
+    );
+
+    client.cleanup_connection_state().await;
+
+    // The finisher of the retired drain runs late and finds its slot taken.
+    client
+        .complete_offline_sync_for_generation(711, stale_generation)
+        .await;
+
+    assert!(
+        exactly_one_permit(&client),
+        "the next drain starts on exactly one permit, whatever the old finisher does"
+    );
+}
+
+/// The permit reset happens under `offline_terminal_lock`, not before it.
+///
+/// Holding the lock is the only way to observe that from outside: while it is
+/// held, a teardown must not have narrowed the semaphore, because the reset is
+/// on the far side of the same lock a publishing finisher holds. With the
+/// reset moved back out, the teardown reaches it without waiting and the
+/// assertion below fails.
+///
+/// Not vacuous, because it waits on `offline_terminal_gate_reached` rather
+/// than on elapsed scheduler turns: that flag is set on the line above the
+/// acquisition, so the teardown has provably arrived at the lock by the time
+/// the assertion runs.
+#[tokio::test]
+async fn the_permit_reset_is_inside_the_terminal_lock() {
+    let client = offline_resume_test_client().await;
+
+    arm_offline_drain(&client, 711, 700).await;
+    client.enter_live_mode_for_tests();
+
+    let terminal_gate = client.offline_terminal_lock.lock().await;
+
+    let teardown = tokio::spawn({
+        let client = Arc::clone(&client);
+        async move { client.cleanup_connection_state().await }
+    });
+
+    // Wait for the teardown to reach the lock itself, not for a guess at how
+    // many scheduler turns that takes: the flag is set on the line above the
+    // acquisition, so when it fires the reset is still ahead of the lock the
+    // test holds. Move the reset back out and it has already run by then.
+    crate::test_utils::poll_until("the teardown to reach the terminal lock", || {
+        client.offline_terminal_gate_reached.load(Ordering::Acquire)
+    })
+    .await;
+
+    assert!(
+        concurrent_permits(&client),
+        "the teardown narrowed the semaphore without the lock a finisher publishes under"
+    );
+
+    drop(terminal_gate);
+    teardown.await.expect("teardown must not panic");
+    assert!(
+        exactly_one_permit(&client),
+        "and once it has the lock, it does narrow it to exactly one"
+    );
+}
+
+/// A completion belongs to the connection whose drain it is.
+///
+/// The inactivity watchdog and the offline-delivery waiter both check the
+/// generation and then call into completion, so a reconnect landing in between
+/// would otherwise mark the replacement connection's backlog finished and
+/// widen its semaphore mid-drain.
+#[tokio::test]
+async fn a_completion_for_a_retired_generation_is_ignored() {
+    use wacore::types::events::ChannelEventHandler;
+
+    let client = offline_resume_test_client().await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    arm_offline_drain(&client, 711, 5).await;
+    let stale_generation = client.connection_generation.load(Ordering::Acquire);
+    client.connection_generation.fetch_add(1, Ordering::SeqCst);
+
+    client
+        .complete_offline_sync_for_generation(711, stale_generation)
+        .await;
+
+    let (_, completed) = drain_offline_sync_events(&rx);
+    assert!(
+        completed.is_empty(),
+        "a retired generation's completion must not be published, got {completed:?}"
+    );
+    assert!(
+        !client.offline_sync_completed.load(Ordering::Acquire),
+        "nor may it flip the live-state flag for the connection that replaced it"
+    );
+    assert!(
+        client.offline_sync_metrics.active.load(Ordering::Acquire),
+        "nor touch the drain state it no longer owns"
+    );
+}
+
+/// WA Web's `ShiftTimer`: a drain the server stops feeding on a live
+/// connection is completed by the client rather than left open.
+#[tokio::test]
+async fn offline_resume_inactivity_timeout_completes_the_drain() {
+    use wacore::types::events::ChannelEventHandler;
+
+    let client = offline_resume_test_client().await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    arm_offline_drain(&client, 711, 5).await;
+    let generation = client.connection_generation.load(Ordering::Acquire);
+    offline_resume::spawn_inactivity_watchdog(
+        Arc::clone(&client),
+        generation,
+        Duration::from_millis(30),
+    );
+
+    let event = wait_for_offline_completion(&rx).await;
+    assert_eq!(
+        event, 5,
+        "the timeout completes at the count actually processed"
+    );
+}
+
+/// The other direction: progress shifts the deadline, so a drain that keeps
+/// arriving is never completed behind the server's back.
+#[tokio::test]
+async fn offline_resume_inactivity_timer_is_rearmed_by_progress() {
+    use wacore::types::events::ChannelEventHandler;
+
+    let client = offline_resume_test_client().await;
+    let (handler, rx) = ChannelEventHandler::new();
+    client.core.event_bus.subscribe_handler(handler).detach();
+
+    arm_offline_drain(&client, 711, 5).await;
+    let generation = client.connection_generation.load(Ordering::Acquire);
+    let timeout = Duration::from_millis(30);
+    offline_resume::spawn_inactivity_watchdog(Arc::clone(&client), generation, timeout);
+
+    // Ten ticks of traffic spanning several timeout windows. The watchdog may
+    // observe up to two windows of silence before firing, so this covers it.
+    for _ in 0..10 {
+        client.offline_batch.note_stanza_activity();
+        tokio::time::sleep(timeout / 2).await;
+        assert!(
+            !client.offline_sync_completed.load(Ordering::Acquire),
+            "a drain that keeps making progress must not be completed by the timer"
+        );
+    }
+
+    // Traffic stops: the same timer that stayed quiet now ends the drain.
+    let count = wait_for_offline_completion(&rx).await;
+    assert_eq!(count, 5);
+}
+
+/// Poll the event stream for the completion event. Bounded by the test
+/// harness's own timeout rather than a sleep long enough to "probably" cover it.
+async fn wait_for_offline_completion(rx: &async_channel::Receiver<Arc<Event>>) -> i32 {
+    loop {
+        let event = rx.recv().await.expect("event bus stays open");
+        if let Event::OfflineSyncCompleted(e) = &*event {
+            return e.count;
+        }
+    }
+}
+
+/// Regression sibling of #1377: `HistorySyncActivity::reset()` runs on every
+/// teardown, zeroing the task count and notifying every listener, so a waiter
+/// that only read the count reported a history sync that never finished.
+#[tokio::test]
+async fn wait_for_startup_sync_fails_when_the_connection_ends_mid_history_sync() {
+    let client = offline_resume_test_client().await;
+
+    client.offline_sync_completed.store(true, Ordering::Release);
+    let _tracker = client.begin_history_sync_task(4096);
+    assert_eq!(client.history_sync_activity.tasks(), 1);
+
+    let waiter = tokio::spawn({
+        let client = Arc::clone(&client);
+        async move { client.wait_for_startup_sync(Duration::from_secs(5)).await }
+    });
+    crate::test_utils::wait_for_notifier_listeners(client.history_sync_activity.idle_notifier(), 1)
+        .await;
+
+    // Exactly what `cleanup_connection_state` does, in that order.
+    client.connection_generation.fetch_add(1, Ordering::SeqCst);
+    client.history_sync_activity.reset();
+
+    let result = waiter.await.expect("waiter task must not panic");
+    assert!(
+        result.is_err(),
+        "a teardown's zeroed task count is not a finished history sync"
+    );
+}
+
+/// The same waiter still succeeds when the tasks genuinely drain.
+#[tokio::test]
+async fn wait_for_startup_sync_succeeds_when_history_tasks_finish() {
+    let client = offline_resume_test_client().await;
+
+    client.offline_sync_completed.store(true, Ordering::Release);
+    let tracker = client.begin_history_sync_task(4096);
+    drop(tracker);
+
+    client
+        .wait_for_startup_sync(Duration::from_secs(5))
+        .await
+        .expect("an idle activity tracker is a completed startup sync");
 }

@@ -18,6 +18,11 @@ message NoiseCert {
 message ServerCertChain {
   NoiseCert intermediate = 1;
   NoiseCert leaf = 2;
+  // Set once both XEdDSA signatures were checked when this chain was
+  // cached. Absent in rows written before this field existed, which decode
+  // to false and so fall back to one XX -- the safe direction, since only a
+  // checked chain may authorize IK.
+  bool signature_verified = 3;
 }
 
 message AppStateSyncKeyWire {
@@ -34,4 +39,10 @@ message HashStateWire {
   // rows written before this field existed, which decode to false — the same
   // state a healthy collection is in.
   bool mac_mismatch_fatal = 4;
+  // Set once the collection has completed a bootstrap. Absent in rows written
+  // before this field existed, which decode to false and so re-bootstrap once --
+  // the safe direction, because version 0 with an empty ltHash is byte-identical
+  // between "never synced" and "synced and empty", and only this flag tells them
+  // apart.
+  bool bootstrapped = 5;
 }

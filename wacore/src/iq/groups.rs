@@ -720,11 +720,13 @@ impl ProtocolNode for GroupEphemeralSettings {
 }
 
 /// Response from a group info query.
+///
+/// `subject` is optional because the protocol can explicitly omit it.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
-pub struct GroupInfoResponse {
+pub struct GroupMetadataResponse {
     pub id: Jid,
-    pub subject: GroupSubject,
+    pub subject: Option<GroupSubject>,
     /// Optional display notification string (from `notify`).
     pub notify: Option<String>,
     pub addressing_mode: AddressingMode,
@@ -833,7 +835,7 @@ pub struct GroupInfoResponse {
     pub limit_sharing_trigger: Option<u32>,
 }
 
-impl ProtocolNode for GroupInfoResponse {
+impl ProtocolNode for GroupMetadataResponse {
     fn tag(&self) -> &'static str {
         "group"
     }
@@ -1019,8 +1021,11 @@ impl ProtocolNode for GroupInfoResponse {
 
         let mut builder = NodeBuilder::new("group")
             .attr("id", self.id)
-            .attr("subject", self.subject.as_str())
             .attr("addressing_mode", self.addressing_mode.as_str());
+
+        if let Some(subject) = self.subject {
+            builder = builder.attr("subject", subject.as_str());
+        }
 
         if let Some(notify) = self.notify {
             builder = builder.attr("notify", notify);
@@ -1087,13 +1092,9 @@ impl ProtocolNode for GroupInfoResponse {
             Jid::group(id_str.as_ref())
         };
 
-        let subject = GroupSubject::new_unchecked(
-            attrs
-                .optional_string("subject")
-                .as_deref()
-                .unwrap_or_default(),
-        );
-
+        let subject = attrs
+            .optional_string("subject")
+            .map(|value| GroupSubject::new_unchecked(value.as_ref()));
         let notify = attrs
             .optional_string("notify")
             .map(|value| value.into_owned());
@@ -1368,6 +1369,17 @@ impl GroupParticipatingRequest {
             include_description: true,
         }
     }
+
+    /// Overview projection (WA Web `hasParticipants` / `hasDescription` presence
+    /// flags unset): the server omits `<participants>` and `<description>`
+    /// children, so an overview list costs wire bytes for neither. Use this for
+    /// [`GroupParticipatingOverviewIq`]; full metadata still uses [`Self::new`].
+    pub fn overview() -> Self {
+        Self {
+            include_participants: false,
+            include_description: false,
+        }
+    }
 }
 
 impl Default for GroupParticipatingRequest {
@@ -1403,11 +1415,147 @@ impl ProtocolNode for GroupParticipatingRequest {
     }
 }
 
+/// Slim per-group projection of a participating/batch response: identity,
+/// subject, size, and the community-hierarchy flags — nothing else.
+///
+/// The parser deliberately never visits `<participant>`, `<description>`,
+/// `<ephemeral>`, or any other detail child, so overview lists never pay to
+/// materialize what they discard. A `<group>` carrying a malformed
+/// `<participant>` (e.g. missing `jid`) still parses as an overview; the
+/// full [`GroupMetadataResponse`] parser rejects it.
+///
+/// The protocol has an explicit unnamed-subject shape, so absence is
+/// distinct from an empty subject.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct GroupOverviewData {
+    pub id: Jid,
+    pub subject: Option<String>,
+    pub size: Option<u32>,
+    pub is_parent_group: bool,
+    pub parent_group_jid: Option<Jid>,
+    pub is_default_sub_group: bool,
+    pub is_general_chat: bool,
+}
+
+impl ProtocolNode for GroupOverviewData {
+    fn tag(&self) -> &'static str {
+        "group"
+    }
+
+    fn into_node(self) -> Node {
+        let mut builder = NodeBuilder::new("group").attr("id", self.id);
+        if let Some(subject) = self.subject {
+            builder = builder.attr("subject", subject);
+        }
+        if let Some(size) = self.size {
+            builder = builder.attr("size", size);
+        }
+        let mut children = Vec::new();
+        if self.is_parent_group {
+            children.push(NodeBuilder::new("parent").build());
+        }
+        if let Some(parent) = self.parent_group_jid {
+            children.push(
+                NodeBuilder::new("linked_parent")
+                    .attr("jid", parent)
+                    .build(),
+            );
+        }
+        if self.is_default_sub_group {
+            children.push(NodeBuilder::new("default_sub_group").build());
+        }
+        if self.is_general_chat {
+            children.push(NodeBuilder::new("general_chat").build());
+        }
+        builder.children(children).build()
+    }
+
+    fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self> {
+        if node.tag != "group" && node.tag != "community" {
+            return Err(anyhow!(
+                "expected <group> or <community>, got <{}>",
+                node.tag
+            ));
+        }
+        let mut attrs = node.attrs();
+        let id_str = attrs
+            .optional_string("id")
+            .ok_or_else(|| anyhow!("missing required attribute id"))?;
+        let id = if id_str.contains('@') {
+            id_str.parse()?
+        } else {
+            Jid::group(id_str.as_ref())
+        };
+        let subject = attrs
+            .optional_string("subject")
+            .map(|value| value.into_owned());
+        attrs.finish()?;
+        let size = optional_bounded_u32_attr(node, "size", GROUP_INFO_PARTICIPANT_LIMIT)?;
+        let is_parent_group = node.get_optional_child_by_tag(&["parent"]).is_some();
+        let parent_group_jid = node
+            .get_optional_child_by_tag(&["linked_parent"])
+            .map(|linked_parent| -> Result<Jid> {
+                let mut attrs = linked_parent.attrs();
+                let jid = attrs.required_jid("jid")?;
+                attrs.finish()?;
+                Ok(jid)
+            })
+            .transpose()?;
+        let is_default_sub_group = node
+            .get_optional_child_by_tag(&["default_sub_group"])
+            .is_some();
+        let is_general_chat = node.get_optional_child_by_tag(&["general_chat"]).is_some();
+        Ok(Self {
+            id,
+            subject,
+            size,
+            is_parent_group,
+            parent_group_jid,
+            is_default_sub_group,
+            is_general_chat,
+        })
+    }
+}
+
 /// Response containing all groups the user is participating in.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct GroupParticipatingResponse {
-    pub groups: Vec<GroupInfoResponse>,
+    pub groups: Vec<GroupMetadataResponse>,
+}
+
+/// Slim participating response: one [`GroupOverviewData`] per group.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct GroupParticipatingOverviewResponse {
+    pub groups: Vec<GroupOverviewData>,
+}
+
+impl ProtocolNode for GroupParticipatingOverviewResponse {
+    fn tag(&self) -> &'static str {
+        "groups"
+    }
+
+    fn into_node(self) -> Node {
+        let children: Vec<Node> = self.groups.into_iter().map(|g| g.into_node()).collect();
+        NodeBuilder::new("groups").children(children).build()
+    }
+
+    fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self> {
+        let child_tag = match node.tag.as_ref() {
+            "groups" => "group",
+            "communities" => "community",
+            _ => {
+                return Err(anyhow!(
+                    "expected <groups> or <communities>, got <{}>",
+                    node.tag
+                ));
+            }
+        };
+        let groups = collect_children::<GroupOverviewData>(node, child_tag)?;
+        Ok(Self { groups })
+    }
 }
 
 impl ProtocolNode for GroupParticipatingResponse {
@@ -1431,7 +1579,7 @@ impl ProtocolNode for GroupParticipatingResponse {
                 ));
             }
         };
-        let groups = collect_children::<GroupInfoResponse>(node, child_tag)?;
+        let groups = collect_children::<GroupMetadataResponse>(node, child_tag)?;
 
         Ok(Self { groups })
     }
@@ -1440,8 +1588,8 @@ impl ProtocolNode for GroupParticipatingResponse {
 /// participant `phash` that matched the server's, so it omitted `<group>` (WA Web
 /// queryGroup phash skip) — the caller should reuse its cached metadata.
 #[derive(Debug, Clone)]
-pub enum GroupInfoOutcome {
-    Full(Box<GroupInfoResponse>),
+pub enum GroupMetadataOutcome {
+    Full(Box<GroupMetadataResponse>),
     NotModified,
 }
 
@@ -1449,7 +1597,7 @@ pub enum GroupInfoOutcome {
 ///
 /// When `phash` is set, the query carries `<query request="interactive"
 /// phash="2:.."/>` so an unchanged group is answered with an absent `<group>`
-/// ([`GroupInfoOutcome::NotModified`]).
+/// ([`GroupMetadataOutcome::NotModified`]).
 #[derive(Debug, Clone)]
 pub struct GroupQueryIq {
     pub group_jid: Jid,
@@ -1480,7 +1628,7 @@ impl GroupQueryIq {
 }
 
 impl IqSpec for GroupQueryIq {
-    type Response = GroupInfoOutcome;
+    type Response = GroupMetadataOutcome;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         let mut query = GroupQueryRequest::default().into_node();
@@ -1499,10 +1647,10 @@ impl IqSpec for GroupQueryIq {
             .get_optional_child("group")
             .or_else(|| response.get_optional_child("community"))
         {
-            Some(group_node) => Ok(GroupInfoOutcome::Full(Box::new(
-                GroupInfoResponse::try_from_node_ref(group_node)?,
+            Some(group_node) => Ok(GroupMetadataOutcome::Full(Box::new(
+                GroupMetadataResponse::try_from_node_ref(group_node)?,
             ))),
-            None => Ok(GroupInfoOutcome::NotModified),
+            None => Ok(GroupMetadataOutcome::NotModified),
         }
     }
 }
@@ -1530,6 +1678,94 @@ impl IqSpec for GroupParticipatingIq {
         } else {
             parse_community_participating_response(response)
         }
+    }
+}
+
+/// IQ specification for getting slim overviews of all groups the user is
+/// participating in.
+///
+/// Sends the overview projection ([`GroupParticipatingRequest::overview`], no
+/// `<participants>` / `<description>` children) and parses each `<group>`
+/// with the slim [`GroupOverviewData`] parser — participants are never
+/// collected, so a malformed `<participant>` cannot fail the list.
+#[derive(Debug, Clone, Default)]
+pub struct GroupParticipatingOverviewIq;
+
+impl GroupParticipatingOverviewIq {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl IqSpec for GroupParticipatingOverviewIq {
+    type Response = GroupParticipatingOverviewResponse;
+
+    fn build_iq(&self) -> InfoQuery<'static> {
+        InfoQuery::get(
+            GROUP_IQ_NAMESPACE,
+            Jid::new("", Server::Group),
+            Some(NodeContent::Nodes(vec![
+                GroupParticipatingRequest::overview().into_node(),
+            ])),
+        )
+    }
+
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
+        // A response can carry BOTH `<groups>` and `<communities>` (the
+        // shape `participating_iqs_select_their_own_container` covers):
+        // combine both containers instead of returning after the first, or
+        // every parent community would be silently dropped from a list that
+        // promises every group. `<communities>` entries are marked as
+        // parent groups, matching the full parser's overlay.
+        let mut groups = Vec::new();
+        let mut seen_groups_shape = false;
+        if has_participating_shape(response, "groups", "group") {
+            groups
+                .extend(parse_participating_overview_response(response, "groups", "group")?.groups);
+            seen_groups_shape = true;
+        }
+        if has_participating_shape(response, "communities", "community") {
+            groups.extend(parse_community_participating_overview_response(response)?.groups);
+            seen_groups_shape = true;
+        }
+        if seen_groups_shape {
+            return Ok(GroupParticipatingOverviewResponse { groups });
+        }
+        parse_community_participating_overview_response(response)
+    }
+}
+
+/// IQ specification for getting slim overviews of all parent communities the
+/// user participates in. Overview projection on the wire, slim parse locally.
+#[derive(Debug, Clone, Default)]
+pub struct CommunityParticipatingOverviewIq;
+
+impl CommunityParticipatingOverviewIq {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl IqSpec for CommunityParticipatingOverviewIq {
+    type Response = GroupParticipatingOverviewResponse;
+
+    fn build_iq(&self) -> InfoQuery<'static> {
+        InfoQuery::get(
+            GROUP_IQ_NAMESPACE,
+            Jid::new("", Server::Group),
+            Some(NodeContent::Nodes(vec![
+                GroupParticipatingRequest::overview().into_node(),
+            ])),
+        )
+    }
+
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
+        if has_participating_shape(response, "communities", "community") {
+            return parse_community_participating_overview_response(response);
+        }
+        let mut result = parse_participating_overview_response(response, "groups", "group")?;
+        result.groups.retain(|group| group.is_parent_group);
+        Ok(result)
     }
 }
 
@@ -1571,6 +1807,38 @@ fn parse_community_participating_response(
     Ok(result)
 }
 
+fn parse_community_participating_overview_response(
+    response: &NodeRef<'_>,
+) -> Result<GroupParticipatingOverviewResponse> {
+    let mut result = parse_participating_overview_response(response, "communities", "community")?;
+    for community in &mut result.groups {
+        community.is_parent_group = true;
+    }
+    Ok(result)
+}
+
+fn parse_participating_overview_response(
+    response: &NodeRef<'_>,
+    container_tag: &'static str,
+    child_tag: &'static str,
+) -> Result<GroupParticipatingOverviewResponse> {
+    if response.tag == container_tag {
+        return GroupParticipatingOverviewResponse::try_from_node_ref(response);
+    }
+
+    if let Some(container) = response.get_optional_child(container_tag) {
+        return GroupParticipatingOverviewResponse::try_from_node_ref(container);
+    }
+
+    let groups = collect_children::<GroupOverviewData>(response, child_tag)?;
+    if groups.is_empty() {
+        return Err(anyhow!(
+            "missing <{container_tag}> or direct <{child_tag}> participating result"
+        ));
+    }
+    Ok(GroupParticipatingOverviewResponse { groups })
+}
+
 fn build_participating_iq() -> InfoQuery<'static> {
     InfoQuery::get(
         GROUP_IQ_NAMESPACE,
@@ -1604,7 +1872,7 @@ fn parse_participating_response(
         return GroupParticipatingResponse::try_from_node_ref(container);
     }
 
-    let groups = collect_children::<GroupInfoResponse>(response, child_tag)?;
+    let groups = collect_children::<GroupMetadataResponse>(response, child_tag)?;
     if groups.is_empty() {
         return Err(anyhow!(
             "missing <{container_tag}> or direct <{child_tag}> participating result"
@@ -1627,8 +1895,8 @@ impl GroupCreateIq {
 
 impl IqSpec for GroupCreateIq {
     // Server's `<create>` reply carries the full `<group>` node, so callers
-    // can skip a follow-up `get_metadata` IQ. Mirrors WA Web's CreateJob.
-    type Response = GroupInfoResponse;
+    // can skip a follow-up `fetch_metadata` IQ. Mirrors WA Web's CreateJob.
+    type Response = GroupMetadataResponse;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         InfoQuery::set(
@@ -1645,7 +1913,7 @@ impl IqSpec for GroupCreateIq {
             .get_optional_child("group")
             .or_else(|| response.get_optional_child("community"))
             .ok_or_else(|| anyhow!("missing group or community create result"))?;
-        let mut info = GroupInfoResponse::try_from_node_ref(group_node)?;
+        let mut info = GroupMetadataResponse::try_from_node_ref(group_node)?;
 
         // Server may omit `<parent>` from a community-create reply; overlay
         // request flags so `group_type()` classifies without a follow-up query.
@@ -2754,7 +3022,7 @@ impl QueryLinkedGroupIq {
 }
 
 impl IqSpec for QueryLinkedGroupIq {
-    type Response = GroupInfoResponse;
+    type Response = GroupMetadataResponse;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         let query_node = NodeBuilder::new("query_linked")
@@ -2772,7 +3040,7 @@ impl IqSpec for QueryLinkedGroupIq {
     fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
         let linked_node = required_child(response, "linked_group")?;
         let group_node = required_child(linked_node, "group")?;
-        GroupInfoResponse::try_from_node_ref(group_node)
+        GroupMetadataResponse::try_from_node_ref(group_node)
     }
 }
 
@@ -2800,7 +3068,7 @@ impl JoinLinkedGroupIq {
 }
 
 impl IqSpec for JoinLinkedGroupIq {
-    type Response = GroupInfoResponse;
+    type Response = JoinGroupResult;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         let node = NodeBuilder::new("join_linked_group")
@@ -2815,9 +3083,33 @@ impl IqSpec for JoinLinkedGroupIq {
     }
 
     fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
-        let linked_node = required_child(response, "linked_group")?;
-        let group_node = required_child(linked_node, "group")?;
-        GroupInfoResponse::try_from_node_ref(group_node)
+        // Bare joins the request's own subgroup (same shape pair as the V4
+        // accept — see the generated shapes).
+        if response.content.is_none() {
+            return Ok(JoinGroupResult::Joined(self.subgroup_jid.clone()));
+        }
+        // Compatibility allowance, not a bundle shape: some servers answer
+        // with the query-shaped `<linked_group><group id/></linked_group>`
+        // metadata instead of the bare result. It carries a real group
+        // identity (the same `id` the query parser reads), so joining it
+        // cannot misreport a non-joined state — but only as the complete
+        // shape: siblings beside the wrapper (an approval request, unknown
+        // nodes) fall through to the strict parser below instead of being
+        // silently ignored.
+        //
+        // TODO: drop this allowance once servers answer the bare result and
+        // re-tighten to bare-or-approval only; the wrapper exists for a
+        // transitional server behavior, not the protocol.
+        if let Some([linked]) = response.children()
+            && linked.tag.as_ref() == "linked_group"
+            && let Some([group]) = linked.children()
+            && group.tag.as_ref() == "group"
+            && let Ok(id_str) = required_attr(group, "id")
+            && let Ok(jid) = parse_group_id(&id_str)
+        {
+            return Ok(JoinGroupResult::Joined(jid));
+        }
+        parse_join_group_response(response)
     }
 }
 
@@ -2902,11 +3194,17 @@ fn parse_group_id(id_str: &str) -> Result<Jid> {
     }
 }
 
+/// Child tags of the join-response shapes, shared by the strict parser and
+/// the bare-result fallbacks below so the two cannot drift apart.
+const JOIN_GROUP_CHILD: &str = "group";
+const JOIN_COMMUNITY_CHILD: &str = "community";
+const JOIN_APPROVAL_CHILD: &str = "membership_approval_request";
+
 /// Shared response parser for group join IQs (both code-based and V4 invite).
 fn parse_join_group_response(response: &NodeRef<'_>) -> Result<JoinGroupResult> {
     if let Some(group_node) = response
-        .get_optional_child("group")
-        .or_else(|| response.get_optional_child("community"))
+        .get_optional_child(JOIN_GROUP_CHILD)
+        .or_else(|| response.get_optional_child(JOIN_COMMUNITY_CHILD))
     {
         let jid_str = required_attr(group_node, "jid")?;
         let jid: Jid = jid_str
@@ -2914,16 +3212,29 @@ fn parse_join_group_response(response: &NodeRef<'_>) -> Result<JoinGroupResult> 
             .map_err(|e| anyhow!("invalid group jid: {e}"))?;
         return Ok(JoinGroupResult::Joined(jid));
     }
-    if let Some(approval_node) = response.get_optional_child("membership_approval_request") {
+    if let Some(approval_node) = response.get_optional_child(JOIN_APPROVAL_CHILD) {
         let jid_str = required_attr(approval_node, "jid")?;
         let jid: Jid = jid_str
             .parse()
             .map_err(|e| anyhow!("invalid group jid: {e}"))?;
         return Ok(JoinGroupResult::PendingApproval(jid));
     }
+    // NOTE: this message is matched downstream (bridge/baileyrs surfaces it);
+    // keep it byte-identical when touching the tags above.
     Err(anyhow!(
         "expected <group>, <community>, or <membership_approval_request> in join response"
     ))
+}
+
+/// Parse a join response that may be a bare `<iq type="result">`: with no
+/// content at all the join succeeded and the group is the request's own
+/// addressee (`fallback`); anything present but unrecognized falls through to
+/// the strict parser and fails loudly instead of reporting `Joined`.
+fn parse_join_or_bare(response: &NodeRef<'_>, fallback: &Jid) -> Result<JoinGroupResult> {
+    if response.content.is_none() {
+        return Ok(JoinGroupResult::Joined(fallback.clone()));
+    }
+    parse_join_group_response(response)
 }
 
 /// ```xml
@@ -3003,7 +3314,10 @@ impl IqSpec for AcceptGroupInviteV4Iq {
     }
 
     fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
-        parse_join_group_response(response)
+        // Bare joins the request's own `to` (`AcceptGroupAddResponseSuccess`
+        // in the generated shapes); the code-based join keeps the strict
+        // parser, whose bare result carries no group identity.
+        parse_join_or_bare(response, &self.group_jid)
     }
 }
 
@@ -3030,7 +3344,7 @@ impl GetGroupInviteInfoIq {
 }
 
 impl IqSpec for GetGroupInviteInfoIq {
-    type Response = GroupInfoResponse;
+    type Response = GroupMetadataResponse;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         let to = Jid::new("", Server::Group);
@@ -3048,7 +3362,7 @@ impl IqSpec for GetGroupInviteInfoIq {
             .get_optional_child("group")
             .or_else(|| response.get_optional_child("community"))
             .ok_or_else(|| anyhow!("missing group or community invite result"))?;
-        GroupInfoResponse::try_from_node_ref(group_node)
+        GroupMetadataResponse::try_from_node_ref(group_node)
     }
 }
 
@@ -3313,14 +3627,59 @@ impl IqSpec for AcknowledgeGroupIq {
 // Batch get group info
 // ---------------------------------------------------------------------------
 
+/// Which refusal a batch `<group error=".."/>` node carries.
+///
+/// The official response union has exactly two closed discriminators —
+/// `GroupForbidden` (`error="403"`) and `GroupNotExist` (`error="404"`) —
+/// so any other code is not a documented shape and must not be silently
+/// mapped onto one of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BatchGroupRefusal {
+    Forbidden(Jid),
+    NotFound(Jid),
+}
+
+/// Classify a batch `<group>` refusal, shared by the metadata and overview
+/// batch parsers so their error handling cannot drift.
+///
+/// An unrecognized `error` code is an error rather than a `NotFound`: mapping
+/// it to `NotFound` would report a group as nonexistent when the server said
+/// something else entirely.
+fn parse_batch_group_refusal(group_node: &NodeRef<'_>, code: &str) -> Result<BatchGroupRefusal> {
+    let id_str = required_attr(group_node, "id")?;
+    let id = parse_group_id(&id_str)?;
+    match code {
+        "403" => Ok(BatchGroupRefusal::Forbidden(id)),
+        "404" => Ok(BatchGroupRefusal::NotFound(id)),
+        other => Err(anyhow!(
+            "unexpected batch group error code '{other}' (expected 403 or 404)"
+        )),
+    }
+}
+
 /// Result for a single group in a batch query.
 #[derive(Debug, Clone)]
-pub enum BatchGroupInfoResult {
-    Full(Box<GroupInfoResponse>),
-    /// Truncated response (only id and size available).
+pub enum BatchGroupMetadataResult {
+    Full(Box<GroupMetadataResponse>),
+    /// Truncated response (only id and required size available).
     Truncated {
         id: Jid,
-        size: Option<u32>,
+        size: u32,
+    },
+    Forbidden(Jid),
+    NotFound(Jid),
+}
+
+/// Slim result for a single group in a batch overview query: the full case
+/// carries only [`GroupOverviewData`], parsed without ever visiting
+/// `<participant>` or detail children.
+#[derive(Debug, Clone)]
+pub enum BatchGroupOverviewResult {
+    Full(Box<GroupOverviewData>),
+    /// Truncated response (only id and required size available).
+    Truncated {
+        id: Jid,
+        size: u32,
     },
     Forbidden(Jid),
     NotFound(Jid),
@@ -3350,7 +3709,7 @@ impl BatchGetGroupInfoIq {
 }
 
 impl IqSpec for BatchGetGroupInfoIq {
-    type Response = Vec<BatchGroupInfoResult>;
+    type Response = Vec<BatchGroupMetadataResult>;
 
     fn build_iq(&self) -> InfoQuery<'static> {
         let children: Vec<Node> = self
@@ -3375,29 +3734,122 @@ impl IqSpec for BatchGetGroupInfoIq {
         for group_node in groups_node.get_children_by_tag("group") {
             let mut attrs = group_node.attrs();
 
-            // Check error attribute first (403=forbidden, 404=not found)
+            // A refusal is one of the union's closed discriminators; an
+            // unrecognized code is an error, not a NotFound.
             if let Some(error_code) = attrs.optional_string("error") {
-                let id_str = required_attr(group_node, "id")?;
-                let id = parse_group_id(&id_str)?;
-                match error_code.as_ref() {
-                    "403" => results.push(BatchGroupInfoResult::Forbidden(id)),
-                    _ => results.push(BatchGroupInfoResult::NotFound(id)),
+                match parse_batch_group_refusal(group_node, error_code.as_ref())? {
+                    BatchGroupRefusal::Forbidden(id) => {
+                        results.push(BatchGroupMetadataResult::Forbidden(id))
+                    }
+                    BatchGroupRefusal::NotFound(id) => {
+                        results.push(BatchGroupMetadataResult::NotFound(id))
+                    }
                 };
                 continue;
             }
 
-            let is_truncated = attrs
-                .optional_string("truncated")
-                .is_some_and(|s| s == "true");
+            let is_truncated = match attrs.optional_string("truncated") {
+                Some(value) if value.as_ref() == "true" => true,
+                Some(value) => {
+                    return Err(anyhow!(
+                        "invalid truncated value '{}' (expected 'true')",
+                        value
+                    ));
+                }
+                None => false,
+            };
+            attrs.finish()?;
 
             if is_truncated {
                 let id_str = required_attr(group_node, "id")?;
                 let id = parse_group_id(&id_str)?;
-                let size = attrs.optional_string("size").and_then(|s| s.parse().ok());
-                results.push(BatchGroupInfoResult::Truncated { id, size });
+                let size =
+                    optional_bounded_u32_attr(group_node, "size", GROUP_INFO_PARTICIPANT_LIMIT)?
+                        .ok_or_else(|| {
+                            anyhow!("missing required attribute size on truncated group")
+                        })?;
+                results.push(BatchGroupMetadataResult::Truncated { id, size });
             } else {
-                let info = GroupInfoResponse::try_from_node_ref(group_node)?;
-                results.push(BatchGroupInfoResult::Full(Box::new(info)));
+                let info = GroupMetadataResponse::try_from_node_ref(group_node)?;
+                results.push(BatchGroupMetadataResult::Full(Box::new(info)));
+            }
+        }
+
+        Ok(results)
+    }
+}
+
+/// Batch query group overviews for up to 10,000 groups.
+///
+/// Same wire shape as [`BatchGetGroupInfoIq`] — the batch request carries no
+/// overview projection flags, so the server answers full `<group>` nodes —
+/// but each node is parsed with the slim [`GroupOverviewData`] parser, so
+/// `<participant>` and detail children are skipped instead of materialized.
+#[derive(Debug, Clone)]
+pub struct BatchGetGroupOverviewIq {
+    pub group_jids: Vec<Jid>,
+}
+
+impl BatchGetGroupOverviewIq {
+    pub fn new(group_jids: &[Jid]) -> Self {
+        Self {
+            group_jids: group_jids.to_vec(),
+        }
+    }
+}
+
+impl IqSpec for BatchGetGroupOverviewIq {
+    type Response = Vec<BatchGroupOverviewResult>;
+
+    fn build_iq(&self) -> InfoQuery<'static> {
+        BatchGetGroupInfoIq::new(&self.group_jids).build_iq()
+    }
+
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
+        let groups_node = required_child(response, "groups")?;
+        let mut results = Vec::new();
+
+        for group_node in groups_node.get_children_by_tag("group") {
+            let mut attrs = group_node.attrs();
+
+            // Same refusal classification as the metadata batch, so the two
+            // cannot drift on what an unexpected code means.
+            if let Some(error_code) = attrs.optional_string("error") {
+                match parse_batch_group_refusal(group_node, error_code.as_ref())? {
+                    BatchGroupRefusal::Forbidden(id) => {
+                        results.push(BatchGroupOverviewResult::Forbidden(id))
+                    }
+                    BatchGroupRefusal::NotFound(id) => {
+                        results.push(BatchGroupOverviewResult::NotFound(id))
+                    }
+                };
+                continue;
+            }
+
+            let is_truncated = match attrs.optional_string("truncated") {
+                Some(value) if value.as_ref() == "true" => true,
+                Some(value) => {
+                    return Err(anyhow!(
+                        "invalid truncated value '{}' (expected 'true')",
+                        value
+                    ));
+                }
+                None => false,
+            };
+            attrs.finish()?;
+
+            if is_truncated {
+                let id_str = required_attr(group_node, "id")?;
+                let id = parse_group_id(&id_str)?;
+                let size =
+                    optional_bounded_u32_attr(group_node, "size", GROUP_INFO_PARTICIPANT_LIMIT)?
+                        .ok_or_else(|| {
+                            anyhow!("missing required attribute size on truncated group")
+                        })?;
+                results.push(BatchGroupOverviewResult::Truncated { id, size });
+            } else {
+                let info = GroupOverviewData::try_from_node_ref(group_node)?;
+                results.push(BatchGroupOverviewResult::Full(Box::new(info)));
             }
         }
 
@@ -3409,8 +3861,25 @@ impl IqSpec for BatchGetGroupInfoIq {
 // Get group profile pictures (batch)
 // ---------------------------------------------------------------------------
 
-/// A single group profile picture result.
-#[derive(Debug, Clone)]
+/// Detailed outcome of a single group profile picture entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroupProfilePictureOutcome {
+    /// Found group profile picture.
+    Found {
+        url: String,
+        direct_path: Option<String>,
+        photo_id: Option<String>,
+    },
+    /// Picture unchanged (status 304).
+    Unchanged,
+    /// Picture not found / no picture set (status 204 or missing).
+    NotFound,
+    /// Server or permission error for this item (status 500, 405, etc.).
+    Error { code: u16 },
+}
+
+/// Profile picture information for a group in a batch query.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupProfilePicture {
     pub group_jid: Jid,
     /// Direct URL to the picture.
@@ -3419,6 +3888,46 @@ pub struct GroupProfilePicture {
     pub direct_path: Option<String>,
     /// Photo ID / version tag.
     pub photo_id: Option<String>,
+    /// HTTP-like status code returned by the server for this entry (e.g. 200, 304, 204, 500, 405).
+    pub status: Option<u16>,
+}
+
+impl GroupProfilePicture {
+    /// Returns `true` if the server returned status 304 (picture unchanged).
+    pub fn is_unchanged(&self) -> bool {
+        self.status == Some(304)
+    }
+
+    /// Returns `true` if the server returned status 204 (picture not found).
+    pub fn is_not_found(&self) -> bool {
+        self.status == Some(204)
+    }
+
+    /// Returns `true` if a picture URL was returned.
+    pub fn is_found(&self) -> bool {
+        self.url.is_some()
+    }
+
+    /// Converts this item into a typed outcome.
+    pub fn outcome(&self) -> GroupProfilePictureOutcome {
+        if self.status == Some(304) {
+            GroupProfilePictureOutcome::Unchanged
+        } else if self.status == Some(204) {
+            GroupProfilePictureOutcome::NotFound
+        } else if let Some(code) = self.status
+            && code >= 400
+        {
+            GroupProfilePictureOutcome::Error { code }
+        } else if let Some(url) = &self.url {
+            GroupProfilePictureOutcome::Found {
+                url: url.clone(),
+                direct_path: self.direct_path.clone(),
+                photo_id: self.photo_id.clone(),
+            }
+        } else {
+            GroupProfilePictureOutcome::NotFound
+        }
+    }
 }
 
 /// Profile picture query type.
@@ -3428,34 +3937,96 @@ pub enum PictureType {
     Image,
 }
 
+/// Single group request item in a batch profile picture query.
+#[derive(Debug, Clone)]
+pub struct GroupPictureEntry {
+    pub jid: Jid,
+    pub picture_type: PictureType,
+    pub existing_id: Option<String>,
+    pub is_parent_group: bool,
+}
+
+impl GroupPictureEntry {
+    pub fn new(jid: &Jid, picture_type: PictureType) -> Self {
+        Self {
+            jid: jid.clone(),
+            picture_type,
+            existing_id: None,
+            is_parent_group: false,
+        }
+    }
+
+    pub fn with_existing_id(mut self, id: impl Into<String>) -> Self {
+        self.existing_id = Some(id.into());
+        self
+    }
+
+    pub fn as_parent_group(mut self, is_parent_group: bool) -> Self {
+        self.is_parent_group = is_parent_group;
+        self
+    }
+}
+
 /// Batch fetch group profile pictures.
 ///
+/// In WhatsApp Web (`WASmaxOutGroupsGetGroupProfilePicturesRequest`):
 /// ```xml
 /// <iq type="get" xmlns="w:g2" to="@g.us">
 ///   <pictures>
-///     <picture jid="{group_jid}" type="preview"/>
+///     <picture sub_group_jid="{group_jid}" type="preview" query="url"/>
 ///   </pictures>
 /// </iq>
 /// ```
 #[derive(Debug, Clone)]
 pub struct GetGroupProfilePicturesIq {
-    pub groups: Vec<(Jid, PictureType)>,
+    pub entries: Vec<GroupPictureEntry>,
+    /// Target destination: either the group server `@g.us` or a community parent JID.
+    pub to_jid: Option<Jid>,
+    /// Optional linked groups membership hint on `<pictures>`.
+    pub membership_hint: Option<Jid>,
 }
 
 impl GetGroupProfilePicturesIq {
     pub fn new(group_jids: &[Jid]) -> Self {
         Self {
-            groups: group_jids
+            entries: group_jids
                 .iter()
-                .map(|jid| (jid.clone(), PictureType::Preview))
+                .map(|jid| GroupPictureEntry::new(jid, PictureType::Preview))
                 .collect(),
+            to_jid: None,
+            membership_hint: None,
         }
     }
 
     pub fn with_type(groups: &[(Jid, PictureType)]) -> Self {
         Self {
-            groups: groups.to_vec(),
+            entries: groups
+                .iter()
+                .map(|(jid, pic_type)| GroupPictureEntry::new(jid, *pic_type))
+                .collect(),
+            to_jid: None,
+            membership_hint: None,
         }
+    }
+
+    pub fn with_entries(entries: Vec<GroupPictureEntry>) -> Self {
+        Self {
+            entries,
+            to_jid: None,
+            membership_hint: None,
+        }
+    }
+
+    /// Set the destination JID (e.g. community parent JID). Defaults to `@g.us`.
+    pub fn with_to_jid(mut self, to: Jid) -> Self {
+        self.to_jid = Some(to);
+        self
+    }
+
+    /// Set the linked groups membership hint.
+    pub fn with_membership_hint(mut self, hint: Jid) -> Self {
+        self.membership_hint = Some(hint);
+        self
     }
 }
 
@@ -3464,26 +4035,45 @@ impl IqSpec for GetGroupProfilePicturesIq {
 
     fn build_iq(&self) -> InfoQuery<'static> {
         let children: Vec<Node> = self
-            .groups
+            .entries
             .iter()
-            .map(|(jid, pic_type)| {
-                let type_str = match pic_type {
+            .map(|entry| {
+                let type_str = match entry.picture_type {
                     PictureType::Preview => "preview",
                     PictureType::Image => "image",
                 };
-                NodeBuilder::new("picture")
-                    .attr("jid", jid)
+                let mut b = NodeBuilder::new("picture")
                     .attr("type", type_str)
-                    .build()
+                    .attr("query", "url");
+
+                if entry.is_parent_group {
+                    b = b.attr("parent_group_jid", &entry.jid);
+                } else {
+                    b = b.attr("sub_group_jid", &entry.jid);
+                }
+
+                if let Some(id) = &entry.existing_id {
+                    b = b.attr("id", id);
+                }
+
+                b.build()
             })
             .collect();
 
-        let pictures_node = NodeBuilder::new("pictures").children(children).build();
+        let mut pictures_builder = NodeBuilder::new("pictures").children(children);
+        if let Some(hint) = &self.membership_hint {
+            pictures_builder = pictures_builder.attr("linked_groups_membership_hint", hint);
+        }
+
+        let to_jid = self
+            .to_jid
+            .clone()
+            .unwrap_or_else(|| Jid::new("", Server::Group));
 
         InfoQuery::get(
             GROUP_IQ_NAMESPACE,
-            Jid::new("", Server::Group),
-            Some(NodeContent::Nodes(vec![pictures_node])),
+            to_jid,
+            Some(NodeContent::Nodes(vec![pictures_builder.build()])),
         )
     }
 
@@ -3493,13 +4083,29 @@ impl IqSpec for GetGroupProfilePicturesIq {
 
         for pic_node in pictures_node.get_children_by_tag("picture") {
             let mut attrs = pic_node.attrs();
-            if let Some(jid_str) = attrs.optional_string("jid") {
-                let jid = parse_group_id(&jid_str)?;
+            // Protocol ground truth: WhatsApp Web uses sub_group_jid or parent_group_jid,
+            // with jid supported as a legacy/compatibility fallback.
+            let group_jid = attrs
+                .optional_string("sub_group_jid")
+                .or_else(|| attrs.optional_string("parent_group_jid"))
+                .or_else(|| attrs.optional_string("jid"))
+                .map(|jid_str| parse_group_id(&jid_str))
+                .transpose()?;
+
+            if let Some(jid) = group_jid {
+                let status = attrs
+                    .optional_string("status")
+                    .and_then(|s| s.parse::<u16>().ok());
+                let url = attrs.optional_string("url").map(|s| s.to_string());
+                let direct_path = attrs.optional_string("direct_path").map(|s| s.to_string());
+                let photo_id = attrs.optional_string("id").map(|s| s.to_string());
+
                 results.push(GroupProfilePicture {
                     group_jid: jid,
-                    url: attrs.optional_string("url").map(|s| s.to_string()),
-                    direct_path: attrs.optional_string("direct_path").map(|s| s.to_string()),
-                    photo_id: attrs.optional_string("id").map(|s| s.to_string()),
+                    url,
+                    direct_path,
+                    photo_id,
+                    status,
                 });
             }
         }
@@ -3949,14 +4555,14 @@ mod tests {
             .build();
         assert!(matches!(
             spec.parse_response(&full.as_node_ref()).unwrap(),
-            GroupInfoOutcome::Full(_)
+            GroupMetadataOutcome::Full(_)
         ));
 
         // Absent <group> → NotModified (server confirmed the phash matched).
         let nm = NodeBuilder::new("iq").build();
         assert!(matches!(
             spec.parse_response(&nm.as_node_ref()).unwrap(),
-            GroupInfoOutcome::NotModified
+            GroupMetadataOutcome::NotModified
         ));
     }
 
@@ -3987,9 +4593,18 @@ mod tests {
             .unwrap();
 
         assert_eq!(groups.groups.len(), 1);
-        assert_eq!(groups.groups[0].subject.as_str(), "Regular group");
+        assert_eq!(
+            groups.groups[0].subject.as_ref().map(GroupSubject::as_str),
+            Some("Regular group")
+        );
         assert_eq!(communities.groups.len(), 1);
-        assert_eq!(communities.groups[0].subject.as_str(), "Parent group");
+        assert_eq!(
+            communities.groups[0]
+                .subject
+                .as_ref()
+                .map(GroupSubject::as_str),
+            Some("Parent group")
+        );
         assert!(communities.groups[0].is_parent_group);
     }
 
@@ -4040,7 +4655,13 @@ mod tests {
 
         assert_eq!(groups.groups.len(), 2);
         assert_eq!(communities.groups.len(), 1);
-        assert_eq!(communities.groups[0].subject.as_str(), "Parent group");
+        assert_eq!(
+            communities.groups[0]
+                .subject
+                .as_ref()
+                .map(GroupSubject::as_str),
+            Some("Parent group")
+        );
     }
 
     #[test]
@@ -4783,6 +5404,169 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
+    fn overview_participating_request_omits_participants_and_description() {
+        let node = GroupParticipatingRequest::overview().into_node();
+        assert!(node.get_optional_child("participants").is_none());
+        assert!(node.get_optional_child("description").is_none());
+        let full = GroupParticipatingRequest::new().into_node();
+        assert!(full.get_optional_child("participants").is_some());
+        assert!(full.get_optional_child("description").is_some());
+    }
+
+    #[test]
+    fn overview_parser_rejects_malformed_linked_parent() {
+        for linked_parent in [
+            NodeBuilder::new("linked_parent").build(),
+            NodeBuilder::new("linked_parent")
+                .attr("jid", "not-a-jid")
+                .build(),
+        ] {
+            let node = NodeBuilder::new("group")
+                .attr("id", "120363000000000041@g.us")
+                .children([linked_parent])
+                .build();
+            assert!(
+                GroupOverviewData::try_from_node(&node).is_err(),
+                "malformed linked_parent must not be treated as standalone"
+            );
+        }
+    }
+
+    #[test]
+    fn overview_parser_ignores_malformed_participants() {
+        // A `<participant>` without `jid`: the full parser rejects it, the
+        // slim overview parser skips it and still succeeds.
+        let node = NodeBuilder::new("group")
+            .attr("id", "120363000000000041@g.us")
+            .attr("subject", "Overview probe")
+            .children([NodeBuilder::new("participant").build()])
+            .build();
+        let overview = GroupOverviewData::try_from_node(&node).unwrap();
+        assert_eq!(overview.subject.as_deref(), Some("Overview probe"));
+        let full_err = GroupMetadataResponse::try_from_node(&node).unwrap_err();
+        assert!(full_err.to_string().contains("jid"));
+    }
+
+    #[test]
+    fn overview_participating_combines_groups_and_communities() {
+        // Both containers present: the overview list must contain both,
+        // with `<communities>` entries marked as parent groups.
+        let response = NodeBuilder::new("iq")
+            .children([
+                NodeBuilder::new("groups")
+                    .children([NodeBuilder::new("group")
+                        .attr("id", "120363000000000041@g.us")
+                        .attr("subject", "Regular group")
+                        .build()])
+                    .build(),
+                NodeBuilder::new("communities")
+                    .children([NodeBuilder::new("community")
+                        .attr("id", "120363000000000042@g.us")
+                        .attr("subject", "Parent group")
+                        .build()])
+                    .build(),
+            ])
+            .build();
+        let overviews = GroupParticipatingOverviewIq::new()
+            .parse_response(&response.as_node_ref())
+            .unwrap()
+            .groups;
+        assert_eq!(overviews.len(), 2);
+        assert_eq!(overviews[0].subject.as_deref(), Some("Regular group"));
+        assert!(!overviews[0].is_parent_group);
+        assert_eq!(overviews[1].subject.as_deref(), Some("Parent group"));
+        assert!(overviews[1].is_parent_group);
+    }
+
+    #[test]
+    fn batch_group_parsers_reject_unexpected_error_codes() {
+        let response = NodeBuilder::new("iq")
+            .children([NodeBuilder::new("groups")
+                .children([NodeBuilder::new("group")
+                    .attr("id", "120363000000000041@g.us")
+                    .attr("error", "500")
+                    .build()])
+                .build()])
+            .build();
+        let response = response.as_node_ref();
+
+        let metadata_error = BatchGetGroupInfoIq::new(&[])
+            .parse_response(&response)
+            .unwrap_err();
+        assert!(
+            metadata_error
+                .to_string()
+                .contains("unexpected batch group error code '500'")
+        );
+
+        let overview_error = BatchGetGroupOverviewIq::new(&[])
+            .parse_response(&response)
+            .unwrap_err();
+        assert!(
+            overview_error
+                .to_string()
+                .contains("unexpected batch group error code '500'")
+        );
+    }
+
+    #[test]
+    fn overview_batch_requires_protocol_truncated_size() {
+        let parse = |truncated: &str, size: Option<&str>| {
+            let mut group = NodeBuilder::new("group")
+                .attr("id", "120363000000000042@g.us")
+                .attr("truncated", truncated);
+            if let Some(size) = size {
+                group = group.attr("size", size);
+            }
+            let response = NodeBuilder::new("iq")
+                .children([NodeBuilder::new("groups").children([group.build()]).build()])
+                .build();
+            BatchGetGroupOverviewIq::new(&[]).parse_response(&response.as_node_ref())
+        };
+
+        let results = parse("true", Some("42")).unwrap();
+        assert!(matches!(
+            results.as_slice(),
+            [BatchGroupOverviewResult::Truncated { size: 42, .. }]
+        ));
+        assert!(parse("true", None).is_err());
+        assert!(parse("not-a-boolean", None).is_err());
+        assert!(parse("true", Some("not-a-number")).is_err());
+        assert!(
+            parse(
+                "true",
+                Some(&(GROUP_INFO_PARTICIPANT_LIMIT + 1).to_string())
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn overview_batch_parses_slim_without_participants() {
+        let response = NodeBuilder::new("iq")
+            .children([NodeBuilder::new("groups")
+                .children([NodeBuilder::new("group")
+                    .attr("id", "120363000000000041@g.us")
+                    .attr("subject", "Batch probe")
+                    .attr("size", "5")
+                    .children([NodeBuilder::new("participant").build()])
+                    .build()])
+                .build()])
+            .build();
+        let results = BatchGetGroupOverviewIq::new(&[])
+            .parse_response(&response.as_node_ref())
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        match &results[0] {
+            BatchGroupOverviewResult::Full(info) => {
+                assert_eq!(info.subject.as_deref(), Some("Batch probe"));
+                assert_eq!(info.size, Some(5));
+            }
+            other => panic!("expected Full, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn participating_groups_accepts_current_and_legacy_envelopes() {
         let spec = GroupParticipatingIq::new();
         for (container_tag, item_tag) in [("groups", "group"), ("communities", "community")] {
@@ -5029,7 +5813,7 @@ mod tests {
             ])
             .build();
 
-        let response = GroupInfoResponse::try_from_node(&node).unwrap();
+        let response = GroupMetadataResponse::try_from_node(&node).unwrap();
         assert!(response.is_parent_group);
         assert!(response.allow_non_admin_sub_group_creation);
         assert!(response.parent_group_jid.is_none());
@@ -5051,7 +5835,7 @@ mod tests {
             ])
             .build();
 
-        let response = GroupInfoResponse::try_from_node(&node).unwrap();
+        let response = GroupMetadataResponse::try_from_node(&node).unwrap();
         assert!(!response.is_parent_group);
         assert!(response.is_default_sub_group);
         assert_eq!(response.parent_group_jid, Some(parent_jid.parse().unwrap()));
@@ -5072,7 +5856,7 @@ mod tests {
                 .build()])
             .build();
 
-        let response = GroupInfoResponse::try_from_node(&node).unwrap();
+        let response = GroupMetadataResponse::try_from_node(&node).unwrap();
         assert_eq!(response.description.as_deref(), Some("Hello world"));
         assert_eq!(response.description_id.as_deref(), Some("desc123"));
         assert_eq!(
@@ -5160,7 +5944,7 @@ mod tests {
             ])
             .build();
 
-        let response = GroupInfoResponse::try_from_node(&node).unwrap();
+        let response = GroupMetadataResponse::try_from_node(&node).unwrap();
         assert_eq!(response.notify.as_deref(), Some("Fixture notification"));
         assert_eq!(
             response.creator_pn,
@@ -5251,7 +6035,7 @@ mod tests {
             Some("fixture.fallback")
         );
 
-        let round_trip = GroupInfoResponse::try_from_node(&response.into_node()).unwrap();
+        let round_trip = GroupMetadataResponse::try_from_node(&response.into_node()).unwrap();
         assert_eq!(round_trip.ephemeral.unwrap().expiration, Some(0));
         assert_eq!(
             round_trip.description_owner_username.as_deref(),
@@ -5281,7 +6065,7 @@ mod tests {
                 .build()])
             .build();
 
-        let response = GroupInfoResponse::try_from_node(&node).unwrap();
+        let response = GroupMetadataResponse::try_from_node(&node).unwrap();
         assert!(response.is_parent_group);
         assert!(!response.parent_membership_approval_required);
     }
@@ -5317,9 +6101,41 @@ mod tests {
                 .build()])
             .build();
 
-        let response = GroupInfoResponse::try_from_node(&node).unwrap();
+        let response = GroupMetadataResponse::try_from_node(&node).unwrap();
         assert!(response.is_suspended);
         assert!(!response.suspension_can_auto_file);
+    }
+
+    #[test]
+    fn test_group_info_response_defaults_absent_subject() {
+        let absent = NodeBuilder::new("group")
+            .attr("id", "120363000000000025@g.us")
+            .build();
+        let empty = NodeBuilder::new("group")
+            .attr("id", "120363000000000026@g.us")
+            .attr("subject", "")
+            .build();
+
+        let absent = GroupMetadataResponse::try_from_node(&absent).unwrap();
+        let empty = GroupMetadataResponse::try_from_node(&empty).unwrap();
+
+        assert!(absent.subject.is_none());
+        assert_eq!(empty.subject.as_ref().map(GroupSubject::as_str), Some(""));
+        assert!(
+            absent
+                .into_node()
+                .attrs()
+                .optional_string("subject")
+                .is_none()
+        );
+        assert_eq!(
+            empty
+                .into_node()
+                .attrs()
+                .optional_string("subject")
+                .as_deref(),
+            Some("")
+        );
     }
 
     #[test]
@@ -5334,8 +6150,8 @@ mod tests {
             .children([NodeBuilder::new("ephemeral").build()])
             .build();
 
-        let absent = GroupInfoResponse::try_from_node(&without_ephemeral).unwrap();
-        let empty = GroupInfoResponse::try_from_node(&with_empty_ephemeral).unwrap();
+        let absent = GroupMetadataResponse::try_from_node(&without_ephemeral).unwrap();
+        let empty = GroupMetadataResponse::try_from_node(&with_empty_ephemeral).unwrap();
 
         assert!(absent.ephemeral.is_none());
         assert_eq!(empty.ephemeral, Some(GroupEphemeralSettings::default()));
@@ -5377,7 +6193,7 @@ mod tests {
 
         for fixture in fixtures {
             assert!(
-                GroupInfoResponse::try_from_node(&fixture).is_err(),
+                GroupMetadataResponse::try_from_node(&fixture).is_err(),
                 "out-of-range group metadata must be rejected: {fixture:?}"
             );
         }
@@ -5394,7 +6210,7 @@ mod tests {
                 .build()])
             .build();
 
-        let response = GroupInfoResponse::try_from_node(&node).unwrap();
+        let response = GroupMetadataResponse::try_from_node(&node).unwrap();
         let serialized = response.into_node();
         let description = serialized
             .get_optional_child("description")
@@ -5683,10 +6499,13 @@ mod tests {
             ])
             .build();
 
-        let response = GroupInfoResponse::try_from_node(&node).unwrap();
+        let response = GroupMetadataResponse::try_from_node(&node).unwrap();
 
         assert_eq!(response.id.to_string(), "120363000000000001@g.us");
-        assert_eq!(response.subject.as_str(), "test");
+        assert_eq!(
+            response.subject.as_ref().map(GroupSubject::as_str),
+            Some("test")
+        );
         assert_eq!(response.addressing_mode, AddressingMode::Lid);
         assert_eq!(response.creation_time, Some(1700000000));
         assert_eq!(response.subject_time, Some(1700000000));
@@ -5712,7 +6531,7 @@ mod tests {
             .attr("subject", "Test Group")
             .build();
 
-        let response = GroupInfoResponse::try_from_node(&node).unwrap();
+        let response = GroupMetadataResponse::try_from_node(&node).unwrap();
         assert!(response.description.is_none());
         assert!(response.description_id.is_none());
         assert!(response.description_owner.is_none());
@@ -5754,5 +6573,406 @@ mod tests {
             accept.attrs().optional_string("admin").as_deref(),
             Some("5511999887766@s.whatsapp.net"),
         );
+    }
+
+    const TEST_GROUP_JID: &str = "120363000000000042@g.us";
+    const TEST_PARENT_JID: &str = "120363000000000001@g.us";
+    const TEST_ADMIN_JID: &str = "5511999887766@s.whatsapp.net";
+    const TEST_INVITE_CODE: &str = "A1B2C3D4";
+    const TEST_INVITE_EXPIRATION: i64 = 1_700_000_123;
+
+    fn v4_spec() -> (Jid, AcceptGroupInviteV4Iq) {
+        let group_jid: Jid = TEST_GROUP_JID.parse().unwrap();
+        let admin_jid: Jid = TEST_ADMIN_JID.parse().unwrap();
+        let spec = AcceptGroupInviteV4Iq::new(
+            &group_jid,
+            TEST_INVITE_CODE,
+            TEST_INVITE_EXPIRATION,
+            &admin_jid,
+        );
+        (group_jid, spec)
+    }
+
+    /// `<iq type="result" from=...>` carrying `children` (empty means a bare
+    /// result: no content at all, not an empty child list).
+    fn result_iq(from: &str, children: Vec<Node>) -> Node {
+        let mut iq = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .attr("from", from);
+        if !children.is_empty() {
+            iq = iq.children(children);
+        }
+        iq.build()
+    }
+
+    fn bare_join_result() -> Node {
+        result_iq(TEST_GROUP_JID, Vec::new())
+    }
+
+    fn approval_child(jid: &str) -> Node {
+        NodeBuilder::new(JOIN_APPROVAL_CHILD)
+            .attr("jid", jid)
+            .build()
+    }
+
+    /// Locks the parser above to the generated join-shape constants: if the next
+    /// sync flips them, this fails and the parser owes a re-read.
+    #[test]
+    fn test_join_success_shapes_match_the_ir_lock() {
+        use crate::iq::join_shapes;
+        assert_eq!(
+            join_shapes::ACCEPT_GROUP_ADD_SUCCESS,
+            &[
+                (
+                    "AcceptGroupAddResponseGroupJoinRequestSuccess",
+                    &["membership_approval_request"][..]
+                ),
+                ("AcceptGroupAddResponseSuccess", &[][..]),
+            ]
+        );
+    }
+
+    /// A bare result joins with the request's group JID.
+    #[test]
+    fn test_accept_group_invite_v4_bare_result_joins() {
+        let (group_jid, spec) = v4_spec();
+        let iq = bare_join_result();
+        let result = spec.parse_response(&iq.as_node_ref()).unwrap();
+        assert_eq!(result, JoinGroupResult::Joined(group_jid));
+    }
+
+    /// Reject an unrecognized child.
+    #[test]
+    fn test_join_linked_group_unknown_child_is_rejected() {
+        let (_, spec) = linked_spec();
+        let iq = result_iq(
+            TEST_PARENT_JID,
+            vec![NodeBuilder::new("unexpected").build()],
+        );
+        assert!(spec.parse_response(&iq.as_node_ref()).is_err());
+    }
+
+    #[test]
+    fn test_join_linked_group_wrapper_with_sibling_is_not_enough() {
+        // The tolerance covers exactly the wrapper shape; an approval request
+        // beside it still reports pending, and any other sibling still fails.
+        let (subgroup, spec) = linked_spec();
+        let wrapper = NodeBuilder::new("linked_group")
+            .children([NodeBuilder::new(JOIN_GROUP_CHILD)
+                .attr("id", "120363000000000042")
+                .build()])
+            .build();
+        let approval = approval_child(TEST_GROUP_JID);
+        let iq = result_iq(TEST_PARENT_JID, vec![wrapper, approval]);
+        let result = spec.parse_response(&iq.as_node_ref()).unwrap();
+        assert_eq!(result, JoinGroupResult::PendingApproval(subgroup));
+
+        let (_, spec) = linked_spec();
+        let wrapper = NodeBuilder::new("linked_group")
+            .children([NodeBuilder::new(JOIN_GROUP_CHILD)
+                .attr("id", "120363000000000042")
+                .build()])
+            .build();
+        let iq = result_iq(
+            TEST_PARENT_JID,
+            vec![wrapper, NodeBuilder::new("unexpected").build()],
+        );
+        assert!(spec.parse_response(&iq.as_node_ref()).is_err());
+    }
+
+    /// Reject scalar response content.
+    #[test]
+    fn test_accept_group_invite_v4_scalar_content_is_rejected() {
+        let (_, spec) = v4_spec();
+        let iq = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .attr("from", TEST_GROUP_JID)
+            .apply_content(Some(NodeContent::String("unexpected payload".into())))
+            .build();
+        assert!(spec.parse_response(&iq.as_node_ref()).is_err());
+    }
+
+    #[test]
+    fn test_accept_group_invite_v4_group_child_still_joins() {
+        let (group_jid, spec) = v4_spec();
+        let group = NodeBuilder::new(JOIN_GROUP_CHILD)
+            .attr("jid", TEST_GROUP_JID)
+            .build();
+        let iq = result_iq(TEST_GROUP_JID, vec![group]);
+        let result = spec.parse_response(&iq.as_node_ref()).unwrap();
+        assert_eq!(result, JoinGroupResult::Joined(group_jid));
+    }
+
+    #[test]
+    fn test_accept_group_invite_v4_approval_child_stays_pending() {
+        let (group_jid, spec) = v4_spec();
+        let iq = result_iq(TEST_GROUP_JID, vec![approval_child(TEST_GROUP_JID)]);
+        let result = spec.parse_response(&iq.as_node_ref()).unwrap();
+        assert_eq!(result, JoinGroupResult::PendingApproval(group_jid));
+    }
+
+    fn linked_spec() -> (Jid, JoinLinkedGroupIq) {
+        let parent: Jid = TEST_PARENT_JID.parse().unwrap();
+        let subgroup: Jid = TEST_GROUP_JID.parse().unwrap();
+        let spec = JoinLinkedGroupIq::new(&parent, &subgroup);
+        (subgroup, spec)
+    }
+
+    /// Locks the linked-group join parser to its generated shapes: a bare
+    /// result and an approval-gated variant, like the V4 accept.
+    #[test]
+    fn test_join_linked_group_shapes_match_the_ir_lock() {
+        use crate::iq::join_shapes;
+        assert_eq!(
+            join_shapes::JOIN_LINKED_GROUP_SUCCESS,
+            &[
+                (
+                    "JoinLinkedGroupResponseGroupJoinRequestSuccess",
+                    &["membership_approval_request"][..]
+                ),
+                ("JoinLinkedGroupResponseSuccess", &[][..]),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_join_linked_group_bare_result_joins_subgroup() {
+        let (subgroup, spec) = linked_spec();
+        let iq = result_iq(TEST_PARENT_JID, Vec::new());
+        let result = spec.parse_response(&iq.as_node_ref()).unwrap();
+        assert_eq!(result, JoinGroupResult::Joined(subgroup));
+    }
+
+    #[test]
+    fn test_join_linked_group_approval_child_stays_pending() {
+        let (subgroup, spec) = linked_spec();
+        let iq = result_iq(TEST_PARENT_JID, vec![approval_child(TEST_GROUP_JID)]);
+        let result = spec.parse_response(&iq.as_node_ref()).unwrap();
+        assert_eq!(result, JoinGroupResult::PendingApproval(subgroup));
+    }
+
+    #[test]
+    fn test_join_linked_group_linked_group_wrapper_is_tolerated() {
+        // Compatibility allowance: a query-shaped answer joins its inner group.
+        let (_, spec) = linked_spec();
+        let group = NodeBuilder::new(JOIN_GROUP_CHILD)
+            .attr("id", "120363000000000042")
+            .build();
+        let linked = NodeBuilder::new("linked_group")
+            .attr("jid", TEST_GROUP_JID)
+            .children([group])
+            .build();
+        let iq = result_iq(TEST_PARENT_JID, vec![linked]);
+        let result = spec.parse_response(&iq.as_node_ref()).unwrap();
+        assert_eq!(
+            result,
+            JoinGroupResult::Joined(TEST_GROUP_JID.parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn test_get_group_profile_pictures_build_iq_server_routing() {
+        let group1: Jid = "120363000000000001@g.us".parse().unwrap();
+        let group2: Jid = "120363000000000002@g.us".parse().unwrap();
+
+        let iq = GetGroupProfilePicturesIq::with_type(&[
+            (group1.clone(), PictureType::Preview),
+            (group2.clone(), PictureType::Image),
+        ])
+        .build_iq();
+
+        assert_eq!(iq.namespace, GROUP_IQ_NAMESPACE);
+        assert_eq!(iq.to, Jid::new("", Server::Group));
+
+        let Some(NodeContent::Nodes(nodes)) = &iq.content else {
+            panic!("expected NodeContent::Nodes");
+        };
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].tag, "pictures");
+
+        let pics: Vec<_> = nodes[0].get_children_by_tag("picture").collect();
+        assert_eq!(pics.len(), 2);
+
+        assert_eq!(
+            pics[0]
+                .attrs
+                .get("sub_group_jid")
+                .map(|v| v.as_str())
+                .as_deref(),
+            Some("120363000000000001@g.us")
+        );
+        assert_eq!(
+            pics[0].attrs.get("type").map(|v| v.as_str()).as_deref(),
+            Some("preview")
+        );
+        assert_eq!(
+            pics[0].attrs.get("query").map(|v| v.as_str()).as_deref(),
+            Some("url")
+        );
+
+        assert_eq!(
+            pics[1]
+                .attrs
+                .get("sub_group_jid")
+                .map(|v| v.as_str())
+                .as_deref(),
+            Some("120363000000000002@g.us")
+        );
+        assert_eq!(
+            pics[1].attrs.get("type").map(|v| v.as_str()).as_deref(),
+            Some("image")
+        );
+        assert_eq!(
+            pics[1].attrs.get("query").map(|v| v.as_str()).as_deref(),
+            Some("url")
+        );
+    }
+
+    #[test]
+    fn test_get_group_profile_pictures_build_iq_community_routing() {
+        let community: Jid = "120363000000000099@g.us".parse().unwrap();
+        let entry = GroupPictureEntry::new(&community, PictureType::Image)
+            .with_existing_id("photo-42")
+            .as_parent_group(true);
+
+        let iq = GetGroupProfilePicturesIq::with_entries(vec![entry])
+            .with_to_jid(community.clone())
+            .build_iq();
+
+        assert_eq!(iq.namespace, GROUP_IQ_NAMESPACE);
+        assert_eq!(iq.to, community);
+
+        let Some(NodeContent::Nodes(nodes)) = &iq.content else {
+            panic!("expected NodeContent::Nodes");
+        };
+        assert_eq!(nodes[0].tag, "pictures");
+
+        let pics: Vec<_> = nodes[0].get_children_by_tag("picture").collect();
+        assert_eq!(pics.len(), 1);
+        assert_eq!(
+            pics[0]
+                .attrs
+                .get("parent_group_jid")
+                .map(|v| v.as_str())
+                .as_deref(),
+            Some("120363000000000099@g.us")
+        );
+        assert_eq!(
+            pics[0].attrs.get("id").map(|v| v.as_str()).as_deref(),
+            Some("photo-42")
+        );
+        assert_eq!(
+            pics[0].attrs.get("type").map(|v| v.as_str()).as_deref(),
+            Some("image")
+        );
+        assert_eq!(
+            pics[0].attrs.get("query").map(|v| v.as_str()).as_deref(),
+            Some("url")
+        );
+    }
+
+    #[test]
+    fn test_get_group_profile_pictures_parse_response_with_status_codes() {
+        let group1: Jid = "120363000000000001@g.us".parse().unwrap();
+        let group2: Jid = "120363000000000002@g.us".parse().unwrap();
+        let group3: Jid = "120363000000000003@g.us".parse().unwrap();
+        let group4: Jid = "120363000000000004@g.us".parse().unwrap();
+
+        let spec = GetGroupProfilePicturesIq::new(&[
+            group1.clone(),
+            group2.clone(),
+            group3.clone(),
+            group4.clone(),
+        ]);
+
+        let response = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .children([NodeBuilder::new("pictures")
+                .children([
+                    // 1. Success
+                    NodeBuilder::new("picture")
+                        .attr("sub_group_jid", "120363000000000001@g.us")
+                        .attr("id", "pic-1")
+                        .attr("url", "https://pps.whatsapp.net/pic1.jpg")
+                        .attr("direct_path", "/v/pic1.jpg")
+                        .build(),
+                    // 2. Unchanged (status 304)
+                    NodeBuilder::new("picture")
+                        .attr("sub_group_jid", "120363000000000002@g.us")
+                        .attr("status", "304")
+                        .build(),
+                    // 3. Not found (status 204)
+                    NodeBuilder::new("picture")
+                        .attr("sub_group_jid", "120363000000000003@g.us")
+                        .attr("status", "204")
+                        .build(),
+                    // 4. Server error (status 500)
+                    NodeBuilder::new("picture")
+                        .attr("parent_group_jid", "120363000000000004@g.us")
+                        .attr("status", "500")
+                        .build(),
+                ])
+                .build()])
+            .build();
+
+        let results = spec.parse_response(&response.as_node_ref()).unwrap();
+        assert_eq!(results.len(), 4);
+
+        // Group 1: Found
+        assert_eq!(results[0].group_jid, group1);
+        assert!(results[0].is_found());
+        assert!(!results[0].is_unchanged());
+        assert!(!results[0].is_not_found());
+        assert_eq!(
+            results[0].url.as_deref(),
+            Some("https://pps.whatsapp.net/pic1.jpg")
+        );
+        assert_eq!(results[0].photo_id.as_deref(), Some("pic-1"));
+        assert_eq!(
+            results[0].outcome(),
+            GroupProfilePictureOutcome::Found {
+                url: "https://pps.whatsapp.net/pic1.jpg".to_string(),
+                direct_path: Some("/v/pic1.jpg".to_string()),
+                photo_id: Some("pic-1".to_string()),
+            }
+        );
+
+        // Group 2: Unchanged (304)
+        assert_eq!(results[1].group_jid, group2);
+        assert!(results[1].is_unchanged());
+        assert_eq!(results[1].status, Some(304));
+        assert_eq!(results[1].outcome(), GroupProfilePictureOutcome::Unchanged);
+
+        // Group 3: NotFound (204)
+        assert_eq!(results[2].group_jid, group3);
+        assert!(results[2].is_not_found());
+        assert_eq!(results[2].status, Some(204));
+        assert_eq!(results[2].outcome(), GroupProfilePictureOutcome::NotFound);
+
+        // Group 4: Server Error (500)
+        assert_eq!(results[3].group_jid, group4);
+        assert_eq!(results[3].status, Some(500));
+        assert_eq!(
+            results[3].outcome(),
+            GroupProfilePictureOutcome::Error { code: 500 }
+        );
+    }
+
+    #[test]
+    fn test_get_group_profile_pictures_parse_malformed_jid_fails() {
+        let group: Jid = "120363000000000001@g.us".parse().unwrap();
+        let spec = GetGroupProfilePicturesIq::new(&[group]);
+
+        let response = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .children([NodeBuilder::new("pictures")
+                .children([NodeBuilder::new("picture")
+                    .attr("sub_group_jid", "invalid@@@")
+                    .attr("status", "200")
+                    .build()])
+                .build()])
+            .build();
+
+        assert!(spec.parse_response(&response.as_node_ref()).is_err());
     }
 }

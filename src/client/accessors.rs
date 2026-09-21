@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::client::interceptor::{InterceptorHandle, Registration, StanzaInterceptor};
+use crate::features::PresencePolicy;
 
 /// Identity for span/error tagging. Named fields, not a tuple — LID/PN transposition would
 /// otherwise be a silent, unchecked bug at call sites.
@@ -19,7 +20,7 @@ impl Client {
             Arc::new(
                 self.cache_config
                     .group_cache
-                    .build_typed_ttl(self.cache_config.cache_stores.group_cache.clone(), "group"),
+                    .build_typed_ttl(self.cache_config.group_cache_store.clone(), "group"),
             )
         })
     }
@@ -227,9 +228,36 @@ impl Client {
         self.skip_history_sync.store(enabled, Ordering::Relaxed);
     }
 
+    /// Whether the A/B props catalog is fetched on connect; see
+    /// [`ClientBuilder::with_ab_props_fetch`](crate::ClientBuilder::with_ab_props_fetch).
+    pub fn set_ab_props_fetch(&self, enabled: bool) {
+        self.ab_props_fetch.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn ab_props_fetch_enabled(&self) -> bool {
+        self.ab_props_fetch.load(Ordering::Relaxed)
+    }
+
     /// Returns `true` if history sync notifications are currently being skipped.
     pub fn skip_history_sync_enabled(&self) -> bool {
         self.skip_history_sync.load(Ordering::Relaxed)
+    }
+
+    /// Choose who announces the account's own `available` presence. Defaults
+    /// to [`PresencePolicy::Automatic`]. Applies from the next lifecycle
+    /// announcement on; changing it sends or retracts nothing by itself.
+    pub fn set_presence_policy(&self, policy: PresencePolicy) {
+        self.automatic_presence
+            .store(policy == PresencePolicy::Automatic, Ordering::Relaxed);
+    }
+
+    /// Returns the configured [`PresencePolicy`].
+    pub fn presence_policy(&self) -> PresencePolicy {
+        if self.automatic_presence.load(Ordering::Relaxed) {
+            PresencePolicy::Automatic
+        } else {
+            PresencePolicy::Manual
+        }
     }
 
     /// Set how many one-time pre-keys are generated per upload batch.
@@ -300,15 +328,16 @@ impl Client {
     /// byte figures.
     ///
     /// On-demand only: walks the in-process caches under their locks when
-    /// called, costs nothing otherwise. Counts are approximate (caches may
-    /// have pending evictions); call `run_pending_tasks()` on individual
-    /// caches first if you need exact counts.
+    /// called, costs nothing otherwise. Counts include entries that have
+    /// expired but not yet been swept; the sweep runs with the keepalive's
+    /// periodic maintenance ([`Self::run_cache_maintenance`]), so between
+    /// sweeps a count can exceed what a fresh lookup would find.
     pub async fn memory_report(&self) -> MemoryReport {
         use wacore::stats::{CollectionStats, HeapSize};
 
         let (signal_sessions, signal_identities, signal_sender_keys) =
             self.signal_cache.memory_stats().await;
-        let (lid_pn_lid_entries, lid_pn_pn_entries) = self.lid_pn_cache.memory_stats().await;
+        let lid_pn = self.lid_pn_cache.memory_stats().await;
         let pending_retries_count = self
             .pending_retries
             .lock()
@@ -323,7 +352,7 @@ impl Client {
         // `get()`, not `get_group_cache()`: a report must not be what builds the
         // cache, so an un-warmed client still reports zero entries.
         let group_cache = match self.group_cache.get() {
-            // Arc<T>'s HeapSize already includes size_of::<GroupInfo>().
+            // Arc<T>'s HeapSize already includes size_of::<GroupRoutingInfo>().
             Some(cache) => {
                 cache
                     .memory_stats(|k, v| k.heap_bytes() + v.heap_bytes())
@@ -346,6 +375,17 @@ impl Client {
             .memory_stats(|k, v| k.heap_bytes() + v.heap_bytes())
             .await;
         let group_distribution_locks = self.group_distribution_locks.capacity_stats().await;
+        // One awaited walk: a lane's queue length is a channel counter, so this
+        // reads each lane once and allocates nothing.
+        let (chat_lanes, chat_lane_backlog) = self
+            .chat_lanes
+            .fold_entries((0u64, 0u64), |(lanes, backlog), _, lane| {
+                (
+                    lanes + 1,
+                    backlog.saturating_add(u64::try_from(lane.queue_tx.len()).unwrap_or(u64::MAX)),
+                )
+            })
+            .await;
 
         // Each count read into a local so no two guards are ever held at once.
         let response_waiters = self.response_waiters_guard().len();
@@ -358,15 +398,37 @@ impl Client {
         let app_state_syncing = self.app_state_syncing.len();
         // `get()`, not the builder: a report must not be what constructs the
         // processor, so an un-synced client still reports zero.
-        let app_state_key_cache = match self.app_state_processor.get() {
-            Some(processor) => processor.cached_key_count().await,
-            None => 0,
+        let (app_state_key_cache, app_state_recovery_requests) =
+            match self.app_state_processor.get() {
+                Some(processor) => (
+                    processor.cached_key_count().await,
+                    processor.outstanding_recovery_requests().await,
+                ),
+                None => (0, 0),
+            };
+        let offline_receipt_buffer = {
+            let buffer = self
+                .offline_receipt_buffer
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            // The `Arc`s are the drain's only remaining hold on these
+            // `MessageInfo`s by the time they are buffered, so each is charged
+            // in full: its allocation, its struct, and what it points at.
+            let bytes = buffer.capacity() * size_of::<Arc<crate::types::message::MessageInfo>>()
+                + buffer
+                    .iter()
+                    .map(|info| size_of::<crate::types::message::MessageInfo>() + info.heap_bytes())
+                    .sum::<usize>();
+            CollectionStats::new(buffer.len() as u64, bytes as u64)
         };
         let (commit_batch_entries, commit_batch_bytes) = self.inbound_commit_batch.pending_stats();
         let inbound_commit_batch =
             CollectionStats::new(commit_batch_entries as u64, commit_batch_bytes as u64);
         let msg_secret_buffer = self.msg_secret_buffer.pending_len();
         let pending_device_sync = self.pending_device_sync.len();
+        let pending_group_device_resync = self.pending_group_device_resync.len();
+        let pending_group_message_repairs =
+            self.pending_group_device_resync.retained_message_count();
         let chatstate_handlers = self.chatstate_handler_count.load(Ordering::Acquire);
         let history_sync_activity = self.history_sync_activity.snapshot();
         let history_sync_tasks = CollectionStats::new(
@@ -419,33 +481,47 @@ impl Client {
         MemoryReport {
             group_cache,
             device_registry_cache: self.device_registry_cache.memory_stats().await,
-            lid_pn_lid_entries,
-            lid_pn_pn_entries,
+            lid_pn_lid_entries: lid_pn.lid,
+            lid_pn_pn_entries: lid_pn.pn,
+            lid_pn_contact_hash_entries: lid_pn.contact_hash,
+            lid_pn_persisted_entries: lid_pn.persisted,
             recent_messages,
             sender_key_device_cache: self.sender_key_device_cache.memory_stats().await,
             group_devices_memo,
             dm_devices_memo,
-            message_retry_counts: self.message_retry_counts.entry_count(),
-            undecryptable_dispatched: self.undecryptable_dispatched.entry_count(),
+            message_retry_counts: self.message_retry_counts.entry_count_async().await,
+            undecryptable_dispatched: self.undecryptable_dispatched.entry_count_async().await,
             dispatched_messages: self.dispatched_messages.entry_count(),
-            pdo_pending_requests: self.pdo_pending_requests.entry_count(),
-            pdo_requested: self.pdo_requested.entry_count(),
+            dispatched_message_contents: self.dispatched_messages.memory_stats(
+                // The identity is a 64-bit digest stored in the slot itself,
+                // so only the claim's payloads retain anything beside it.
+                |_key: &crate::message::DispatchKey, claim: &crate::message::DispatchClaim| {
+                    use wacore::stats::HeapSize;
+                    claim.heap_bytes()
+                },
+            ),
+            pdo_pending_requests: self.pdo_pending_requests.entry_count_async().await,
+            pdo_requested: self.pdo_requested.entry_count_async().await,
             history_sync_tasks,
             history_sync_tasks_peak: history_sync_activity.tasks_peak as u64,
             history_sync_payload_bytes_peak: history_sync_activity.payload_bytes_peak as u64,
             inbound_commit_batch,
+            offline_receipt_buffer,
             msg_secret_buffer,
             pending_device_sync,
-            session_locks: self.session_locks.entry_count(),
+            pending_group_device_resync,
+            pending_group_message_repairs,
+            session_locks: self.session_locks.entry_count_async().await,
             ensure_inflight: self.ensure_inflight.len() as u64,
             group_metadata_inflight: self.group_metadata_inflight.len() as u64,
-            chat_lanes: self.chat_lanes.entry_count(),
+            chat_lanes,
+            chat_lane_backlog,
             group_distribution_locks: group_distribution_locks.entries,
             group_distribution_lock_evictions: group_distribution_locks.evictions,
             group_distribution_lock_eviction_blocks: group_distribution_locks.eviction_blocks,
-            resend_rate_limiter_chats: self.resend_rate_limiter.entry_count(),
-            session_recreate_history: self.session_recreate_history.entry_count(),
-            skdm_warm_memo: self.skdm_warm_memo.entry_count(),
+            resend_rate_limiter_chats: self.resend_rate_limiter.entry_count_async().await,
+            session_recreate_history: self.session_recreate_history.entry_count_async().await,
+            skdm_warm_memo: self.skdm_warm_memo.entry_count_async().await,
             transport_ack_queue: self.transport_ack_queue.get().map_or(0, |tx| tx.len()),
             delivery_receipt_queue: self.delivery_receipt_queue.get().map_or(0, |tx| tx.len()),
             response_waiters,
@@ -456,6 +532,7 @@ impl Client {
             presence_subscriptions,
             app_state_key_requests,
             app_state_key_cache,
+            app_state_recovery_requests,
             app_state_syncing,
             signal_sessions,
             signal_identities,
@@ -485,6 +562,7 @@ impl Client {
             chatstate_handlers,
             custom_enc_handlers: self.custom_enc_handlers.get().map_or(0, |m| m.len()),
             stanza_interceptors: self.stanza_interceptors().len(),
+            core_event_handlers: self.core.event_bus.memory_stats(),
         }
     }
 
@@ -599,7 +677,7 @@ impl Client {
 
         let addressing_mode = self
             .groups()
-            .query_info(group_jid)
+            .routing_info(group_jid)
             .await
             .map(|info| info.addressing_mode)
             .unwrap_or(crate::types::message::AddressingMode::Pn);
@@ -636,10 +714,12 @@ impl Client {
         let client_clone = self.clone();
         self.runtime
             .spawn(Box::pin(async move {
-                if let Err(e) = client_clone.presence().set_available().await {
-                    log::warn!("Failed to send presence after push name update: {:?}", e);
-                } else {
-                    log::debug!("Sent presence after push name update.");
+                match client_clone.send_automatic_available().await {
+                    Ok(true) => log::debug!("Sent presence after push name update."),
+                    Ok(false) => {}
+                    Err(e) => {
+                        log::warn!("Failed to send presence after push name update: {:?}", e);
+                    }
                 }
             }))
             .detach();

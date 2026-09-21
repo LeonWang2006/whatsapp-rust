@@ -24,7 +24,7 @@ use super::smpl_lsf_quant::{lsf_quant, lsf_quant_cond};
 use super::smpl_mem::{SmplMem, load_smpl_mem};
 use super::smpl_perc::{
     BitrateController, BitrateControllerInputs, PercModelState, SMPL_PERC_EMPH_UV,
-    SMPL_PERC_EMPH_V, SMPL_PERC_REG, smpl_perc_ac2a, smpl_perc_model,
+    SMPL_PERC_EMPH_V, SMPL_PERC_REG, smpl_perc_ac2a_into, smpl_perc_model,
 };
 use super::smpl_signal_mode::{VuvMode, smpl_get_signal_mode};
 use super::smpl_synth::{
@@ -50,7 +50,7 @@ const SMPL_LSF_RDW_ADJ: f32 = 1.1952286;
 #[derive(Default)]
 pub(crate) struct SmplEncoderState {
     hist: Vec<f64>,
-    /// Reused because VAD runs for every packet on the realtime encode path.
+    /// Reused for f32 input conversion. The i16 path lends its original PCM to VAD.
     vad_pcm: Vec<i16>,
     /// Reused to avoid four packet-sized allocations on the realtime encode path.
     hp: Vec<f32>,
@@ -104,7 +104,7 @@ const SMPL_CELP_FCB_SUBFRLEN: usize = 80;
 /// 12 subframes per 60 ms packet (4 subframes/internal frame x 3 internal frames).
 const SMPL_CELP_SUBFR_PER_PACKET: usize = 12;
 /// `perc_resp_len + SMPL_PERC_EMPH_V_LEN - 1` (= 33 = SMPL_MAX_L_RESP): the perceptual autocorrelation
-/// length the perc model returns and `smpl_perc_ac2a` consumes.
+/// length the perc model returns and `smpl_perc_ac2a_into` consumes.
 const SMPL_PERC_R_LEN: usize = SMPL_CELP_PERC_RESP_LEN + 1;
 /// `smpl_fcb_tot_surv_20ms_max` for complexity 5-8 (the perc_resp_len=32 path). Drives `tot_surv`.
 const SMPL_FCB_TOT_SURV_20MS_MAX: i32 = 100;
@@ -125,7 +125,7 @@ struct Candidate {
     stage1: i32,
     grid: i32,
     qsym: [i32; 16],
-    pulse_vec: Vec<i32>,
+    pulse_vec: [i32; SMPL_INTF_LEN],
     /// Per-subframe excitation gainQ used by the synthesis (rate-control gain for unvoiced, 0 for
     /// voiced). Must match what `commit_candidate` feeds the shadow synth (warm history).
     gain_q: [i32; 4],
@@ -170,9 +170,12 @@ struct CelpFrameCtx<'a> {
 }
 
 /// Turn one 60 ms PCM frame (960 f32 @16 kHz, ~[-1,1]) into params, advancing `es`.
+/// If supplied, `original_pcm` must contain the 960 i16 samples whose normalization produced `pcm`.
+/// VAD borrows them directly; the f32 path instead reuses its conversion buffer.
 pub(crate) fn smpl_analyze_frame_st(
     es: &mut SmplEncoderState,
     pcm: &[f32],
+    original_pcm: Option<&[i16]>,
 ) -> super::params::SmplFrameParams {
     let need = SMPL_INTF_LEN * 3;
     let mut owned;
@@ -187,16 +190,30 @@ pub(crate) fn smpl_analyze_frame_st(
 
     // SILK VAD on the int16 input PCM (runs on the raw API samples, before the encoder HP). Produces
     // the per-internal-frame speech-activity probability + the packet coded_as_active_voice.
-    es.vad_pcm.clear();
-    es.vad_pcm.extend(
-        pcm[..need]
-            .iter()
-            .map(|&s| (s * 32768.0).round().clamp(-32768.0, 32767.0) as i16),
-    );
+    let vad_pcm = if let Some(original) = original_pcm {
+        debug_assert_eq!(original.len(), need);
+        debug_assert!(
+            original
+                .iter()
+                .zip(&pcm[..need])
+                .all(|(&raw, &normalized)| {
+                    (raw as f32 / 32768.0).to_bits() == normalized.to_bits()
+                })
+        );
+        original
+    } else {
+        es.vad_pcm.clear();
+        es.vad_pcm.extend(
+            pcm[..need]
+                .iter()
+                .map(|&s| (s * 32768.0).round().clamp(-32768.0, 32767.0) as i16),
+        );
+        &es.vad_pcm
+    };
     let vad = es
         .vad
         .get_or_insert_with(super::smpl_vad::SmplVadState::new)
-        .process_packet(&es.vad_pcm, SMPL_INTF_LEN);
+        .process_packet(vad_pcm, SMPL_INTF_LEN);
     let sp_act_prob = vad.vad_results;
     let coded_as_active_voice = vad.coded_as_active_voice;
 
@@ -462,7 +479,7 @@ fn commit_candidate(
             &cand.ip.lsf.stage2,
             prev_nlsf,
         );
-        let pulse_vec = vec![0i32; SMPL_INTF_LEN];
+        let pulse_vec = [0i32; SMPL_INTF_LEN];
         synth_internal_frame(
             synth_t,
             st,
@@ -550,12 +567,12 @@ fn smpl_unvoiced_candidate(
 
     // Map CELP pulses -> per-position pulse train; collect the per-subframe FCB gain index (= the
     // wire `nrg_res` symbol, which the decoder reads back as `fcbg_idx`).
-    let mut pulse_vec = vec![0i32; SMPL_INTF_LEN];
+    let mut pulse_vec = [0i32; SMPL_INTF_LEN];
     let mut fcbg_idx = [0i32; 4];
     const MAIN: usize = 1;
     for sf in 0..SMPL_SUBFR_COUNT {
         let out = &celp_out[sf];
-        for &v in &out.pulses[MAIN] {
+        for &v in &out.pulses[MAIN][..out.n_pulses[MAIN].max(0) as usize] {
             // Same unpacking as the C: sign = 1 + 2*(v>>15); pos = v*sign - 1; pPulses[pos] += sign.
             let sign = 1 + 2 * ((v as i32) >> 15);
             let pos = (v as i32 * sign) - 1;
@@ -744,21 +761,30 @@ fn compute_perc_corrs(cs: &mut CelpFrameCtx) -> [Vec<f32>; SMPL_SUBFR_COUNT] {
     corrs
 }
 
-/// Derive the per-subframe `perc_wght_resp` (length perc_resp_len) from precomputed `perc_corrs` for
-/// the given emphasis (`smpl_perc_ac2a`, voiced vs unvoiced). Pure (no state).
-fn perc_corrs_to_wght(corrs: &[Vec<f32>], emph: [f32; 2], resp_len: usize) -> Vec<Vec<f32>> {
-    corrs
-        .iter()
-        .map(|c| {
-            smpl_perc_ac2a(
-                c,
-                SMPL_PERC_R_LEN,
-                emph[if SMPL_CELP_LOW_RATE { 1 } else { 0 }],
-                resp_len,
-                SMPL_PERC_REG,
-            )
-        })
-        .collect()
+/// Derive one weighting response per subframe from precomputed perceptual correlations.
+/// Only the first `resp_len` coefficients are active; the rest of each row remain zero.
+/// The fixed matrix avoids allocating a response vector for each subframe.
+///
+/// Panics if `corrs` does not contain `SMPL_SUBFR_COUNT` rows or if `resp_len`
+/// exceeds `SMPL_CELP_PERC_RESP_LEN`.
+fn perc_corrs_to_wght(
+    corrs: &[Vec<f32>],
+    emph: [f32; 2],
+    resp_len: usize,
+) -> [[f32; SMPL_CELP_PERC_RESP_LEN]; SMPL_SUBFR_COUNT] {
+    assert_eq!(corrs.len(), SMPL_SUBFR_COUNT);
+    std::array::from_fn(|sf| {
+        let mut response = [0.0; SMPL_CELP_PERC_RESP_LEN];
+        smpl_perc_ac2a_into(
+            &corrs[sf],
+            SMPL_PERC_R_LEN,
+            emph[if SMPL_CELP_LOW_RATE { 1 } else { 0 }],
+            resp_len,
+            SMPL_PERC_REG,
+            &mut response[..resp_len],
+        );
+        response
+    })
 }
 
 /// The per-subframe residual + interpolated predcoef for `lsf_interpol_idx` 0, and the alternative
@@ -838,7 +864,7 @@ fn smpl_silent_internal(synth_t: &SmplSynthTables) -> Candidate {
         stage1: 0,
         grid: 0,
         qsym: sym,
-        pulse_vec: vec![0i32; SMPL_INTF_LEN],
+        pulse_vec: [0i32; SMPL_INTF_LEN],
         gain_q: [0; 4],
         pitch: unvoiced_pitch(),
         silent: true,
@@ -1233,12 +1259,12 @@ fn smpl_voiced_candidate(
 
     // Unpack the MAIN-rate pulses into a per-position train; collect acb/fcb indices per subframe.
     const MAIN: usize = 1;
-    let mut pulse_vec = vec![0i32; SMPL_INTF_LEN];
+    let mut pulse_vec = [0i32; SMPL_INTF_LEN];
     let mut acbg = [0i32; 4];
     let mut fcbg = [0i32; 4];
     for sf in 0..SMPL_SUBFR_COUNT {
         let out = &celp_out[sf];
-        for &v in &out.pulses[MAIN] {
+        for &v in &out.pulses[MAIN][..out.n_pulses[MAIN].max(0) as usize] {
             let sign = 1 + 2 * ((v as i32) >> 15);
             let pos = (v as i32 * sign) - 1;
             if (0..SMPL_SUBFR_LEN as i32).contains(&pos) {
@@ -1430,7 +1456,7 @@ pub mod stage_bench {
         pub fn new() -> Self {
             let mut es = SmplEncoderState::default();
             for k in 0..WARMUP_FRAMES {
-                let _ = smpl_analyze_frame_st(&mut es, &tone(k * SMPL_INTF_LEN * 3));
+                let _ = smpl_analyze_frame_st(&mut es, &tone(k * SMPL_INTF_LEN * 3), None);
             }
             let pcm: Vec<Vec<f32>> = (0..STREAM)
                 .map(|k| tone((WARMUP_FRAMES + k) * SMPL_INTF_LEN * 3))
@@ -1440,7 +1466,7 @@ pub mod stage_bench {
             // the state `es` is left in.
             let fps: Vec<_> = pcm
                 .iter()
-                .map(|f| smpl_analyze_frame_st(&mut es, f))
+                .map(|f| smpl_analyze_frame_st(&mut es, f, None))
                 .collect();
 
             let hp = es.hp.clone();
@@ -1763,7 +1789,7 @@ pub mod stage_bench {
         pub fn analyze_frame(&mut self) -> u8 {
             let frame = &self.pcm[self.pcm_at % self.pcm.len()];
             self.pcm_at += 1;
-            let fp = smpl_analyze_frame_st(&mut self.es, frame);
+            let fp = smpl_analyze_frame_st(&mut self.es, frame, None);
             fp.toc
         }
 

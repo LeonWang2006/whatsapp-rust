@@ -2,15 +2,16 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use wacore_binary::Jid;
 
-#[cfg(feature = "voip")]
+#[cfg(feature = "voip-control")]
 use super::group_call::GroupCallDevice;
 use super::group_call::{GroupCallEncRekey, GroupCallUpdate, ScreenShare, WaitingRoom};
 
 /// The encrypted callKey + parsed relay carried by an `<offer>`, captured so the media facade can
 /// decrypt the callKey and connect the relay without re-walking the raw stanza. Binary/media-only,
 /// so it is kept off the `serde` shape (downstream JS consumers see only the signaling fields).
-/// Behind the `voip` feature: it carries the parsed `RelayData`, which lives in `crate::voip`.
-#[cfg(feature = "voip")]
+/// Behind the `voip-control` feature: it carries the parsed `RelayData`, which now lives in the
+/// neutral contract (`crate::voip_control::relay_parse`), so a control-only build can carry it.
+#[cfg(feature = "voip-control")]
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct MediaOffer {
@@ -19,7 +20,7 @@ pub struct MediaOffer {
     /// per `<destination><to jid>`, and [`enc_for`](Self::enc_for) selects the one for this device.
     pub encs: Vec<OfferRecipientEnc>,
     /// The parsed `<relay>` block (endpoints + crypto material), when the offer carried one.
-    pub relay: Option<crate::voip::relay_parse::RelayData>,
+    pub relay: Option<crate::voip_control::relay_parse::RelayData>,
     /// Rollout metadata echoed by official callees in the video accept.
     pub peer_abtest_bucket: Option<String>,
     pub peer_abtest_bucket_id_list: Option<String>,
@@ -29,7 +30,7 @@ pub struct MediaOffer {
     pub peer_device: Option<GroupCallDevice>,
 }
 
-#[cfg(feature = "voip")]
+#[cfg(feature = "voip-control")]
 impl MediaOffer {
     /// The callKey `<enc>` to decrypt for our own device: the entry whose `<to jid>` equals
     /// `own_jid`, else the single unaddressed entry (a bare `<enc>` child targeting us directly).
@@ -49,7 +50,7 @@ impl MediaOffer {
 
 /// One per-recipient `<enc>` from an `<offer>`: the Signal ciphertext plus the `<to jid>` it was
 /// addressed to (`None` for a bare `<enc>` child on a single-device offer).
-#[cfg(feature = "voip")]
+#[cfg(feature = "voip-control")]
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct OfferRecipientEnc {
@@ -59,7 +60,7 @@ pub struct OfferRecipientEnc {
 
 /// The `<enc>` child of an `<offer>` addressed to this device: the Signal ciphertext of the
 /// callKey message plus the wire `type`/`v` needed to decrypt and unpad it.
-#[cfg(feature = "voip")]
+#[cfg(feature = "voip-control")]
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct OfferEnc {
@@ -180,8 +181,9 @@ pub enum CallAction {
         call_id: String,
         call_creator: Jid,
         /// Why the device rejected. `busy` means THAT DEVICE cannot take the call (already in one,
-        /// or a companion that does not do voice) - it is not the callee declining, and the peer's
-        /// other devices keep ringing. Absent means an explicit decline by the user.
+        /// or a companion that does not do voice); `enc` means THAT DEVICE could not decrypt the
+        /// offer. Neither is the callee declining, and the peer's other devices keep ringing.
+        /// Absent means an explicit decline by the user.
         reason: Option<String>,
     },
     #[wire = "terminate"]
@@ -314,6 +316,24 @@ pub struct IncomingCall {
     pub timestamp: DateTime<Utc>,
     pub offline: bool,
     pub action: CallAction,
+    /// The rotation the sending device announced on this stanza's `<video>`
+    /// child, in `0..=3`. Only an `<offer>` and an `<accept>` carry one; `None`
+    /// everywhere else, and for a stanza whose value was out of range.
+    ///
+    /// A video-from-start peer announces its camera rotation exactly once, in
+    /// that stanza, and sends no `<video>` of its own until the camera actually
+    /// turns -- so dropping this leaves every frame of a call from a sideways
+    /// camera stamped upright.
+    ///
+    /// On the payload rather than inside [`CallAction::Offer`] / [`Accept`]:
+    /// those variants are plain struct variants, so a new field there breaks
+    /// every consumer that destructures them without a `..` rest. This struct is
+    /// `#[non_exhaustive]` with a `bon` builder, which is exactly the shape the
+    /// `Event` stability policy reserves for a payload that has to grow.
+    ///
+    /// [`Accept`]: CallAction::Accept
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_orientation: Option<u8>,
     /// Group snapshot embedded in an initial offer or active-call invitation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<Box<GroupCallUpdate>>,
@@ -334,7 +354,7 @@ pub struct IncomingCall {
     /// half `agent_docs/subsystem_boundary.md` test 4 is about. Unconditional is not the
     /// alternative -- the type carries a parsed `RelayData`, so making it always present would
     /// link the relay parser into every build.
-    #[cfg(feature = "voip")]
+    #[cfg(feature = "voip-control")]
     #[serde(skip)]
     #[builder(skip)]
     pub(crate) media: Option<Box<MediaOffer>>,
@@ -440,16 +460,34 @@ impl IncomingCall {
     /// Attach the media material the parser captured from an `<offer>`. Not
     /// `pub`: the parser below is the only caller, unlike the sibling setters
     /// this crate exposes for `whatsapp-rust` to call.
-    #[cfg(feature = "voip")]
+    #[cfg(feature = "voip-control")]
     pub(crate) fn with_media(mut self, media: Option<Box<MediaOffer>>) -> Self {
         self.media = media;
         self
     }
 
     /// The offer's media material, when this is an `<offer>` that carried an `<enc>` for us.
-    #[cfg(feature = "voip")]
+    #[cfg(feature = "voip-control")]
     pub fn media(&self) -> Option<&MediaOffer> {
         self.media.as_deref()
+    }
+
+    /// Attach an `<offer>` media block carrying just the offerer's device capability.
+    ///
+    /// The media block is parser output, not something a consumer composes, so it is
+    /// `#[non_exhaustive]` and its field is `pub(crate)`. A dependent crate's tests still need a
+    /// call that carries a capability, and [`Self::new_for_test`] alone cannot build one.
+    #[cfg(feature = "voip-control")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_peer_device_for_test(self, peer_device: Option<GroupCallDevice>) -> Self {
+        self.with_media(Some(Box::new(MediaOffer {
+            encs: Vec::new(),
+            relay: None,
+            peer_abtest_bucket: None,
+            peer_abtest_bucket_id_list: None,
+            peer_device,
+        })))
     }
 
     /// Minimal constructor for in-tree tests in dependent crates; `#[non_exhaustive]` blocks the

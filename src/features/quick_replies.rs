@@ -12,28 +12,30 @@
 
 use crate::appstate_sync::Mutation;
 use crate::client::Client;
+use crate::client::{AppStateDispatchOutcome, fingerprint_id};
 use crate::features::chat_actions::AppStateError;
 use log::debug;
 use wacore::appstate::schemas;
 use wacore::types::events::{Event, QuickReplyUpdate};
 use waproto::whatsapp as wa;
 
-/// Dispatch inbound quick-reply mutations synced from a linked device.
-/// Returns `true` if handled, `false` if the mutation is not a quick reply.
-pub(crate) fn dispatch_quick_reply_mutation(
+/// Dispatch inbound quick-reply mutations synced from a linked device,
+/// returning the [`crate::client::AppStateDispatchOutcome`] for the semantic
+/// per-mutation log line.
+pub(crate) fn dispatch_quick_reply_mutation_outcome(
     event_bus: &wacore::types::events::CoreEventBus,
-    m: &Mutation,
-    full_sync: bool,
-) -> bool {
+    m: &mut Mutation,
+    event_full_sync: bool,
+) -> AppStateDispatchOutcome {
     if m.operation != wa::syncd_mutation::SyncdOperation::Set
         || m.index.first().map(String::as_str) != Some(schemas::QUICK_REPLY.name)
     {
-        return false;
+        return AppStateDispatchOutcome::Unclaimed;
     }
 
     let Some(id) = m.index.get(1).cloned() else {
         log::warn!("Skipping quick_reply mutation: missing id in index");
-        return true;
+        return AppStateDispatchOutcome::Skipped("missing-id");
     };
 
     let ts = m
@@ -43,24 +45,25 @@ pub(crate) fn dispatch_quick_reply_mutation(
         .unwrap_or(0);
     let time = wacore::time::from_millis_or_now(ts);
 
-    if let Some(val) = &m.action_value
-        && let Some(act) = val.quick_reply_action.as_option()
+    if let Some(val) = &mut m.action_value
+        && let Some(act) = val.quick_reply_action.take()
     {
         event_bus.dispatch(Event::QuickReplyUpdate(
             QuickReplyUpdate::builder()
                 .id(id)
                 .timestamp(time)
-                .action(Box::new(act.clone()))
-                .from_full_sync(full_sync)
+                .action(Box::new(act))
+                .from_full_sync(event_full_sync)
                 .build(),
         ));
+        AppStateDispatchOutcome::Event("QuickReplyUpdate")
     } else {
         // Claimed but undeliverable. WA Web counts the same shape as a
-        // malformed action value and logs it; without this the mutation would
-        // vanish with no signal at all. The id is opaque, not user content.
-        log::warn!("Skipping quick_reply mutation {id}: missing quickReplyAction value");
+        // malformed action value; the central `report` warns once with the
+        // command and the outcome, so nothing is logged here. The id is
+        // opaque, not user content.
+        AppStateDispatchOutcome::Malformed("QuickReplyUpdate")
     }
-    true
 }
 
 /// Access via `client.quick_replies()`.
@@ -113,8 +116,8 @@ impl<'a> QuickReplies<'a> {
                 "quick reply count cannot be negative".into(),
             ));
         }
-        // Don't log the shortcut or message (user content); the id is enough to trace.
-        debug!("Setting quick reply {id} (count={count})");
+        // Don't log the shortcut or message (user content); the fingerprinted id is enough to trace.
+        debug!("Setting quick reply {} (count={count})", fingerprint_id(id));
         // `associatedLabelIds` is left empty on purpose, not by omission: both of
         // WA Web's builders hardcode `associatedLabelIds: []`, and its receiving
         // side never reads the field. A repeated field left at its default
@@ -142,7 +145,7 @@ impl<'a> QuickReplies<'a> {
                 "quick reply id cannot be empty".into(),
             ));
         }
-        debug!("Deleting quick reply {id}");
+        debug!("Deleting quick reply {}", fingerprint_id(id));
         let value = quick_reply_value(wa::sync_action_value::QuickReplyAction {
             shortcut: Some(String::new()),
             message: Some(String::new()),
@@ -193,13 +196,13 @@ mod tests {
         }
     }
 
-    fn run(m: &Mutation) -> (bool, Vec<Arc<Event>>) {
+    fn run(m: &Mutation) -> (AppStateDispatchOutcome, Vec<Arc<Event>>) {
         let bus = CoreEventBus::new();
         let rec = Arc::new(Recorder::default());
         bus.subscribe_handler(rec.clone()).detach();
-        let handled = dispatch_quick_reply_mutation(&bus, m, false);
+        let outcome = dispatch_quick_reply_mutation_outcome(&bus, &mut m.clone(), false);
         let events = rec.events.lock().unwrap().clone();
-        (handled, events)
+        (outcome, events)
     }
 
     #[test]
@@ -329,8 +332,8 @@ mod tests {
         )
         .await;
 
-        let (handled, events) = run(&mutation);
-        assert!(handled);
+        let (outcome, events) = run(&mutation);
+        assert!(outcome != AppStateDispatchOutcome::Unclaimed);
         assert_eq!(events.len(), 1);
         match &*events[0] {
             Event::QuickReplyUpdate(u) => {
@@ -354,8 +357,8 @@ mod tests {
                 ..Default::default()
             })),
         };
-        let (handled, events) = run(&m);
-        assert!(handled);
+        let (outcome, events) = run(&m);
+        assert!(outcome != AppStateDispatchOutcome::Unclaimed);
         assert_eq!(events.len(), 1);
         match &*events[0] {
             Event::QuickReplyUpdate(u) => {
@@ -377,8 +380,8 @@ mod tests {
                 ..Default::default()
             })),
         };
-        let (handled, events) = run(&m);
-        assert!(handled);
+        let (outcome, events) = run(&m);
+        assert!(outcome != AppStateDispatchOutcome::Unclaimed);
         match &*events[0] {
             Event::QuickReplyUpdate(u) => assert_eq!(u.action.deleted, Some(true)),
             other => panic!("expected QuickReplyUpdate, got {other:?}"),
@@ -392,8 +395,8 @@ mod tests {
             operation: wa::syncd_mutation::SyncdOperation::Set,
             action_value: Some(wa::SyncActionValue::default()),
         };
-        let (handled, events) = run(&m);
-        assert!(handled);
+        let (outcome, events) = run(&m);
+        assert!(outcome != AppStateDispatchOutcome::Unclaimed);
         assert!(events.is_empty());
     }
 
@@ -409,8 +412,8 @@ mod tests {
                 operation: wa::syncd_mutation::SyncdOperation::Set,
                 action_value,
             };
-            let (handled, events) = run(&m);
-            assert!(handled);
+            let (outcome, events) = run(&m);
+            assert!(outcome != AppStateDispatchOutcome::Unclaimed);
             assert!(events.is_empty());
         }
     }
@@ -422,8 +425,8 @@ mod tests {
             operation: wa::syncd_mutation::SyncdOperation::Set,
             action_value: Some(wa::SyncActionValue::default()),
         };
-        let (handled, events) = run(&m);
-        assert!(!handled);
+        let (outcome, events) = run(&m);
+        assert_eq!(outcome, AppStateDispatchOutcome::Unclaimed);
         assert!(events.is_empty());
     }
 

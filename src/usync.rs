@@ -13,16 +13,40 @@ use wacore_binary::Jid;
 /// turns one send into an unbounded request loop.
 const DEVICE_REFRESH_MAX_ATTEMPTS: usize = 3;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeviceListApplyMode {
+    CachePreferred,
+    StrictRefresh,
+    GroupRefresh,
+}
+
+impl From<crate::cache::Freshness> for DeviceListApplyMode {
+    fn from(freshness: crate::cache::Freshness) -> Self {
+        match freshness {
+            crate::cache::Freshness::CachePreferred => Self::CachePreferred,
+            crate::cache::Freshness::Refresh => Self::StrictRefresh,
+        }
+    }
+}
+
 #[inline]
-fn device_response_contains_user(response: &DeviceListResponse, user: &str) -> bool {
-    response
-        .device_lists
-        .iter()
-        .any(|device_list| device_list.user.user == user)
-        || response
-            .lid_mappings
+/// Every user a device-list response speaks for, in both namespaces, as the
+/// member set a topology change is checked against.
+fn device_response_users(
+    response: &DeviceListResponse,
+) -> crate::client::member_index::MemberIndex {
+    crate::client::member_index::MemberIndex::from_users(
+        response
+            .device_lists
             .iter()
-            .any(|mapping| mapping.phone_number == user || mapping.lid == user)
+            .map(|device_list| device_list.user.user.as_str())
+            .chain(
+                response
+                    .lid_mappings
+                    .iter()
+                    .flat_map(|mapping| [mapping.phone_number.as_str(), mapping.lid.as_str()]),
+            ),
+    )
 }
 
 pub use wacore::iq::usync::{
@@ -59,35 +83,17 @@ impl Client {
         &self,
         jids: Vec<Jid>,
     ) -> Result<Vec<Jid>, anyhow::Error> {
-        let input_len = jids.len();
-        let mut jids_to_fetch: Vec<Jid> = Vec::with_capacity(input_len);
-        let mut all_devices = Vec::with_capacity(input_len * 2);
-
-        // Resolve the LOCAL registry scan concurrently (the network usync below is
-        // already one batched IQ) — a cold-cache large group would otherwise
-        // serialize 256+ per-user cache/DB reads. Order is irrelevant (phash sorts,
-        // encrypt fan-out is order-agnostic). A None result means an empty/corrupt
-        // record, which falls through to the network below (WA Web always keeps
-        // device 0). The stream owns each JID and is drained incrementally, so
-        // no second result Vec is materialized.
-        use futures::StreamExt;
-        // Bounded fan-out over the independent per-user registry reads.
-        const DEVICE_LIST_RESOLVE_CONCURRENCY: usize = 16;
-        let mut resolved = futures::stream::iter(jids.into_iter().map(Jid::into_non_ad))
-            .map(|jid| async move {
-                let devices = self.get_devices_from_registry(&jid).await;
-                (jid, devices)
-            })
-            .buffer_unordered(DEVICE_LIST_RESOLVE_CONCURRENCY);
-
-        while let Some((jid, devices)) = resolved.next().await {
-            match devices {
-                Some(devices) => all_devices.extend(devices),
-                None => {
-                    jids_to_fetch.push(jid);
-                }
-            }
-        }
+        // One batched registry pass: the cache answers per user, and every
+        // user it cannot answer goes to the backend in ONE read. The
+        // previous per-user fan-out (16 concurrent `get_devices`) bought
+        // nothing, because the backend read is on the single write permit
+        // and the permit re-serialized them. Order is irrelevant (phash
+        // sorts, encrypt fan-out is order-agnostic). An unresolved user is
+        // one with no usable record anywhere (WA Web always keeps device 0,
+        // so an empty record counts as none) and falls through to the
+        // network below.
+        let jids: Vec<Jid> = jids.into_iter().map(Jid::into_non_ad).collect();
+        let (mut all_devices, mut jids_to_fetch) = self.get_devices_from_registry_batch(jids).await;
 
         if !jids_to_fetch.is_empty() {
             wacore::types::jid::sort_dedup_by_user(&mut jids_to_fetch);
@@ -112,6 +118,66 @@ impl Client {
         wacore::types::jid::sort_dedup_by_user(&mut jids);
         self.fetch_user_devices_with_freshness(jids, crate::cache::Freshness::Refresh)
             .await
+    }
+
+    /// Publish successful group sync results, then read the complete local fanout.
+    /// An omitted or invalid user keeps its previous registry record.
+    pub(crate) async fn refresh_group_user_devices(
+        &self,
+        mut jids: Vec<Jid>,
+    ) -> Result<Vec<Jid>, anyhow::Error> {
+        for jid in &mut jids {
+            jid.agent = 0;
+            jid.device = 0;
+        }
+        wacore::types::jid::sort_dedup_by_user(&mut jids);
+        if jids.is_empty() {
+            return Ok(Vec::new());
+        }
+        for _ in 0..DEVICE_REFRESH_MAX_ATTEMPTS {
+            let generation = self.device_topology.current();
+            let response = self
+                .execute(DeviceListSpec::new(
+                    jids.clone(),
+                    self.generate_request_id(),
+                ))
+                .await?;
+            if let Some(devices) = self
+                .try_process_group_device_list_response(&response, &jids, generation)
+                .await?
+            {
+                return Ok(devices);
+            }
+        }
+        anyhow::bail!("device registry kept changing while a group refresh was in flight")
+    }
+
+    async fn try_process_group_device_list_response(
+        &self,
+        response: &DeviceListResponse,
+        users: &[Jid],
+        topology_generation: u64,
+    ) -> Result<Option<Vec<Jid>>, anyhow::Error> {
+        let mapping_guard = self.lid_pn_cache.lock_mutation().await;
+        let registry_guard = self.device_topology.lock_registry().await;
+        if !self
+            .device_topology
+            .unchanged_for(topology_generation, &device_response_users(response))
+        {
+            return Ok(None);
+        }
+        self.learn_device_list_mappings_guarded(response, &mapping_guard)
+            .await?;
+        self.process_device_list_response_guarded(
+            response,
+            DeviceListApplyMode::GroupRefresh,
+            &registry_guard,
+        )
+        .await?;
+        // Read under the publication guards, including users omitted by the
+        // response. Retrying a partial response must retain the original query.
+        let (devices, _) = self.get_devices_from_registry_batch(users.to_vec()).await;
+        Ok(Some(devices))
     }
 
     async fn fetch_user_devices(&self, jids: Vec<Jid>) -> Result<Vec<Jid>, anyhow::Error> {
@@ -177,7 +243,7 @@ impl Client {
         response: &DeviceListResponse,
         guard: &crate::lid_pn_cache::LidPnMutationGuard<'_>,
     ) -> Result<(), anyhow::Error> {
-        // Learn LID↔PN mappings via the same batched, guarded learner query_info
+        // Learn LID↔PN mappings via the same batched, guarded learner routing_info
         // uses (one detached transaction, skipping already-durable pairs), so
         // per-mapping DB writes stay off the send's critical path. Client
         // construction always installs `self_weak`; failing the impossible
@@ -189,7 +255,7 @@ impl Client {
         // contact with prior PN Signal state encrypt before the PN-wins migration
         // runs — but the per-address session_lock_for both take is the real
         // barrier (they can't interleave). The group-send path is unchanged:
-        // query_info already learns these same pairs detached upstream.
+        // routing_info already learns these same pairs detached upstream.
         if response.lid_mappings.is_empty() {
             return Ok(());
         }
@@ -234,7 +300,7 @@ impl Client {
         let registry_guard = self.device_topology.lock_registry().await;
         self.learn_device_list_mappings_guarded(response, &mapping_guard)
             .await?;
-        self.process_device_list_response_guarded(response, freshness, &registry_guard)
+        self.process_device_list_response_guarded(response, freshness.into(), &registry_guard)
             .await
     }
 
@@ -250,15 +316,13 @@ impl Client {
         let registry_guard = self.device_topology.lock_registry().await;
         if !self
             .device_topology
-            .unchanged_for(topology_generation, |user| {
-                device_response_contains_user(response, user)
-            })
+            .unchanged_for(topology_generation, &device_response_users(response))
         {
             return Ok(None);
         }
         self.learn_device_list_mappings_guarded(response, &mapping_guard)
             .await?;
-        self.process_device_list_response_guarded(response, freshness, &registry_guard)
+        self.process_device_list_response_guarded(response, freshness.into(), &registry_guard)
             .await
             .map(Some)
     }
@@ -266,10 +330,13 @@ impl Client {
     async fn process_device_list_response_guarded(
         &self,
         response: &DeviceListResponse,
-        freshness: crate::cache::Freshness,
+        mode: DeviceListApplyMode,
         guard: &crate::client::device_topology::DeviceRegistryMutationGuard<'_>,
     ) -> Result<Vec<Jid>, anyhow::Error> {
-        let mut fetched_devices = Vec::with_capacity(response.device_lists.len());
+        let mut fetched_devices = Vec::new();
+        if mode != DeviceListApplyMode::GroupRefresh {
+            fetched_devices.reserve(response.device_lists.len());
+        }
         let mut device_records: Vec<wacore::store::traits::DeviceListRecord> =
             Vec::with_capacity(response.device_lists.len());
         struct PendingIdentityReset<'a> {
@@ -282,19 +349,36 @@ impl Client {
         // lets an authoritative refresh validate every user before any prior
         // Signal sessions or registry snapshot are discarded.
         let mut pending_identity_resets = Vec::new();
+        let mut pending_removals = Vec::new();
+        let mut retained_ids = std::collections::HashSet::new();
+
+        // The existing records for the whole response in one alias-aware
+        // (LID <-> PN) batch, so a response covering a large group does not
+        // pay a serialized backend read per member before it can be applied.
+        let users: Vec<&Jid> = response
+            .device_lists
+            .iter()
+            .map(|user_list| &user_list.user)
+            .collect();
+        let mut existing_records = self.load_device_records_batch(&users).await.into_iter();
 
         for user_list in &response.device_lists {
             // Update device registry (single source of truth for device lists).
             // Preserve key_index values from existing records (set via account_sync)
-            // Use alias-aware lookup (resolves LID ↔ PN) to find
-            // existing record regardless of which key it was stored under
-            let mut existing_record = self.load_device_record(&user_list.user.user).await;
+            let mut existing_record = existing_records.next().flatten();
 
             // Decode key-index-list if present (WA Web: handleKeyIndexResult)
             let decoded_key_index = user_list
                 .key_index_bytes
                 .as_deref()
                 .and_then(wacore::adv::decode_key_index_list);
+
+            if mode == DeviceListApplyMode::GroupRefresh
+                && user_list.key_index_bytes.is_some()
+                && decoded_key_index.is_none()
+            {
+                continue;
+            }
 
             // Check raw_id mismatch for identity change detection
             // TODO: also check advAccountType mismatch (see patch_device_add TODO)
@@ -337,11 +421,11 @@ impl Client {
                             record
                                 .devices
                                 .iter()
-                                .find(|cached| cached.device_id == d.device as u32)
-                                .and_then(|cached| cached.key_index)
+                                .find(|cached| cached.device_id() == d.device)
+                                .and_then(|cached| cached.key_index())
                         })
                     });
-                    wacore::store::traits::DeviceInfo::new(d.device as u32, key_index)
+                    wacore::store::traits::DeviceInfo::new(d.device, key_index)
                         .with_hosting(d.is_hosted)
                 })
                 .collect();
@@ -356,11 +440,14 @@ impl Client {
             // corrupt. Persisting it would clobber a good cached record, or store an
             // empty one that get_user_devices then re-fetches on every send.
             if devices.is_empty() {
-                if freshness == crate::cache::Freshness::Refresh {
+                if mode == DeviceListApplyMode::StrictRefresh {
                     anyhow::bail!(
                         "device-list refresh left no valid devices for {}",
                         user_list.user
                     );
+                }
+                if mode == DeviceListApplyMode::GroupRefresh {
+                    continue;
                 }
                 if let Some(previous) = pending_identity_reset {
                     pending_identity_resets.push(PendingIdentityReset {
@@ -375,6 +462,23 @@ impl Client {
                 continue;
             }
 
+            if let Some(previous) = existing_record.as_ref() {
+                retained_ids.clear();
+                retained_ids.extend(devices.iter().map(|device| device.device_id()));
+                for device in &previous.devices {
+                    // The same response can reuse an ID whose old key index
+                    // was revoked. Its replacement must not inherit a warm mark.
+                    if !retained_ids.contains(&device.device_id())
+                        || (device.device_id() != 0
+                            && decoded_key_index.as_ref().is_some_and(|decoded| {
+                                !wacore::adv::is_key_index_valid(device.key_index(), decoded)
+                            }))
+                    {
+                        pending_removals.push((&user_list.user, device.device_id()));
+                    }
+                }
+            }
+
             if let Some(previous) = pending_identity_reset {
                 pending_identity_resets.push(PendingIdentityReset {
                     user: &user_list.user,
@@ -384,24 +488,61 @@ impl Client {
             }
 
             // Convert filtered DeviceInfo list back to JIDs for return
-            let user_jid = &user_list.user;
-            for d in &devices {
-                fetched_devices.push(user_jid.with_device_hosting(d.device_id as u16, d.is_hosted));
+            if mode != DeviceListApplyMode::GroupRefresh {
+                let user_jid = &user_list.user;
+                for d in &devices {
+                    fetched_devices
+                        .push(user_jid.with_device_hosting(d.device_id(), d.is_hosted()));
+                }
             }
 
             device_records.push(wacore::store::traits::DeviceListRecord {
-                user: user_list.user.user.to_string(),
-                devices,
+                user: std::sync::Arc::from(user_list.user.user.as_str()),
+                devices: devices.into_boxed_slice(),
                 timestamp: wacore::time::now_secs(),
-                phash: user_list.phash.clone(),
+                phash: user_list.phash.clone().map(Box::<str>::from),
                 raw_id,
             });
         }
 
-        // All strict validation has completed. Apply identity cleanup before
-        // publishing replacement snapshots so no send can pair a new registry
-        // record with sessions established under the previous identity.
+        // Publish replacements before destructive cleanup: if the backend
+        // write fails, sender-key rows and sessions are still intact and a
+        // retry recomputes the same removals. Everything here runs under the
+        // mapping and registry guards, so no send observes the intermediate
+        // state.
+        //
+        // One batched backend write for the whole usync response — for
+        // large groups this collapses N spawn_blocking SQLite hops into
+        // a single transaction, which dominated the per-send wall-clock.
+        self.update_device_lists_guarded(device_records, guard)
+            .await?;
+        for (user, device_id) in pending_removals {
+            if let Err(e) = self
+                .delete_sender_key_rows_for_device(&user.user, device_id)
+                .await
+            {
+                // The replacement records are already durable; bias the live
+                // cache toward redistribution so a removed-then-readded device
+                // cannot ride a stale warm mark past the SKDM it needs.
+                self.sender_key_device_cache
+                    .invalidate_entries_for_device(&user.user, device_id)
+                    .await;
+                return Err(e.into());
+            }
+        }
         for reset in pending_identity_resets {
+            for device in &reset.previous.devices {
+                if device.device_id() != 0
+                    && let Err(e) = self
+                        .delete_sender_key_rows_for_device(&reset.user.user, device.device_id())
+                        .await
+                {
+                    self.sender_key_device_cache
+                        .invalidate_entries_for_device(&reset.user.user, device.device_id())
+                        .await;
+                    return Err(e.into());
+                }
+            }
             self.clear_device_record(
                 &reset.user.user,
                 reset.user.server.as_str(),
@@ -412,16 +553,6 @@ impl Client {
                 self.invalidate_device_cache_guarded(&reset.user.user, guard)
                     .await;
             }
-        }
-
-        // One batched backend write for the whole usync response — for
-        // large groups this collapses N spawn_blocking SQLite hops into
-        // a single transaction, which dominated the per-send wall-clock.
-        if let Err(e) = self
-            .update_device_lists_guarded(device_records, guard)
-            .await
-        {
-            warn!("Failed to update device registry batch: {e}");
         }
 
         Ok(fetched_devices)
@@ -450,10 +581,10 @@ impl Client {
         for own in device_snapshot.pn.iter().chain(device_snapshot.lid.iter()) {
             let bare = own.to_non_ad();
             // Carry the cached device_hash so an unchanged list is skipped server-side.
-            if let Some(record) = self.load_device_record(&bare.user).await
+            if let Some(record) = self.load_device_record_for_jid(&bare).await
                 && let Some(phash) = record.phash
             {
-                hashes.insert(bare.clone(), (phash, record.timestamp));
+                hashes.insert(bare.clone(), (String::from(phash), record.timestamp));
             }
             jids.push(bare);
         }
@@ -563,6 +694,472 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn group_refresh_partial_success_rebuilds_cached_unresolved_users() {
+        use wacore::iq::spec::IqSpec;
+        use wacore_binary::builder::NodeBuilder;
+
+        let client = create_test_client().await;
+        let users = vec![
+            Jid::pn("12025550121"),
+            Jid::pn("12025550122"),
+            Jid::pn("12025550127"),
+        ];
+        for user in &users {
+            client
+                .update_device_list(DeviceListRecord {
+                    user: user.user.as_str().into(),
+                    devices: [DeviceInfo::new(0, None), DeviceInfo::new(7, Some(3))].into(),
+                    timestamp: 1,
+                    phash: None,
+                    raw_id: Some(2),
+                })
+                .await
+                .unwrap();
+        }
+        let wire = NodeBuilder::new("iq")
+            .attr("type", "result")
+            .children([NodeBuilder::new("usync")
+                .children([NodeBuilder::new("list")
+                    .children([
+                        NodeBuilder::new("user")
+                            .attr("jid", users[0].to_string())
+                            .children([NodeBuilder::new("devices")
+                                .children([NodeBuilder::new("device-list")
+                                    .children([NodeBuilder::new("device").attr("id", "0").build()])
+                                    .build()])
+                                .build()])
+                            .build(),
+                        NodeBuilder::new("user")
+                            .attr("jid", users[1].to_string())
+                            .children([NodeBuilder::new("devices")
+                                .children([NodeBuilder::new("error").attr("code", "500").build()])
+                                .build()])
+                            .build(),
+                    ])
+                    .build()])
+                .build()])
+            .build();
+        let response = DeviceListSpec::new(users.clone(), "group-partial")
+            .parse_response(&wire.as_node_ref())
+            .unwrap();
+        assert!(
+            DeviceListSpec::new(users.clone(), "dm-strict")
+                .require_complete_response()
+                .parse_response(&wire.as_node_ref())
+                .is_err()
+        );
+        let devices = client
+            .try_process_group_device_list_response(
+                &response,
+                &users,
+                client.device_topology.current(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(devices.len(), 5);
+        assert!(!devices.contains(&users[0].with_device(7)));
+        assert!(devices.contains(&users[1].with_device(7)));
+        assert!(devices.contains(&users[2].with_device(7)));
+    }
+
+    #[tokio::test]
+    async fn group_refresh_preserves_malformed_and_filtered_identity_records() {
+        use wacore::usync::{UserDeviceList, UsyncDevice};
+
+        for (bytes, devices) in [
+            (Some(vec![0xff]), vec![UsyncDevice::new(7, Some(3))]),
+            (
+                Some(signed_key_index_bytes(Vec::new(), 10)),
+                vec![UsyncDevice::new(7, Some(3))],
+            ),
+            (None, Vec::new()),
+        ] {
+            let client = create_test_client().await;
+            let user = Jid::pn("12025550123");
+            client
+                .update_device_list(DeviceListRecord {
+                    user: user.user.as_str().into(),
+                    devices: [DeviceInfo::new(0, None), DeviceInfo::new(7, Some(3))].into(),
+                    timestamp: 1,
+                    phash: Some("old".into()),
+                    raw_id: Some(2),
+                })
+                .await
+                .unwrap();
+            let session = seed_fresh_session(&client, &user.with_device(7)).await;
+            let response = DeviceListResponse {
+                device_lists: vec![UserDeviceList {
+                    user: user.clone(),
+                    devices,
+                    phash: None,
+                    key_index_bytes: bytes,
+                }],
+                lid_mappings: Vec::new(),
+            };
+            let devices = client
+                .try_process_group_device_list_response(
+                    &response,
+                    std::slice::from_ref(&user),
+                    client.device_topology.current(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(devices.len(), 2);
+            let record = client.load_device_record_for_jid(&user).await.unwrap();
+            assert_eq!(record.raw_id, Some(2));
+            assert_eq!(record.phash.as_deref(), Some("old"));
+            assert!(has_session(&client, &session).await);
+        }
+    }
+
+    #[tokio::test]
+    async fn group_refresh_rejects_response_after_concurrent_notification() {
+        use wacore::usync::{UserDeviceList, UsyncDevice};
+
+        let client = create_test_client().await;
+        let user = Jid::pn("12025550124");
+        client
+            .update_device_list(DeviceListRecord {
+                user: user.user.as_str().into(),
+                devices: [DeviceInfo::new(0, None)].into(),
+                timestamp: 1,
+                phash: None,
+                raw_id: None,
+            })
+            .await
+            .unwrap();
+        let generation = client.device_topology.current();
+        client
+            .patch_device_add(
+                &user.user,
+                &wacore::stanza::devices::DeviceElement {
+                    jid: user.with_device(7),
+                    key_index: None,
+                    lid: None,
+                },
+                None,
+            )
+            .await;
+        let response = DeviceListResponse {
+            device_lists: vec![UserDeviceList {
+                user: user.clone(),
+                devices: vec![UsyncDevice::new(0, None)],
+                phash: None,
+                key_index_bytes: None,
+            }],
+            lid_mappings: Vec::new(),
+        };
+        assert!(
+            client
+                .try_process_group_device_list_response(
+                    &response,
+                    std::slice::from_ref(&user),
+                    generation,
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            client
+                .get_devices_from_registry(&user)
+                .await
+                .unwrap()
+                .contains(&user.with_device(7))
+        );
+        let omitted = DeviceListResponse {
+            device_lists: Vec::new(),
+            lid_mappings: Vec::new(),
+        };
+        let devices = client
+            .try_process_group_device_list_response(
+                &omitted,
+                std::slice::from_ref(&user),
+                generation,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(devices.contains(&user.with_device(7)));
+    }
+
+    #[tokio::test]
+    async fn group_refresh_removed_then_reused_device_id_is_cold() {
+        use crate::sender_key_device_cache::SenderKeyDeviceMap;
+        use wacore::usync::{UserDeviceList, UsyncDevice};
+
+        let client = create_test_client().await;
+        let user = Jid::pn("12025550125");
+        let group = "120363000000000125@g.us";
+        client
+            .update_device_list(DeviceListRecord {
+                user: user.user.as_str().into(),
+                devices: [DeviceInfo::new(0, None), DeviceInfo::new(7, Some(3))].into(),
+                timestamp: 1,
+                phash: None,
+                raw_id: None,
+            })
+            .await
+            .unwrap();
+        let rows = vec![
+            (user.to_string(), true),
+            (user.with_device(7).to_string(), true),
+        ];
+        client
+            .persistence_manager
+            .set_sender_key_status(
+                group,
+                &[(rows[0].0.as_str(), true), (rows[1].0.as_str(), true)],
+            )
+            .await
+            .unwrap();
+        client
+            .sender_key_device_cache
+            .get_or_init(group, async {
+                std::sync::Arc::new(SenderKeyDeviceMap::from_db_rows(&rows))
+            })
+            .await;
+        let response = DeviceListResponse {
+            device_lists: vec![UserDeviceList {
+                user: user.clone(),
+                devices: vec![UsyncDevice::new(0, None)],
+                phash: None,
+                key_index_bytes: None,
+            }],
+            lid_mappings: Vec::new(),
+        };
+        client
+            .try_process_group_device_list_response(
+                &response,
+                std::slice::from_ref(&user),
+                client.device_topology.current(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        client
+            .patch_device_add(
+                &user.user,
+                &wacore::stanza::devices::DeviceElement {
+                    jid: user.with_device(7),
+                    key_index: Some(4),
+                    lid: None,
+                },
+                None,
+            )
+            .await;
+        let rows = client
+            .persistence_manager
+            .get_sender_key_devices(group)
+            .await
+            .unwrap();
+        assert_eq!(rows, vec![(user.to_string(), true)]);
+        let map = client
+            .sender_key_device_cache
+            .get_or_init(group, async {
+                std::sync::Arc::new(SenderKeyDeviceMap::from_db_rows(&rows))
+            })
+            .await;
+        assert_eq!(map.device_has_key(&user.user, 7), None);
+        assert_eq!(map.device_has_key(&user.user, 0), Some(true));
+        assert_eq!(
+            client
+                .load_device_record_for_jid(&user)
+                .await
+                .unwrap()
+                .devices
+                .iter()
+                .find(|device| device.device_id() == 7)
+                .unwrap()
+                .key_index(),
+            Some(4)
+        );
+    }
+
+    #[tokio::test]
+    async fn group_refresh_same_response_reused_id_checks_previous_key_index() {
+        use crate::sender_key_device_cache::SenderKeyDeviceMap;
+        use wacore::usync::{UserDeviceList, UsyncDevice};
+
+        for previous_index_valid in [false, true] {
+            let client = create_test_client().await;
+            let user = Jid::pn("12025550128");
+            let group = "120363000000000128@g.us";
+            client
+                .update_device_list(DeviceListRecord {
+                    user: user.user.as_str().into(),
+                    devices: [DeviceInfo::new(0, None), DeviceInfo::new(7, Some(3))].into(),
+                    timestamp: 1,
+                    phash: None,
+                    raw_id: Some(1),
+                })
+                .await
+                .unwrap();
+            let rows = vec![
+                (user.to_string(), true),
+                (user.with_device(7).to_string(), true),
+            ];
+            client
+                .persistence_manager
+                .set_sender_key_status(
+                    group,
+                    &[(rows[0].0.as_str(), true), (rows[1].0.as_str(), true)],
+                )
+                .await
+                .unwrap();
+            let warm = client
+                .sender_key_device_cache
+                .get_or_init(group, async {
+                    std::sync::Arc::new(SenderKeyDeviceMap::from_db_rows(&rows))
+                })
+                .await;
+            assert!(warm.device_and_primary_warm(&user.user, 7));
+
+            let valid_indexes = if previous_index_valid {
+                vec![3, 4]
+            } else {
+                vec![4]
+            };
+            let response = DeviceListResponse {
+                device_lists: vec![UserDeviceList {
+                    user: user.clone(),
+                    devices: vec![UsyncDevice::new(0, None), UsyncDevice::new(7, Some(4))],
+                    phash: None,
+                    key_index_bytes: Some(signed_key_index_bytes(valid_indexes, 4)),
+                }],
+                lid_mappings: Vec::new(),
+            };
+            let devices = client
+                .try_process_group_device_list_response(
+                    &response,
+                    std::slice::from_ref(&user),
+                    client.device_topology.current(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(devices.contains(&user.with_device(7)));
+            let record = client.load_device_record_for_jid(&user).await.unwrap();
+            assert_eq!(record.raw_id, Some(1));
+            assert_eq!(
+                record
+                    .devices
+                    .iter()
+                    .find(|device| device.device_id() == 7)
+                    .unwrap()
+                    .key_index(),
+                Some(4)
+            );
+
+            let rows = client
+                .persistence_manager
+                .get_sender_key_devices(group)
+                .await
+                .unwrap();
+            assert_eq!(
+                rows.iter()
+                    .any(|(jid, has_key)| jid == &user.with_device(7).to_string() && *has_key),
+                previous_index_valid
+            );
+            let map = client
+                .sender_key_device_cache
+                .get_or_init(group, async {
+                    std::sync::Arc::new(SenderKeyDeviceMap::from_db_rows(&rows))
+                })
+                .await;
+            assert_eq!(
+                map.device_has_key(&user.user, 7),
+                previous_index_valid.then_some(true)
+            );
+            assert_eq!(map.device_has_key(&user.user, 0), Some(true));
+        }
+    }
+
+    /// A failed registry write must not leave sender-key rows and sessions
+    /// deleted for a device list that never landed: the cleanup runs after
+    /// the write, so a write that never happened leaves everything intact.
+    #[tokio::test]
+    async fn group_refresh_write_failure_keeps_tracking_and_sessions() {
+        use std::sync::atomic::Ordering;
+        use wacore::usync::{UserDeviceList, UsyncDevice};
+
+        let client = create_test_client().await;
+        let user = Jid::pn("12025550129");
+        let group = "120363000000000129@g.us";
+        client
+            .update_device_list(DeviceListRecord {
+                user: user.user.as_str().into(),
+                devices: [DeviceInfo::new(0, None), DeviceInfo::new(7, Some(3))].into(),
+                timestamp: 1,
+                phash: None,
+                raw_id: None,
+            })
+            .await
+            .unwrap();
+        let rows = [
+            (user.to_string(), true),
+            (user.with_device(7).to_string(), true),
+        ];
+        client
+            .persistence_manager
+            .set_sender_key_status(
+                group,
+                &[(rows[0].0.as_str(), true), (rows[1].0.as_str(), true)],
+            )
+            .await
+            .unwrap();
+        let session = seed_fresh_session(&client, &user.with_device(7)).await;
+        // The replacement drops device 7, so the old order would delete its
+        // sender-key rows and session before attempting the write.
+        let response = DeviceListResponse {
+            device_lists: vec![UserDeviceList {
+                user: user.clone(),
+                devices: vec![UsyncDevice::new(0, None)],
+                phash: None,
+                key_index_bytes: None,
+            }],
+            lid_mappings: Vec::new(),
+        };
+        client
+            .fail_next_device_list_write
+            .store(true, Ordering::SeqCst);
+        client
+            .try_process_group_device_list_response(
+                &response,
+                std::slice::from_ref(&user),
+                client.device_topology.current(),
+            )
+            .await
+            .expect_err("the injected write failure must surface");
+        let rows = client
+            .persistence_manager
+            .get_sender_key_devices(group)
+            .await
+            .unwrap();
+        assert!(
+            rows.iter()
+                .any(|(jid, has_key)| jid == &user.with_device(7).to_string() && *has_key),
+            "a write that never happened must not delete sender-key tracking: {rows:?}"
+        );
+        assert!(
+            has_session(&client, &session).await,
+            "a write that never happened must not delete sessions"
+        );
+        assert!(
+            client
+                .load_device_record_for_jid(&user)
+                .await
+                .unwrap()
+                .devices
+                .iter()
+                .any(|device| device.device_id() == 7),
+            "the previous device list must survive a failed write"
+        );
+    }
+
+    #[tokio::test]
     async fn test_device_registry_hit_resolves_devices() {
         let client = create_test_client().await;
 
@@ -571,7 +1168,7 @@ mod tests {
         // Insert a device record into the registry (simulates prior usync/notification)
         let record = DeviceListRecord {
             user: "1234567890".into(),
-            devices: vec![DeviceInfo::new(0, None), DeviceInfo::new(3, Some(10))],
+            devices: [DeviceInfo::new(0, None), DeviceInfo::new(3, Some(10))].into(),
             timestamp: wacore::time::now_secs(),
             phash: None,
             raw_id: None,
@@ -593,7 +1190,7 @@ mod tests {
         client
             .update_device_list(DeviceListRecord {
                 user: "12025550102".into(),
-                devices: vec![DeviceInfo::new(0, None), DeviceInfo::new(8, None)],
+                devices: [DeviceInfo::new(0, None), DeviceInfo::new(8, None)].into(),
                 timestamp: wacore::time::now_secs(),
                 phash: None,
                 raw_id: None,
@@ -633,7 +1230,7 @@ mod tests {
 
         let record = DeviceListRecord {
             user: "100000012345678".into(),
-            devices: vec![DeviceInfo::new(0, None), DeviceInfo::new(39, Some(25))],
+            devices: [DeviceInfo::new(0, None), DeviceInfo::new(39, Some(25))].into(),
             timestamp: wacore::time::now_secs(),
             phash: None,
             raw_id: None,
@@ -656,7 +1253,7 @@ mod tests {
         // Insert into backend DB via update_device_list
         let record = DeviceListRecord {
             user: "9876543210".into(),
-            devices: vec![DeviceInfo::new(5, None)],
+            devices: [DeviceInfo::new(5, None)].into(),
             timestamp: wacore::time::now_secs(),
             phash: None,
             raw_id: None,
@@ -688,7 +1285,7 @@ mod tests {
 
         let record = DeviceListRecord {
             user: "5551230000".into(),
-            devices: vec![],
+            devices: Box::default(),
             timestamp: wacore::time::now_secs(),
             phash: None,
             raw_id: None,
@@ -736,9 +1333,9 @@ mod tests {
         client
             .update_device_list(DeviceListRecord {
                 user: "2222222222".into(),
-                devices: vec![DeviceInfo::new(0, None), DeviceInfo::new(7, None)],
+                devices: [DeviceInfo::new(0, None), DeviceInfo::new(7, None)].into(),
                 timestamp: wacore::time::now_secs(),
-                phash: Some("2:oldB".to_string()),
+                phash: Some("2:oldB".into()),
                 raw_id: None,
             })
             .await
@@ -749,7 +1346,7 @@ mod tests {
             device_lists: vec![UserDeviceList {
                 user: "1111111111@s.whatsapp.net".parse().unwrap(),
                 devices: vec![UsyncDevice::new(0, None)],
-                phash: Some("2:a".to_string()),
+                phash: Some("2:a".into()),
                 key_index_bytes: None,
             }],
             lid_mappings: vec![],
@@ -791,7 +1388,7 @@ mod tests {
                     UsyncDevice::new(0, None),
                     UsyncDevice::new(7, Some(3)).with_hosting(true),
                 ],
-                phash: Some("2:hosted".to_string()),
+                phash: Some("2:hosted".into()),
                 key_index_bytes: None,
             }],
             lid_mappings: Vec::new(),
@@ -826,10 +1423,10 @@ mod tests {
         let user = Jid::pn("12025550102");
         client
             .update_device_list(DeviceListRecord {
-                user: user.user.to_string(),
-                devices: vec![DeviceInfo::new(0, None)],
+                user: user.user.as_str().into(),
+                devices: [DeviceInfo::new(0, None)].into(),
                 timestamp: wacore::time::now_secs(),
-                phash: Some("1:before".to_string()),
+                phash: Some("1:before".into()),
                 raw_id: None,
             })
             .await
@@ -840,7 +1437,7 @@ mod tests {
             device_lists: vec![UserDeviceList {
                 user: user.clone(),
                 devices: vec![UsyncDevice::new(0, None)],
-                phash: Some("1:stale".to_string()),
+                phash: Some("1:stale".into()),
                 key_index_bytes: None,
             }],
             lid_mappings: Vec::new(),
@@ -962,8 +1559,8 @@ mod tests {
         let refresh_started_at = client.device_topology.current();
         client
             .update_device_list(DeviceListRecord {
-                user: "12025550105".to_string(),
-                devices: vec![DeviceInfo::new(0, None)],
+                user: "12025550105".into(),
+                devices: [DeviceInfo::new(0, None)].into(),
                 timestamp: wacore::time::now_secs(),
                 phash: None,
                 raw_id: None,
@@ -1042,9 +1639,9 @@ mod tests {
         client
             .update_device_list(DeviceListRecord {
                 user: "3333333333".into(),
-                devices: vec![DeviceInfo::new(0, None), DeviceInfo::new(4, None)],
+                devices: [DeviceInfo::new(0, None), DeviceInfo::new(4, None)].into(),
                 timestamp: wacore::time::now_secs(),
-                phash: Some("3:old".to_string()),
+                phash: Some("3:old".into()),
                 raw_id: None,
             })
             .await
@@ -1055,7 +1652,7 @@ mod tests {
             device_lists: vec![UserDeviceList {
                 user: "3333333333@s.whatsapp.net".parse().unwrap(),
                 devices: vec![],
-                phash: Some("3:empty".to_string()),
+                phash: Some("3:empty".into()),
                 key_index_bytes: None,
             }],
             lid_mappings: vec![],
@@ -1091,10 +1688,10 @@ mod tests {
         let user = Jid::pn("4444444444");
         client
             .update_device_list(DeviceListRecord {
-                user: user.user.to_string(),
-                devices: vec![DeviceInfo::new(0, None), DeviceInfo::new(7, Some(3))],
+                user: user.user.as_str().into(),
+                devices: [DeviceInfo::new(0, None), DeviceInfo::new(7, Some(3))].into(),
                 timestamp: wacore::time::now_secs(),
-                phash: Some("2:previous".to_string()),
+                phash: Some("2:previous".into()),
                 raw_id: Some(1),
             })
             .await
@@ -1107,7 +1704,7 @@ mod tests {
             device_lists: vec![UserDeviceList {
                 user: user.clone(),
                 devices: vec![UsyncDevice::new(7, Some(3))],
-                phash: Some("2:incomplete".to_string()),
+                phash: Some("2:incomplete".into()),
                 key_index_bytes: Some(signed_key_index_bytes(Vec::new(), 10)),
             }],
             lid_mappings: Vec::new(),
@@ -1138,10 +1735,10 @@ mod tests {
         for (user, raw_id) in [(&identity_changed, 2), (&invalid, 1)] {
             client
                 .update_device_list(DeviceListRecord {
-                    user: user.user.to_string(),
-                    devices: vec![DeviceInfo::new(0, None), DeviceInfo::new(7, Some(3))],
+                    user: user.user.as_str().into(),
+                    devices: [DeviceInfo::new(0, None), DeviceInfo::new(7, Some(3))].into(),
                     timestamp: wacore::time::now_secs(),
-                    phash: Some("2:previous".to_string()),
+                    phash: Some("2:previous".into()),
                     raw_id: Some(raw_id),
                 })
                 .await
@@ -1156,7 +1753,7 @@ mod tests {
                     // A primary device survives key-index filtering, so this
                     // first user schedules a valid identity replacement.
                     devices: vec![UsyncDevice::new(0, None)],
-                    phash: Some("1:changed".to_string()),
+                    phash: Some("1:changed".into()),
                     key_index_bytes: Some(signed_key_index_bytes(Vec::new(), 10)),
                 },
                 UserDeviceList {
@@ -1164,7 +1761,7 @@ mod tests {
                     // The second user makes the authoritative response invalid
                     // only after key-index projection.
                     devices: vec![UsyncDevice::new(7, Some(3))],
-                    phash: Some("1:invalid".to_string()),
+                    phash: Some("1:invalid".into()),
                     key_index_bytes: Some(signed_key_index_bytes(Vec::new(), 10)),
                 },
             ],
@@ -1195,10 +1792,10 @@ mod tests {
         let user = Jid::pn("4444444453");
         client
             .update_device_list(DeviceListRecord {
-                user: user.user.to_string(),
-                devices: vec![DeviceInfo::new(0, None), DeviceInfo::new(7, Some(3))],
+                user: user.user.as_str().into(),
+                devices: [DeviceInfo::new(0, None), DeviceInfo::new(7, Some(3))].into(),
                 timestamp: wacore::time::now_secs(),
-                phash: Some("2:previous".to_string()),
+                phash: Some("2:previous".into()),
                 raw_id: Some(2),
             })
             .await
@@ -1209,7 +1806,7 @@ mod tests {
             device_lists: vec![UserDeviceList {
                 user: user.clone(),
                 devices: vec![UsyncDevice::new(7, Some(3))],
-                phash: Some("1:changed".to_string()),
+                phash: Some("1:changed".into()),
                 key_index_bytes: Some(signed_key_index_bytes(Vec::new(), 10)),
             }],
             lid_mappings: Vec::new(),

@@ -76,6 +76,25 @@ fn media_encrypt_video_10mb_with_sidecar(bencher: Bencher) {
     bench_encrypt(bencher, 10 * MB, MediaType::Video, true);
 }
 
+/// The buffered upload API on the same 10 MiB video, output buffer included:
+/// what a caller of `encrypt_media` pays, ciphertext `Vec` allocation and all,
+/// where the arm above measures the crypto into a pre-sized buffer.
+#[divan::bench]
+fn media_encrypt_video_10mb_buffered_api(bencher: Bencher) {
+    let plaintext = payload(10 * MB);
+    bencher.counter(BytesCount::new(plaintext.len())).bench(|| {
+        black_box(
+            encrypt_media_with_key_and_sidecar(
+                black_box(&plaintext),
+                MediaType::Video,
+                Some(&MEDIA_KEY),
+                None,
+            )
+            .expect("buffered encryption"),
+        )
+    });
+}
+
 /// The streaming upload path: 8 KiB reads, encrypt, flush whole runs to the
 /// writer. A `Vec` writer keeps this a measurement of crypto plus buffer
 /// traffic; against a real `File` the write batching is worth much more.
@@ -153,4 +172,31 @@ fn media_decrypt_in_place_10mb(bencher: Bencher) {
 #[divan::bench]
 fn media_decrypt_in_place_1mb(bencher: Bencher) {
     bench_decrypt_in_place(bencher, MB, MediaType::Image);
+}
+
+/// The copying decrypt: allocates the plaintext beside the ciphertext, so one
+/// full-file memcpy plus a 2x peak. The delta against the in-place rows above
+/// is what routing a buffered HTTP response through
+/// `verify_and_decrypt_in_place` saves.
+fn bench_decrypt_copy(bencher: Bencher, len: usize, media_type: MediaType) {
+    let ciphertext = encrypted(len, media_type);
+    bencher
+        .counter(BytesCount::new(len))
+        .with_inputs(|| ciphertext.clone())
+        .bench_refs(|buf| {
+            black_box(
+                DownloadUtils::verify_and_decrypt(black_box(buf), &MEDIA_KEY, media_type)
+                    .expect("fixture decrypt"),
+            );
+        });
+}
+
+#[divan::bench]
+fn media_decrypt_copy_10mb(bencher: Bencher) {
+    bench_decrypt_copy(bencher, 10 * MB, MediaType::Video);
+}
+
+#[divan::bench]
+fn media_decrypt_copy_1mb(bencher: Bencher) {
+    bench_decrypt_copy(bencher, MB, MediaType::Image);
 }

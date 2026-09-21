@@ -222,6 +222,21 @@ pub trait SessionStore: ThreadSafe {
     /// Destructive cache checkouts belong in `load_session_for_update`.
     async fn load_session(&self, address: &ProtocolAddress) -> Result<Option<SessionRecord>>;
 
+    /// Hint to fault `addresses` into the store in one backend round-trip.
+    ///
+    /// A send fans out over every device, and without this each device pays its
+    /// own load; the caller offers the whole candidate set up front so a
+    /// batch-capable store can collapse the N+1. The default does nothing:
+    /// warming then happens through the normal per-address paths, so stores
+    /// without a batch backend keep their exact behavior. An override must only
+    /// populate what a later `load_session`/`has_session` would have read
+    /// anyway — never change store contents — so ignoring the hint is always
+    /// correct, just slower on a cold cache.
+    async fn prefetch_sessions(&self, addresses: &[ProtocolAddress]) -> Result<()> {
+        let _ = addresses;
+        Ok(())
+    }
+
     /// Loads a mutation copy and optionally marks it as destructively checked out.
     ///
     /// `None` is an assertion that [`load_session`] was non-destructive. A store
@@ -291,7 +306,13 @@ pub trait SessionStore: ThreadSafe {
 }
 
 /// Result of returning a record from a cancellation-safe checkout.
+///
+/// A transient return value, moved out of as soon as it is matched, so the
+/// record-carrying arm costs nothing beyond the record itself; boxing it
+/// would add an allocation to a path that is done with the value by the next
+/// statement.
 #[doc(hidden)]
+#[allow(clippy::large_enum_variant)]
 pub enum SessionCheckoutStoreResult {
     Stored,
     Rejected,

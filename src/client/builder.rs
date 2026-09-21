@@ -8,6 +8,7 @@ use super::Client;
 #[cfg(feature = "client-lifecycle")]
 use super::{ClientLifecycle, LifecycleRegistration};
 use crate::cache_config::CacheConfig;
+use crate::features::PresencePolicy;
 use crate::http::HttpClient;
 #[cfg(feature = "plugins")]
 use crate::plugins::{
@@ -20,6 +21,8 @@ use crate::sync_task::MajorSyncTask;
 use crate::transport::TransportFactory;
 use crate::types::durability_hook::InboundDurabilityHook;
 use crate::types::enc_handler::EncHandler;
+use crate::types::history_sync_admission::HistorySyncAdmission;
+use wacore::handshake::NoiseCertPolicy;
 use wacore::runtime::Runtime;
 
 /// Result of constructing a [`Client`].
@@ -84,6 +87,13 @@ pub enum ClientBuilderError {
     InvalidPluginTaskDrainTimeout,
     #[error("the configured backend does not support the inbound durability hook: {0}")]
     UnsupportedDurabilityBackend(String),
+    /// Two media backends were installed, or one was installed after assembly already bound the
+    /// registry's. Silently ignoring the requested backend would leave a caller running on one it
+    /// did not ask for, so the conflict is an error.
+    #[cfg(feature = "voip-control")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "voip-control")))]
+    #[error("a VoIP media backend is already installed on this client")]
+    VoipMediaBackendAlreadyInstalled,
     #[cfg(feature = "client-lifecycle")]
     #[cfg_attr(docsrs, doc(cfg(feature = "client-lifecycle")))]
     #[error("client lifecycle installation failed: {0}")]
@@ -113,7 +123,11 @@ pub struct ClientBuilder {
     cache_config: CacheConfig,
     custom_enc_handlers: HashMap<String, Arc<dyn EncHandler>>,
     inbound_durability_hook: Option<Arc<dyn InboundDurabilityHook>>,
+    history_sync_admission: Option<Arc<dyn HistorySyncAdmission>>,
     skip_history_sync: bool,
+    ab_props_fetch: bool,
+    presence_policy: PresencePolicy,
+    noise_cert_policy: NoiseCertPolicy,
     wanted_pre_key_count: Option<usize>,
     resend_rate_limit: Option<(u32, u32)>,
     task_instrument: Option<Arc<dyn wacore::stats::TaskInstrument>>,
@@ -125,6 +139,11 @@ pub struct ClientBuilder {
     plugins: Vec<PluginRegistration>,
     #[cfg(feature = "plugins")]
     plugin_host_config: PluginHostConfig,
+    /// The media backend the call subsystem reserves sessions from, when the application wants a
+    /// foreign implementation. `None` means "use whatever this build defaults to": the resident
+    /// `WacoreVoipMediaBackend` on a `voip-engine-wacore` build, or none at all.
+    #[cfg(feature = "voip-control")]
+    voip_media_backend: Option<Arc<dyn wacore::voip_control::VoipMediaBackend>>,
 }
 
 impl Default for ClientBuilder {
@@ -145,7 +164,11 @@ impl ClientBuilder {
             cache_config: CacheConfig::default(),
             custom_enc_handlers: HashMap::new(),
             inbound_durability_hook: None,
+            history_sync_admission: None,
             skip_history_sync: false,
+            ab_props_fetch: true,
+            presence_policy: PresencePolicy::default(),
+            noise_cert_policy: NoiseCertPolicy::default(),
             wanted_pre_key_count: None,
             resend_rate_limit: None,
             task_instrument: None,
@@ -157,6 +180,8 @@ impl ClientBuilder {
             plugins: Vec::new(),
             #[cfg(feature = "plugins")]
             plugin_host_config: PluginHostConfig::default(),
+            #[cfg(feature = "voip-control")]
+            voip_media_backend: None,
         }
     }
 
@@ -207,6 +232,31 @@ impl ClientBuilder {
 
     pub fn with_http_client_arc(mut self, http_client: Arc<dyn HttpClient>) -> Self {
         self.http_client = Some(http_client);
+        self
+    }
+
+    /// Install the media backend the call subsystem reserves sessions from.
+    ///
+    /// The call registry never names a concrete media implementation; it asks this backend to
+    /// `reserve` one session per call. Supplying one is what lets a caller run calls on a foreign
+    /// engine instead of the resident one, and a `voip-control`-only build has no other way to get
+    /// media at all.
+    #[cfg(feature = "voip-control")]
+    pub fn with_voip_media_backend<B>(mut self, backend: B) -> Self
+    where
+        B: wacore::voip_control::VoipMediaBackend + 'static,
+    {
+        self.voip_media_backend = Some(Arc::new(backend));
+        self
+    }
+
+    /// [`with_voip_media_backend`](Self::with_voip_media_backend) for an already-shared backend.
+    #[cfg(feature = "voip-control")]
+    pub fn with_voip_media_backend_arc(
+        mut self,
+        backend: Arc<dyn wacore::voip_control::VoipMediaBackend>,
+    ) -> Self {
+        self.voip_media_backend = Some(backend);
         self
     }
 
@@ -267,8 +317,66 @@ impl ClientBuilder {
         self
     }
 
+    /// Register a synchronous policy that can reject inbound history-sync
+    /// notifications before they create history-sync work.
+    pub fn with_history_sync_admission<A>(mut self, admission: A) -> Self
+    where
+        A: HistorySyncAdmission + 'static,
+    {
+        self.history_sync_admission = Some(Arc::new(admission));
+        self
+    }
+
+    /// Register an already-shared history-sync admission policy.
+    pub fn with_history_sync_admission_arc(
+        mut self,
+        admission: Arc<dyn HistorySyncAdmission>,
+    ) -> Self {
+        self.history_sync_admission = Some(admission);
+        self
+    }
+
     pub fn with_skip_history_sync(mut self, skip: bool) -> Self {
         self.skip_history_sync = skip;
+        self
+    }
+
+    /// Whether to fetch the server's A/B props catalog on connect, as WA Web
+    /// does. On by default.
+    ///
+    /// The catalog is the largest frame of an ordinary login (a few thousand
+    /// props, ~30 KB compressed) and the client keeps a couple of dozen of
+    /// them. It is consumed as a stream, so on a host it costs nothing worth
+    /// turning off; the switch exists for a client on a heap of a few hundred
+    /// KB that cannot afford even the compressed frame plus the inflate state
+    /// (~80 KB together) at the moment it arrives.
+    ///
+    /// Turned off, every flag reads as its registry default, the value WA Web
+    /// itself uses before its first fetch: the server sees no `abt` request
+    /// (whatsmeow never sends one) and accepts the client either way, but an
+    /// account the server has 1:1-LID-migrated is not recognised as such from
+    /// the props (`lid_one_on_one_migration_enabled` defaults to off), and
+    /// privacy-token and trusted-contact-token gates run on their defaults.
+    pub fn with_ab_props_fetch(mut self, enabled: bool) -> Self {
+        self.ab_props_fetch = enabled;
+        self
+    }
+
+    /// Choose who announces the account's own `available` presence; see
+    /// [`PresencePolicy`].
+    pub fn with_presence_policy(mut self, policy: PresencePolicy) -> Self {
+        self.presence_policy = policy;
+        self
+    }
+
+    /// Select the Noise server-cert verification policy for handshakes made
+    /// by the built client. Defaults to strict (explicit `Strict` always
+    /// verifies); pass
+    /// [`NoiseCertPolicy::DangerSkipCertChainVerify`] only for testing
+    /// against a mock server that cannot produce a WhatsApp-rooted chain.
+    /// Fixed at build time and applied to every connect, including reconnects.
+    pub fn with_noise_cert_policy(mut self, policy: NoiseCertPolicy) -> Self {
+        self.noise_cert_policy = policy;
         self
     }
 
@@ -507,9 +615,39 @@ impl ClientBuilder {
                 lifecycle,
                 #[cfg(feature = "plugins")]
                 plugin_host,
+                noise_cert_policy: self.noise_cert_policy,
+                history_sync_admission: self.history_sync_admission,
             },
         );
         let client = assembly.client();
+        #[cfg(feature = "voip-control")]
+        {
+            // A caller-supplied backend wins; otherwise the resident one is the default when the
+            // engine feature is on. The resident backend owns the runtime and holds the client
+            // weakly, so the control plane never has to be handed either. A `voip-control`-only
+            // build with no backend injected leaves the registry with none, and starting media
+            // reports the typed `MediaSetupError::NoBackend`.
+            #[allow(unused_mut)]
+            let mut backend: Option<Arc<dyn wacore::voip_control::VoipMediaBackend>> =
+                self.voip_media_backend.clone();
+            #[cfg(feature = "voip-engine-wacore")]
+            if backend.is_none() {
+                backend = Some(Arc::new(
+                    crate::voip_control::wacore_backend::WacoreVoipMediaBackend::new(
+                        Arc::clone(&runtime),
+                        Arc::downgrade(&client),
+                    ),
+                ));
+            }
+            if let Some(backend) = backend
+                && !client.call_registry().install_backend(backend)
+            {
+                // A caller that asked for a specific backend must never end up on another. The only
+                // way this fails is a second install, which is a programming error, not a runtime
+                // condition, so it is surfaced rather than dropped.
+                return Err(ClientBuilderError::VoipMediaBackendAlreadyInstalled);
+            }
+        }
         #[cfg(feature = "client-lifecycle")]
         let mut construction = ClientConstructionGuard::new(Arc::clone(&client));
 
@@ -522,6 +660,10 @@ impl ClientBuilder {
         if self.skip_history_sync {
             client.set_skip_history_sync(true);
         }
+        if !self.ab_props_fetch {
+            client.set_ab_props_fetch(false);
+        }
+        client.set_presence_policy(self.presence_policy);
         if let Some(count) = self.wanted_pre_key_count {
             client.set_wanted_pre_key_count(count);
         }
@@ -584,16 +726,9 @@ impl ClientBuilder {
 async fn probe_durability_backend(
     backend: &Arc<dyn crate::store::traits::Backend>,
 ) -> Result<(), ClientBuilderError> {
-    use portable_atomic::{AtomicU64, Ordering};
-
-    static PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
     const PROBE_JID: &str = "0@s.whatsapp.net";
     const PROBE_PAYLOAD: &[u8] = b"probe";
-    let probe_id = format!(
-        "__wa_durability_probe_{}_{}__",
-        std::process::id(),
-        PROBE_SEQ.fetch_add(1, Ordering::Relaxed)
-    );
+    let probe_id = super::durability_probe_id::next();
     let map_err =
         |error: StoreError| ClientBuilderError::UnsupportedDurabilityBackend(error.to_string());
 
@@ -660,6 +795,8 @@ pub(super) struct ClientExtensions {
     pub(super) lifecycle: Option<Arc<LifecycleRegistration>>,
     #[cfg(feature = "plugins")]
     pub(super) plugin_host: Option<Arc<PluginHost>>,
+    pub(super) noise_cert_policy: NoiseCertPolicy,
+    pub(super) history_sync_admission: Option<Arc<dyn HistorySyncAdmission>>,
 }
 
 impl ClientAssembly {
@@ -835,6 +972,17 @@ mod tests {
         spawns: Arc<AtomicUsize>,
     }
 
+    struct CountingHistorySyncAdmission {
+        decisions: Arc<AtomicUsize>,
+    }
+
+    impl HistorySyncAdmission for CountingHistorySyncAdmission {
+        fn decide(&self, _metadata: &crate::HistorySyncMetadata<'_>) -> crate::HistorySyncDecision {
+            self.decisions.fetch_add(1, Ordering::SeqCst);
+            crate::HistorySyncDecision::Accept
+        }
+    }
+
     #[async_trait::async_trait]
     impl Runtime for CountingRuntime {
         fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send + 'static>>) -> AbortHandle {
@@ -869,6 +1017,38 @@ mod tests {
             .with_persistence_manager(persistence_manager)
             .with_transport_factory(MockTransportFactory::new())
             .with_http_client(MockHttpClient)
+    }
+
+    #[tokio::test]
+    async fn durability_probes_round_trip_and_clean_up_without_deleting_other_rows() {
+        let backend: Arc<dyn crate::store::traits::Backend> =
+            Arc::new(wacore::store::in_memory::InMemoryBackend::new());
+        backend
+            .store_pending_inbound("0@s.whatsapp.net", "0@s.whatsapp.net", "existing", b"keep")
+            .await
+            .expect("seed unrelated row");
+
+        let (first, second) = futures::join!(
+            probe_durability_backend(&backend),
+            probe_durability_backend(&backend)
+        );
+        first.expect("first probe");
+        second.expect("second probe");
+        assert_eq!(
+            backend
+                .get_pending_inbound("0@s.whatsapp.net", "0@s.whatsapp.net", "existing")
+                .await
+                .expect("read unrelated row"),
+            Some(b"keep".to_vec())
+        );
+        assert_eq!(
+            backend
+                .delete_expired_pending_inbound(i64::MAX)
+                .await
+                .expect("count remaining rows"),
+            1,
+            "only the unrelated row should remain"
+        );
     }
 
     #[tokio::test]
@@ -911,6 +1091,86 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn noise_cert_policy_setter_stores_per_builder_value() {
+        let strict = ClientBuilder::new();
+        assert_eq!(
+            strict.noise_cert_policy,
+            NoiseCertPolicy::default(),
+            "fresh builder carries the default policy"
+        );
+        let bypass =
+            ClientBuilder::new().with_noise_cert_policy(NoiseCertPolicy::DangerSkipCertChainVerify);
+        assert_eq!(
+            bypass.noise_cert_policy,
+            NoiseCertPolicy::DangerSkipCertChainVerify
+        );
+        // No shared state: opting one builder in leaves the other alone.
+        assert_eq!(strict.noise_cert_policy, NoiseCertPolicy::default());
+    }
+
+    #[test]
+    fn noise_cert_policy_default_is_strict() {
+        assert_eq!(NoiseCertPolicy::default(), NoiseCertPolicy::Strict);
+    }
+
+    #[tokio::test]
+    async fn noise_cert_policy_reaches_the_built_client() {
+        let strict = complete_builder()
+            .await
+            .build()
+            .await
+            .expect("build")
+            .into_client();
+        assert_eq!(strict.noise_cert_policy, NoiseCertPolicy::default());
+        strict.signal_shutdown_sync();
+
+        let bypass = complete_builder()
+            .await
+            .with_noise_cert_policy(NoiseCertPolicy::DangerSkipCertChainVerify)
+            .build()
+            .await
+            .expect("build")
+            .into_client();
+        assert_eq!(
+            bypass.noise_cert_policy,
+            NoiseCertPolicy::DangerSkipCertChainVerify
+        );
+        bypass.signal_shutdown_sync();
+    }
+
+    #[tokio::test]
+    async fn history_sync_admission_reaches_the_built_client() {
+        let decisions = Arc::new(AtomicUsize::new(0));
+        let client = complete_builder()
+            .await
+            .with_history_sync_admission(CountingHistorySyncAdmission {
+                decisions: Arc::clone(&decisions),
+            })
+            .build()
+            .await
+            .expect("build")
+            .into_parts()
+            .0;
+
+        let admission = client
+            .history_sync_admission
+            .as_ref()
+            .expect("builder-installed history-sync admission");
+        assert_eq!(
+            admission.decide(&crate::HistorySyncMetadata {
+                sync_type: None,
+                chunk_order: None,
+                progress: None,
+                file_length: None,
+                inline_payload_len: None,
+                peer_data_request_session_id: None,
+            }),
+            crate::HistorySyncDecision::Accept
+        );
+        assert_eq!(decisions.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn assembly_is_inert_until_started() {
         let persistence_manager = Arc::new(
@@ -935,7 +1195,9 @@ mod tests {
         assert_eq!(spawns.load(Ordering::SeqCst), 0);
 
         let build = assembly.start();
-        assert_eq!(spawns.load(Ordering::SeqCst), 1);
+        // Two spawns: the LID-PN warm-up, and the startup retention sweep that
+        // reaps rows expired while the process was closed.
+        assert_eq!(spawns.load(Ordering::SeqCst), 2);
         build.into_client().signal_shutdown_sync();
     }
 
@@ -1146,6 +1408,7 @@ mod tests {
             .with_transport_factory(MockTransportFactory::new())
             .with_http_client(MockHttpClient)
             .with_skip_history_sync(true)
+            .with_presence_policy(PresencePolicy::Manual)
             .with_wanted_pre_key_count(123)
             .with_alloc_meter(Arc::clone(&meter))
             .with_background_saver_interval(Duration::from_secs(3600))
@@ -1155,6 +1418,7 @@ mod tests {
         let client = build.into_client();
 
         assert!(client.skip_history_sync_enabled());
+        assert_eq!(client.presence_policy(), PresencePolicy::Manual);
         assert_eq!(client.wanted_pre_key_count(), 123);
         assert!(
             client
@@ -1163,7 +1427,9 @@ mod tests {
                 .is_some_and(|installed| Arc::ptr_eq(installed, &meter))
         );
         assert!(client.saver_handle.get().is_some());
-        assert_eq!(spawns.load(Ordering::SeqCst), 3);
+        // LID-PN warm-up, the startup retention sweep, and the background
+        // saver.
+        assert_eq!(spawns.load(Ordering::SeqCst), 4);
         client.signal_shutdown_sync();
     }
 

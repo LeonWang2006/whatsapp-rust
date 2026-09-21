@@ -1,5 +1,6 @@
 use e2e_tests::{TestClient, text_msg};
 use log::info;
+use wacore::client::context::SendContextResolver;
 use wacore::types::events::Event;
 use whatsapp_rust::Jid;
 use whatsapp_rust::NodeFilter;
@@ -243,7 +244,12 @@ async fn test_group_promote_and_demote_admin() -> anyhow::Result<()> {
     info!("Group created: {group_jid}");
 
     // Verify B is NOT an admin initially
-    let metadata = client_a.client.groups().get_metadata(&group_jid).await?;
+    let mut metadata = client_a.client.groups().fetch_metadata(&group_jid).await?;
+    client_a
+        .client
+        .groups()
+        .resolve_participant_addresses(&mut metadata)
+        .await;
     let b_is_admin = find_participant_admin_status(&metadata, &jid_b);
     assert_eq!(
         b_is_admin,
@@ -261,7 +267,12 @@ async fn test_group_promote_and_demote_admin() -> anyhow::Result<()> {
     info!("Promoted B to admin");
 
     // Verify B is now an admin
-    let metadata = client_a.client.groups().get_metadata(&group_jid).await?;
+    let mut metadata = client_a.client.groups().fetch_metadata(&group_jid).await?;
+    client_a
+        .client
+        .groups()
+        .resolve_participant_addresses(&mut metadata)
+        .await;
     let b_is_admin = find_participant_admin_status(&metadata, &jid_b);
     assert_eq!(
         b_is_admin,
@@ -279,7 +290,12 @@ async fn test_group_promote_and_demote_admin() -> anyhow::Result<()> {
     info!("Demoted B from admin");
 
     // Verify B is no longer an admin
-    let metadata = client_a.client.groups().get_metadata(&group_jid).await?;
+    let mut metadata = client_a.client.groups().fetch_metadata(&group_jid).await?;
+    client_a
+        .client
+        .groups()
+        .resolve_participant_addresses(&mut metadata)
+        .await;
     let b_is_admin = find_participant_admin_status(&metadata, &jid_b);
     assert_eq!(
         b_is_admin,
@@ -391,7 +407,7 @@ async fn test_group_settings() -> anyhow::Result<()> {
     info!("Group created: {group_jid}");
 
     // Verify initial state
-    let metadata = client_a.client.groups().get_metadata(&group_jid).await?;
+    let metadata = client_a.client.groups().fetch_metadata(&group_jid).await?;
     assert!(!metadata.is_locked, "Group should not be locked initially");
     assert!(
         !metadata.is_announcement,
@@ -417,7 +433,7 @@ async fn test_group_settings() -> anyhow::Result<()> {
         .groups()
         .set_locked(&group_jid, true)
         .await?;
-    let metadata = client_a.client.groups().get_metadata(&group_jid).await?;
+    let metadata = client_a.client.groups().fetch_metadata(&group_jid).await?;
     assert!(
         metadata.is_locked,
         "Group should be locked after set_locked(true)"
@@ -429,7 +445,7 @@ async fn test_group_settings() -> anyhow::Result<()> {
         .groups()
         .set_locked(&group_jid, false)
         .await?;
-    let metadata = client_a.client.groups().get_metadata(&group_jid).await?;
+    let metadata = client_a.client.groups().fetch_metadata(&group_jid).await?;
     assert!(
         !metadata.is_locked,
         "Group should be unlocked after set_locked(false)"
@@ -442,7 +458,7 @@ async fn test_group_settings() -> anyhow::Result<()> {
         .groups()
         .set_announce(&group_jid, true)
         .await?;
-    let metadata = client_a.client.groups().get_metadata(&group_jid).await?;
+    let metadata = client_a.client.groups().fetch_metadata(&group_jid).await?;
     assert!(
         metadata.is_announcement,
         "Announcement should be on after set_announce(true)"
@@ -454,7 +470,7 @@ async fn test_group_settings() -> anyhow::Result<()> {
         .groups()
         .set_announce(&group_jid, false)
         .await?;
-    let metadata = client_a.client.groups().get_metadata(&group_jid).await?;
+    let metadata = client_a.client.groups().fetch_metadata(&group_jid).await?;
     assert!(
         !metadata.is_announcement,
         "Announcement should be off after set_announce(false)"
@@ -467,7 +483,7 @@ async fn test_group_settings() -> anyhow::Result<()> {
         .groups()
         .set_ephemeral(&group_jid, 86400)
         .await?;
-    let metadata = client_a.client.groups().get_metadata(&group_jid).await?;
+    let metadata = client_a.client.groups().fetch_metadata(&group_jid).await?;
     assert_eq!(
         metadata.ephemeral.and_then(|settings| settings.expiration),
         Some(86400),
@@ -480,7 +496,7 @@ async fn test_group_settings() -> anyhow::Result<()> {
         .groups()
         .set_ephemeral(&group_jid, 604800)
         .await?;
-    let metadata = client_a.client.groups().get_metadata(&group_jid).await?;
+    let metadata = client_a.client.groups().fetch_metadata(&group_jid).await?;
     assert_eq!(
         metadata.ephemeral.and_then(|settings| settings.expiration),
         Some(604800),
@@ -493,7 +509,7 @@ async fn test_group_settings() -> anyhow::Result<()> {
         .groups()
         .set_ephemeral(&group_jid, 0)
         .await?;
-    let metadata = client_a.client.groups().get_metadata(&group_jid).await?;
+    let metadata = client_a.client.groups().fetch_metadata(&group_jid).await?;
     assert_eq!(
         metadata
             .ephemeral
@@ -510,7 +526,7 @@ async fn test_group_settings() -> anyhow::Result<()> {
         .groups()
         .set_membership_approval(&group_jid, MembershipApprovalMode::On)
         .await?;
-    let metadata = client_a.client.groups().get_metadata(&group_jid).await?;
+    let metadata = client_a.client.groups().fetch_metadata(&group_jid).await?;
     assert!(
         metadata.membership_approval,
         "Membership approval should be on"
@@ -522,7 +538,7 @@ async fn test_group_settings() -> anyhow::Result<()> {
         .groups()
         .set_membership_approval(&group_jid, MembershipApprovalMode::Off)
         .await?;
-    let metadata = client_a.client.groups().get_metadata(&group_jid).await?;
+    let metadata = client_a.client.groups().fetch_metadata(&group_jid).await?;
     assert!(
         !metadata.membership_approval,
         "Membership approval should be off"
@@ -733,13 +749,14 @@ async fn test_per_device_sender_key_tracking() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// E1 — regression test for PR #579 Fix 1: after `query_info` on an LID-mode
-/// group, each LID participant's PN must be present in `lid_pn_cache`.
+/// E1 — regression test for PR #579 Fix 1: after resolving an LID-mode group
+/// through the public send-context resolver, each LID participant's PN must
+/// be present in `lid_pn_cache`.
 /// This closes the silent-observer zombie loop where `invalidate_device_cache`
 /// couldn't resolve a participant's PN alias because the mapping was never
 /// learned from a message (matches WA Web's `CreateOrReplaceDisplayNamesAndLidPnMappings`).
 #[tokio::test]
-async fn test_query_info_populates_lid_pn_cache_for_participants() -> anyhow::Result<()> {
+async fn test_routing_info_populates_lid_pn_cache_for_participants() -> anyhow::Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
 
     let client_a = TestClient::connect("e2e_grp_lidpn_a").await?;
@@ -765,15 +782,20 @@ async fn test_query_info_populates_lid_pn_cache_for_participants() -> anyhow::Re
         .metadata
         .id;
 
-    // create_group doesn't populate the group cache, so the first query_info
-    // hits the network and runs the lid_pn_cache populate loop.
-    let _info = client_a.client.groups().query_info(&group_jid).await?;
+    // create_group doesn't populate the group cache, so the first resolve
+    // hits the network and runs the lid_pn_cache populate loop. The public
+    // send-context resolver delegates to the crate-internal routing cache,
+    // so this exercises the real routing path without widening its API.
+    let _info = client_a
+        .client
+        .resolve_group_routing_info(&group_jid)
+        .await?;
 
     let entry = client_a
         .client
         .get_lid_pn_entry(&jid_b_lid)
         .await?
-        .expect("lid_pn_cache must have B's mapping after query_info");
+        .expect("lid_pn_cache must have B's mapping after resolve");
     assert_eq!(&*entry.lid, jid_b_lid.user.as_str());
     assert_eq!(&*entry.phone_number, jid_b_pn.user.as_str());
 

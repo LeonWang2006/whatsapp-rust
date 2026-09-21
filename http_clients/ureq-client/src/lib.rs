@@ -22,19 +22,33 @@ const MAX_IDLE_CONNECTIONS: u64 = 3;
 
 /// HTTP client implementation using `ureq` for synchronous HTTP requests.
 /// Since `ureq` is blocking, all requests are wrapped in `tokio::task::spawn_blocking`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct UreqHttpClient {
     agent: ureq::Agent,
     /// Total-bytes cap for both [`UreqHttpClient::execute`] and the reader from
     /// [`UreqHttpClient::execute_streaming`]. Bounds an in-memory sink so a
     /// hostile CDN can't drive it to OOM; defaults to WA's 2 GiB max file size.
     max_body_bytes: u64,
-    /// Best-effort pool footprint for `resource_report`. `None` when a custom
-    /// agent is supplied (its buffer/pool config is opaque to us).
-    pool_report: Option<HttpResourceReport>,
+    /// Provenance of `agent`: true when built by [`build_agent`]. The pool
+    /// report is a constant of that config, so [`UreqHttpClient::resource_report`]
+    /// reconstructs it instead of storing a copy per client.
+    is_default_agent: bool,
     /// Set by the first request. Shared, because cloning shares the agent and
     /// therefore the pool. Read by [`UreqHttpClient::resource_report`].
     requested: Arc<AtomicBool>,
+}
+
+// Manual `Debug` so the `pool_report` field below keeps rendering exactly what
+// the stored `Option<HttpResourceReport>` used to render.
+impl std::fmt::Debug for UreqHttpClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UreqHttpClient")
+            .field("agent", &self.agent)
+            .field("max_body_bytes", &self.max_body_bytes)
+            .field("pool_report", &self.stored_pool_report())
+            .field("requested", &self.requested)
+            .finish()
+    }
 }
 
 /// Pool footprint of the default agent once it has connected: each idle
@@ -75,13 +89,19 @@ fn mark_if_dispatchable<Any>(requested: &AtomicBool, req: &ureq::RequestBuilder<
     let Some(headers) = req.headers_ref() else {
         return;
     };
-    // Mirrors ureq's own rule byte for byte (`ureq_proto`'s `Call::new` compares
-    // the whole header value to `close`), because the question here is what ureq
-    // will do with the socket, not what the RFC lets a caller write.
+    // Mirrors ureq's own rule (`ureq_proto`'s `Call::new` asks its
+    // `HeaderIterExt::has` for the `close` token), because the question here is
+    // what ureq will do with the socket, not what the RFC lets a caller write.
+    // `has` reads `Connection` as the comma-separated token list RFC 9110 says
+    // it is: each element trimmed and compared case-insensitively. `keep-alive,
+    // close` therefore closes the connection, which the earlier whole-value
+    // comparison against `close` got wrong.
     let pools = !headers
         .get_all(ureq::http::header::CONNECTION)
         .iter()
-        .any(|value| value.as_bytes() == b"close");
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|element| element.trim().eq_ignore_ascii_case("close"));
     let dispatchable = pools
         && ureq::http::Uri::try_from(url).is_ok_and(|uri| {
             uri.authority().is_some() && matches!(uri.scheme_str(), Some("http" | "https"))
@@ -96,7 +116,7 @@ impl UreqHttpClient {
         Self {
             agent: build_agent(),
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
-            pool_report: Some(default_pool_report()),
+            is_default_agent: true,
             requested: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -110,7 +130,7 @@ impl UreqHttpClient {
             agent,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             // A custom agent's buffer/pool sizes are opaque — don't guess.
-            pool_report: None,
+            is_default_agent: false,
             requested: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -121,6 +141,13 @@ impl UreqHttpClient {
     pub fn with_max_body_bytes(mut self, max_body_bytes: u64) -> Self {
         self.max_body_bytes = max_body_bytes;
         self
+    }
+
+    /// The constant report a stored field used to hold: the default agent's
+    /// pool footprint, or `None` for a caller-supplied agent whose buffer/pool
+    /// config is opaque to us.
+    fn stored_pool_report(&self) -> Option<HttpResourceReport> {
+        self.is_default_agent.then(default_pool_report)
     }
 }
 
@@ -349,7 +376,7 @@ impl HttpClient for UreqHttpClient {
     /// reached us, since agents share their pool with every clone, so its pool
     /// is as opaque as its buffer sizes and stays unreported.
     fn resource_report(&self) -> Option<HttpResourceReport> {
-        let pool_report = self.pool_report?;
+        let pool_report = self.stored_pool_report()?;
         if !self.requested.load(Ordering::Relaxed) {
             return Some(EMPTY_POOL_REPORT);
         }
@@ -637,6 +664,60 @@ mod tests {
         }
     }
 
+    /// The pool report is a constant of the agent's provenance, not per-client
+    /// state: a provenance flag plus the shared request latch reconstruct the
+    /// same answers the stored `Option<HttpResourceReport>` used to hold.
+    #[test]
+    fn provenance_reconstructs_the_stored_report() {
+        assert_eq!(
+            UreqHttpClient::new().resource_report(),
+            Some(EMPTY_POOL_REPORT)
+        );
+        assert_eq!(
+            UreqHttpClient::new()
+                .with_max_body_bytes(1024)
+                .resource_report(),
+            Some(EMPTY_POOL_REPORT)
+        );
+        assert_eq!(
+            UreqHttpClient::with_agent(build_agent()).resource_report(),
+            None
+        );
+        assert_eq!(
+            UreqHttpClient::new().stored_pool_report(),
+            Some(default_pool_report())
+        );
+        assert_eq!(
+            UreqHttpClient::with_agent(build_agent()).stored_pool_report(),
+            None
+        );
+
+        // The flag (+ cap + shared latch) stays smaller than the stored
+        // `Option<HttpResourceReport>` it replaces; the 24-byte overhead
+        // below only holds where `usize` is 8 bytes.
+        assert!(
+            size_of::<UreqHttpClient>()
+                < size_of::<ureq::Agent>() + size_of::<Option<HttpResourceReport>>(),
+            "provenance flag must stay smaller than the stored report it replaces"
+        );
+        // Budget on top of the contract above: our own overhead floats with
+        // the compiler layout, so only growth past 24 fails. Rebaseline per
+        // [layout asserts](../../../agent_docs/layout_asserts.md).
+        #[cfg(target_pointer_width = "64")]
+        assert!(
+            size_of::<UreqHttpClient>() <= size_of::<ureq::Agent>() + 24,
+            "client overhead grew to {} B past the agent (budget 24)",
+            size_of::<UreqHttpClient>() - size_of::<ureq::Agent>()
+        );
+
+        // `Debug` still renders the reconstructed `pool_report` field.
+        assert!(format!("{:?}", UreqHttpClient::new()).contains("pool_report: Some("));
+        assert!(
+            format!("{:?}", UreqHttpClient::with_agent(build_agent()))
+                .contains("pool_report: None")
+        );
+    }
+
     /// A caller-supplied agent is opaque in both directions: its buffer sizes
     /// are unknown, and it may already have connected before it reached us,
     /// because every clone of an agent shares one pool. Answering `Some(0)`
@@ -808,12 +889,12 @@ mod tests {
         );
     }
 
-    /// RFC 9110 lets `Connection` carry a token list, and ureq does not read one
-    /// — it compares the whole value to `close`. The estimate deliberately
-    /// follows ureq rather than the RFC, so this pins the pair together: widen
-    /// one and this fails until the other widens too.
+    /// RFC 9110 lets `Connection` carry a token list, and ureq reads it as one:
+    /// `keep-alive, close` contains the `close` token, so the connection is not
+    /// pooled. This pins our estimate to ureq's rule, since the estimate is a
+    /// claim about what ureq did with the socket.
     #[tokio::test(flavor = "current_thread")]
-    async fn a_token_list_close_is_pooled_by_ureq_and_reported_as_pooled() {
+    async fn a_token_list_close_is_not_pooled_by_ureq() {
         let (url, accepted) = spawn_keep_alive_server();
         let client = UreqHttpClient::new();
         for _ in 0..2 {
@@ -825,8 +906,34 @@ mod tests {
 
         assert_eq!(
             accepted.load(Ordering::Relaxed),
+            2,
+            "a token list containing `close` must not reuse a pooled connection"
+        );
+        assert_eq!(
+            client.resource_report().and_then(|r| r.pool_buffer_bytes),
+            Some(0),
+            "nothing was pooled, so the estimate must not claim the cap"
+        );
+    }
+
+    /// The other half of the token-list rule: a list without `close` still
+    /// pools. `close` has to be matched as a whole token, so `keep-alive` and a
+    /// value like `closer` must not be read as a close.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_token_list_without_close_is_pooled_by_ureq() {
+        let (url, accepted) = spawn_keep_alive_server();
+        let client = UreqHttpClient::new();
+        for _ in 0..2 {
+            client
+                .execute(get(url.clone()).with_header("connection", "keep-alive, closer"))
+                .await
+                .expect("the request to answer");
+        }
+
+        assert_eq!(
+            accepted.load(Ordering::Relaxed),
             1,
-            "ureq pooled a token-list close; the estimate below assumes it did"
+            "no `close` token means the connection is pooled and reused"
         );
         assert_eq!(
             client.resource_report().and_then(|r| r.pool_connections),

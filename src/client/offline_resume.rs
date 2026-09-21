@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use futures::FutureExt;
 use log::{debug, warn};
 use wacore_binary::Node;
 use wacore_binary::builder::NodeBuilder;
@@ -31,6 +32,15 @@ const BATCH_SIZE: u32 = 200;
 /// Mirrors `WAWebOfflineHandler.S = 100`.
 const REQUEST_DEBOUNCE: Duration = Duration::from_millis(100);
 
+/// Mirrors `WAWebOfflineResumeConst.OFFLINE_STANZA_TIMEOUT_MS = 60000`: the
+/// blocking resume manager arms a `ShiftTimer` on the first preview, shifts it
+/// on every offline stanza, and on expiry completes the session itself.
+const STANZA_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Parked in `stanza_activity` by the watchdog that completes a stalled drain,
+/// so a stanza racing that decision loses the CAS instead of being ignored.
+const INACTIVE_CLAIMED: u64 = u64::MAX;
+
 #[derive(Default)]
 pub(crate) struct OfflineBatchCoordinator {
     armed: AtomicBool,
@@ -39,6 +49,12 @@ pub(crate) struct OfflineBatchCoordinator {
     /// stanza of that batch's response. CAS-gated so concurrent arrivals
     /// deterministically elect a single "first arrival" winner per cycle.
     prev_batch_inflight: AtomicBool,
+    /// Bumped by every offline stanza. Stands in for WA Web's `ShiftTimer`
+    /// re-arm (`$13`): the watchdog compares the counter across a sleep
+    /// instead of reading a clock per stanza, which costs one relaxed
+    /// increment on the receive path and in exchange lets the timeout fire
+    /// anywhere in [timeout, 2 * timeout) after the last stanza.
+    stanza_activity: AtomicU64,
 }
 
 impl OfflineBatchCoordinator {
@@ -52,10 +68,43 @@ impl OfflineBatchCoordinator {
         self.prev_batch_inflight.store(false, Ordering::Release);
     }
 
+    /// Disarm and report whether this call is the one that did it. The
+    /// teardown paths use it as a once-guard for the interrupted-resume
+    /// event, so a second teardown (or a `connect()` that follows one) stays
+    /// silent.
+    pub(crate) fn take_armed(&self) -> bool {
+        self.armed.swap(false, Ordering::AcqRel)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_armed(&self) -> bool {
+        self.armed.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn stanza_activity(&self) -> u64 {
+        self.stanza_activity.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn note_stanza_activity(&self) {
+        self.stanza_activity.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Claim a drain as inactive, but only if no stanza has arrived since
+    /// `seen`. A bump landing between the watchdog's read and its decision
+    /// fails the CAS, so a drain that is still being fed is never completed
+    /// behind the server's back. The sentinel it parks on is never a value
+    /// `note_stanza_activity` can reach from a fresh `arm()`.
+    fn try_claim_inactive(&self, seen: u64) -> bool {
+        self.stanza_activity
+            .compare_exchange(seen, INACTIVE_CLAIMED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
     fn arm(&self, generation: u64) {
         // Set inner state first; `armed` is published last so readers that
         // observe armed=true also see the matching generation and inflight.
         self.generation.store(generation, Ordering::Release);
+        self.stanza_activity.store(0, Ordering::Release);
         self.prev_batch_inflight.store(true, Ordering::Release);
         self.armed.store(true, Ordering::Release);
     }
@@ -100,11 +149,77 @@ pub(crate) async fn send_first_batch(client: Arc<Client>, total: usize) {
         total,
         BATCH_SIZE,
     );
+    spawn_inactivity_watchdog(Arc::clone(&client), generation, STANZA_INACTIVITY_TIMEOUT);
     // arm() already published prev_batch_inflight=true. Do NOT republish after
     // the await: an arrival (primer) processed concurrently with this send may
     // have legitimately won the CAS already, and republishing would let a
     // second arrival win again and schedule a duplicate continuation.
     let _ = send_batch(&client, BATCH_SIZE).await;
+}
+
+/// WA Web's `ShiftTimer` (`WAWebBlockingOfflineResumeManager.$12`/`$13`): a
+/// drain the server stops feeding is completed by the client rather than left
+/// open, so consumers of the completion signal are never stranded on a stall.
+/// Bounded by the connection generation, since a drain that ends with the
+/// connection is reported as interrupted instead.
+pub(crate) fn spawn_inactivity_watchdog(client: Arc<Client>, generation: u64, timeout: Duration) {
+    let runtime = client.runtime.clone();
+    // Subscribed at the spawn, for the connection whose generation this
+    // watchdog was armed with — subscribing inside the task would pick up
+    // whatever notifier a teardown had already installed.
+    let shutdown = client.connection_shutdown_signal();
+    runtime
+        .spawn(Box::pin(async move {
+            let mut seen = client.offline_batch.stanza_activity();
+            loop {
+                // Raced rather than merely re-checked after waking: the window
+                // is a minute long, so on a teardown this task otherwise stays
+                // scheduled — holding the whole client graph alive through its
+                // `Arc` — for up to that long after the connection it belongs
+                // to is gone, once per connection. The checks below are
+                // unchanged and still decide everything; this only stops the
+                // waiting early.
+                futures::select! {
+                    _ = client.runtime.sleep(timeout).fuse() => {}
+                    _ = wacore::runtime::wait_for_shutdown(&shutdown).fuse() => return,
+                }
+                if !client.offline_batch.is_armed_for(generation)
+                    || client.connection_generation.load(Ordering::Acquire) != generation
+                    || client.offline_sync_completed.load(Ordering::Acquire)
+                {
+                    return;
+                }
+                let current = client.offline_batch.stanza_activity();
+                if current != seen {
+                    seen = current;
+                    continue;
+                }
+                if !client.offline_batch.try_claim_inactive(seen) {
+                    // A stanza arrived while this was deciding; the drain is
+                    // alive after all, so give it another window.
+                    seen = client.offline_batch.stanza_activity();
+                    continue;
+                }
+                let processed = client
+                    .offline_sync_metrics
+                    .processed_messages
+                    .load(Ordering::Acquire);
+                log::warn!(
+                    target: "Client/OfflineResume",
+                    "No offline stanza for {:?}; completing the resume by timeout at {} item(s)",
+                    timeout,
+                    processed,
+                );
+                client
+                    .complete_offline_sync_for_generation(
+                        i32::try_from(processed).unwrap_or(i32::MAX),
+                        generation,
+                    )
+                    .await;
+                return;
+            }
+        }))
+        .detach();
 }
 
 /// Called from `process_node` after the per-stanza `processed_messages` bump.
@@ -116,6 +231,7 @@ pub(crate) fn on_offline_stanza_arrived(client: &Arc<Client>, pending: usize) {
     if !coord.is_armed_for(generation) {
         return;
     }
+    coord.note_stanza_activity();
     if pending == 0 {
         // Server has nothing more for us; let the end marker drive completion.
         return;

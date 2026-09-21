@@ -20,9 +20,9 @@ ignored = ["getrandom"]
 debug-snapshots = []
 # Typed interop with the decoded libsignal SessionRecord v1 model.
 legacy-session-interop = ["wacore-libsignal/legacy-session-interop"]
-# Expose the InMemoryBackend fault-injection / call-count hooks used by the e2e
-# suite. Off by default so normal builds carry no extra fields or per-call
-# bookkeeping. Enabled only from test crates.
+# Shared cryptographic fixtures and InMemoryBackend fault-injection/call-count
+# hooks for tests. Off by default so normal builds carry no test scaffolding
+# or per-call bookkeeping.
 test-util = []
 # Optional observability: emit tracing spans/events. Off by default (no dep).
 tracing = ["dep:tracing"]
@@ -30,14 +30,16 @@ tracing = ["dep:tracing"]
 metrics = ["dep:metrics"]
 # Render raw phone numbers in tracing fields instead of redacted tokens (debug only).
 tracing-pii = ["wacore-binary/tracing-pii"]
-# Disables XEdDSA verification of the server's Noise cert chain. Required
-# for the e2e mock server (self-signed certs). NEVER enable in prod.
-danger-skip-cert-chain-verify = ["wacore-noise/danger-skip-cert-chain-verify"]
 # Enable JS-based random number generation for wasm32 targets.
 # Activates getrandom's wasm_js backend so rand works in the browser.
 js = ["getrandom/wasm_js"]
+# The neutral control-plane media contract: the boundary types and the backend/session traits a
+# media engine implements, with no `voip` type in the API. It carries no engine, no crypto and no
+# codec, so a build that enables it and not `voip` compiles the control plane without the engine.
+# `voip` implies it, because the registry stores a session behind this contract.
+voip-control = []
 # VoIP/calls media crypto (SRTP, SFrame, WAHKDF). Pure, no-Tokio. Off by default.
-voip = ["dep:aes-gcm", "dep:zerocopy"]
+voip = ["voip-control", "dep:aes-gcm", "dep:zerocopy"]
 # Built-in PCM/MLOW adapter. Encoded audio transport needs only `voip`.
 voip-mlow = ["voip"]
 # Heap profiling of the codec hot paths via the `voip_profile` example (dhat as global allocator).
@@ -75,7 +77,6 @@ hkdf = { workspace = true }
 hmac = { workspace = true }
 itoa = { workspace = true }
 log = { workspace = true }
-md5 = "0.8.1"
 metrics = { workspace = true, optional = true }
 portable-atomic = { workspace = true }
 rand = { workspace = true }
@@ -105,6 +106,9 @@ buffa-build = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
+# Compact oracle fixtures; pure Rust, test-only, including on wasm targets.
+ciborium = "0.2.2"
+ruzstd = "0.9.0"
 divan = { workspace = true }
 # Compression only: the runtime inflates through `wacore_binary::zlib_pool`
 # (zlib-rs directly), so flate2 stays out of the release dependency set.
@@ -157,6 +161,10 @@ harness = false
 
 [[bench]]
 name = "media_benchmark"
+harness = false
+
+[[bench]]
+name = "retained_memory_benchmark"
 harness = false
 
 [[bench]]

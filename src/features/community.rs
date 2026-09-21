@@ -15,11 +15,16 @@ use crate::request::IqError;
 use log::warn;
 use thiserror::Error;
 use wacore::iq::groups::{
-    CommunityParticipatingIq, DeleteCommunityIq, GetLinkedGroupsParticipantsIq, GroupCreateOptions,
-    JoinLinkedGroupIq, LinkSubgroupsIq, QueryLinkedGroupIq, UnlinkSubgroupsIq,
+    CommunityParticipatingIq, CommunityParticipatingOverviewIq, DeleteCommunityIq,
+    GetLinkedGroupsParticipantsIq, GroupCreateOptions, JoinGroupResult, JoinLinkedGroupIq,
+    LinkSubgroupsIq, QueryLinkedGroupIq, UnlinkSubgroupsIq,
 };
 use wacore::iq::mex_operations::{fetch_all_subgroups, query_subgroup_participant_count};
 use wacore_binary::Jid;
+
+/// How the subgroup queries say the request came from a user acting now, which
+/// is the only context WA Web sends from the web client.
+const SUBGROUP_QUERY_CONTEXT: &str = "INTERACTIVE";
 
 /// Error returned by community operations.
 #[derive(Debug, Error)]
@@ -37,6 +42,10 @@ pub enum CommunityError {
     /// The request was malformed or the server response was missing required data.
     #[error("invalid community request: {0}")]
     InvalidRequest(String),
+    /// The subgroup join was received but requires membership approval: the
+    /// caller is not in the group yet.
+    #[error("subgroup join requires membership approval: {0}")]
+    MembershipApprovalRequired(Jid),
 }
 
 // Types
@@ -121,17 +130,29 @@ pub struct UnlinkSubgroupsResult {
 }
 
 /// Determine the group type from metadata fields.
+///
+/// A pure projection of [`GroupHierarchy`](crate::GroupHierarchy):
+/// the classification runs through the single canonical normalizer, so this
+/// and overview hierarchies agree by construction instead of reimplementing
+/// flag precedence.
 pub fn group_type(metadata: &GroupMetadata) -> GroupType {
-    if metadata.is_default_sub_group {
-        GroupType::LinkedAnnouncementGroup
-    } else if metadata.is_general_chat {
-        GroupType::LinkedGeneralGroup
-    } else if metadata.parent_group_jid.is_some() {
-        GroupType::LinkedSubgroup
-    } else if metadata.is_parent_group {
-        GroupType::Community
-    } else {
-        GroupType::Default
+    // from_metadata is the canonical normalizer; match on its output rather
+    // than re-reading the flags so precedence lives in exactly one place.
+    let hierarchy = crate::features::groups::GroupHierarchy::from_metadata(metadata);
+    // Exhaustive on purpose: this match lives in the crate that defines the
+    // enums, so `#[non_exhaustive]` does not require a wildcard here. Leaving
+    // one out means a future `GroupHierarchy`/`SubgroupKind` variant forces a
+    // classification decision instead of silently defaulting.
+    match hierarchy {
+        crate::features::groups::GroupHierarchy::Standalone => GroupType::Default,
+        crate::features::groups::GroupHierarchy::Community => GroupType::Community,
+        crate::features::groups::GroupHierarchy::Subgroup { kind, .. } => match kind {
+            crate::features::groups::SubgroupKind::Announcement => {
+                GroupType::LinkedAnnouncementGroup
+            }
+            crate::features::groups::SubgroupKind::General => GroupType::LinkedGeneralGroup,
+            crate::features::groups::SubgroupKind::Regular => GroupType::LinkedSubgroup,
+        },
     }
 }
 
@@ -303,7 +324,11 @@ impl<'a> Community<'a> {
             .mex()
             .query(mex_request!(fetch_all_subgroups {
                 group_id: Some(community_jid.to_string()),
-                ..Default::default()
+                query_context: Some(SUBGROUP_QUERY_CONTEXT.to_string()),
+                // WA Web names a subgroup the user has already joined here, to
+                // steer which subgroups come back first. There is no such hint
+                // to give from this API, and WA Web omits it in that case too.
+                sub_group_hint_id: None,
             }))
             .await?;
 
@@ -338,12 +363,36 @@ impl<'a> Community<'a> {
         Ok(subgroups)
     }
 
-    /// Fetch all parent groups the account currently participates in.
-    pub async fn get_participating(
+    /// List every parent community the account participates in as slim overviews.
+    ///
+    /// Always hits the network (one `participating` IQ sent as the overview
+    /// projection: no `<participants>` / `<description>` children requested)
+    /// and parses only id, subject, size, and the community-hierarchy flags
+    /// per community — participants are never collected. For full metadata use
+    /// [`Community::fetch_participating_metadata`].
+    pub async fn list_participating(
+        &self,
+    ) -> Result<Vec<crate::features::groups::GroupOverview>, CommunityError> {
+        let response = self
+            .client
+            .execute(CommunityParticipatingOverviewIq::new())
+            .await?;
+        Ok(response
+            .groups
+            .iter()
+            .map(crate::features::groups::GroupOverview::from_overview_data)
+            .collect())
+    }
+
+    /// Fetch full metadata for every parent community the account participates
+    /// in. Always hits the network; protocol data only, no LID/PN backfill —
+    /// call [`Groups::resolve_participant_addresses`](crate::features::groups::Groups::resolve_participant_addresses)
+    /// per result when PN-keyed display data is needed.
+    pub async fn fetch_participating_metadata(
         &self,
     ) -> Result<std::collections::HashMap<Jid, GroupMetadata>, CommunityError> {
         let response = self.client.execute(CommunityParticipatingIq::new()).await?;
-        let mut result: std::collections::HashMap<Jid, GroupMetadata> = response
+        let result: std::collections::HashMap<Jid, GroupMetadata> = response
             .groups
             .into_iter()
             .map(|community| {
@@ -351,10 +400,6 @@ impl<'a> Community<'a> {
                 (id, GroupMetadata::from(community))
             })
             .collect();
-
-        for metadata in result.values_mut() {
-            self.client.groups().fill_participant_pns(metadata).await;
-        }
 
         Ok(result)
     }
@@ -370,7 +415,8 @@ impl<'a> Community<'a> {
             .query(mex_request!(query_subgroup_participant_count {
                 input: Some(query_subgroup_participant_count::Input {
                     group_jid: Some(community_jid.to_string()),
-                    ..Default::default()
+                    query_context: Some(SUBGROUP_QUERY_CONTEXT.to_string()),
+                    sub_group_jid_hint: None,
                 }),
             }))
             .await?;
@@ -425,6 +471,11 @@ impl<'a> Community<'a> {
     }
 
     /// Join a linked subgroup via the parent community.
+    ///
+    /// The join RPC itself carries no metadata (WA Web's success variants hold
+    /// no fields), so a joined result is followed by a metadata query. An
+    /// approval-pending join is reported rather than resolved: the caller is
+    /// not in the group, so there is no metadata to return.
     pub async fn join_subgroup(
         &self,
         community_jid: impl Into<Jid>,
@@ -432,11 +483,18 @@ impl<'a> Community<'a> {
     ) -> Result<GroupMetadata, CommunityError> {
         let community_jid = &community_jid.into();
         let subgroup_jid = &subgroup_jid.into();
-        let response = self
+        match self
             .client
             .execute(JoinLinkedGroupIq::new(community_jid, subgroup_jid))
-            .await?;
-        Ok(GroupMetadata::from(response))
+            .await?
+        {
+            JoinGroupResult::Joined(_) => {
+                self.query_linked_group(community_jid, subgroup_jid).await
+            }
+            JoinGroupResult::PendingApproval(jid) => {
+                Err(CommunityError::MembershipApprovalRequired(jid))
+            }
+        }
     }
 
     /// Get all participants across all linked groups of a community.
@@ -539,6 +597,63 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn community_jid() -> Jid {
+        "120363000000000001@g.us"
+            .parse()
+            .expect("fictitious community")
+    }
+
+    /// Regression for the same 400 as the newsletter queries: WhatsApp Web
+    /// always sends `query_context`, and only leaves `sub_group_hint_id` out
+    /// when it has no joined subgroup to name, which is this client's case.
+    #[test]
+    fn subgroup_listing_sends_the_query_context_and_omits_only_the_hint() {
+        let request = mex_request!(fetch_all_subgroups {
+            group_id: Some(community_jid().to_string()),
+            query_context: Some(SUBGROUP_QUERY_CONTEXT.to_string()),
+            sub_group_hint_id: None,
+        });
+
+        assert_eq!(
+            request.missing_variables().expect("serialize"),
+            vec!["sub_group_hint_id"]
+        );
+        assert_eq!(
+            serde_json::to_value(&request.variables).expect("serialize"),
+            serde_json::json!({
+                "group_id": "120363000000000001@g.us",
+                "query_context": "INTERACTIVE",
+            })
+        );
+    }
+
+    /// The participant count carries the same context, one level down inside
+    /// `input`, where the compiler cannot force the decision.
+    #[test]
+    fn participant_count_input_carries_the_query_context() {
+        let request = mex_request!(query_subgroup_participant_count {
+            input: Some(query_subgroup_participant_count::Input {
+                group_jid: Some(community_jid().to_string()),
+                query_context: Some(SUBGROUP_QUERY_CONTEXT.to_string()),
+                sub_group_jid_hint: None,
+            }),
+        });
+
+        assert_eq!(
+            request.missing_variables().expect("serialize"),
+            Vec::<&str>::new()
+        );
+        assert_eq!(
+            serde_json::to_value(&request.variables).expect("serialize"),
+            serde_json::json!({
+                "input": {
+                    "group_jid": "120363000000000001@g.us",
+                    "query_context": "INTERACTIVE",
+                }
+            })
+        );
+    }
 
     #[test]
     fn subgroup_parser_preserves_typed_metadata() {

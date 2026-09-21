@@ -48,10 +48,17 @@ travel to the socket as `SendObservers`, so the next observer plugs in there
 instead of widening `do_handshake` again.
 
 It also owns the activity timestamps the keepalive dead-socket watchdog reads:
-`last_data_received_ms` (one clock read per received transport event, plus one
+`last_data_received` (one clock read per received transport event, plus one
 more when that event carries several frames, so a slow drain is not read as
-silence) and `first_send_since_recv_ms`, which every frame loads but only the
-send that arms or re-arms the anchor spends a clock read on. There
+silence) and `first_send_since_recv`, which every frame loads but only the
+send that arms or re-arms the anchor spends a clock read on. Both are held as
+`wacore::time::AtomicInstant` (an atomic slot carrying a `wacore::time::Instant`
+or nothing), never wall-clock stamps: the watchdog asks how much
+time passed, and a wall clock answers that with whatever the system clock was
+last set to, so a laptop resuming from suspend used to kill a socket it had
+authenticated seconds earlier. `StatsSnapshot::last_data_received_ms` still
+reports a wall-clock instant, derived from the monotonic anchor when the
+snapshot is taken rather than stamped on the wire path. There
 is deliberately no "last send" timestamp: nothing in the core reads one, and it
 cost a clock read on every frame written, which is the client's hottest path
 and a call out of the module on wasm32/embedded. `frames_sent` answers "is it
@@ -70,6 +77,12 @@ dropped and the send continues, which is parity with WA Web and is not up for
 change; what these answer is *how often it happens*, which is the difference
 between "the session repair worked" and a screenshot of a chat stuck on
 "Waiting for this message".
+
+These are process-wide totals, so they say a device went unkeyed somewhere but
+never which message lost it. The per-message question is answered by
+`SendResult::recipient_fanout` (`RecipientFanout`), which a DM fills in with how
+many recipient devices it addressed, how many encrypted, and whether the
+recipient's primary device was among the ones that did not.
 
 **Per attempt, not per delivered stanza**, and the distinction is not academic:
 a batch-wide `406` and a `Required` distribution that cannot reach every target
@@ -142,15 +155,52 @@ Walks every internal collection and returns entry counts plus estimated
 retained bytes (`MemoryReport`, per-collection `CollectionStats`). Byte
 figures come from the `wacore::stats::HeapSize` trait:
 
-- Signal records use their protobuf encoded size (`SessionRecord::
-  estimated_size`, buffa `compute_size` — no encode buffer allocated).
-- Collections sum key/payload capacities (`GroupInfo`, `DeviceListRecord`,
-  `LidPnEntry`, `ResolvedGroupDevices`, ...).
+- Signal records walk their live structures (`SessionRecord::estimated_size`,
+  `SenderKeyRecord::estimated_size`) — struct sizes, `Vec` capacities and the
+  bytes each field points at. Not the protobuf-encoded size, which is what
+  these reported until it was found to understate a session carrying skipped
+  message keys by roughly 5x: the encoded form omits both the `Option` slots a
+  seed-only `MessageKey` leaves empty and the `Vec` capacity behind the
+  backlog. Size computation only — no encode buffer is allocated.
+- Collections sum key/payload capacities (`GroupRoutingInfo`, `DeviceListRecord`,
+  `LidPnEntry`, `ResolvedGroupDevices`, ...). Where a report charges for a hash
+  table's slots it should go through `wacore::stats::hash_table_bytes`, which
+  converts a `capacity()` into the buckets hashbrown actually owns: it rounds to
+  a power of two and keeps an eighth free, so `capacity() * size_of::<(K, V)>()`
+  under-counts by up to a half. The device-list memos
+  (`GroupDevicesMemo`/`DmDevicesMemo`), the sender-key device cache and
+  `SignalStoreCache::memory_stats` all use it — the last charges each store's
+  own tables (`UserIndexedCache::overhead_bytes`: the primary map, the user
+  index, the removal ring) plus the dirty/deleted sets and pre-wire gates
+  beside it. Those sets are charged for their **slots only**: their addresses
+  are the cache's own `Arc<str>` keys, which eviction cannot drop while an
+  address is dirty, deleted or pending, so charging the payloads again would
+  double-count them. `sender_keys.bytes` additionally covers
+  `pending_distributions` — table slots, distribution payloads, and the key
+  bytes of pending entries the cache no longer holds — and `sender_keys.entries`
+  counts those pending-only addresses. One overlap is accepted rather than
+  tracked: an address evicted while still pending is charged both as a
+  pending-only key and in the 64-entry removal window that named it, which
+  bounds the overstatement to a handful of addresses.
+  `wacore/tests/hash_table_bytes_matches_the_allocator.rs` checks the conversion
+  against a counting `GlobalAlloc`. After removals the figure is a lower bound
+  rather than exact: hashbrown leaves tombstones that consume growth slots
+  without shrinking the bucket array, so `capacity()` can read below the
+  canonical capacity for the buckets really held.
 - Store-backed caches (Redis etc.) report `bytes: 0` — their entries are not
   process memory.
 - In-flight history sync reports queued/running task count, retained compressed
   payload storage, and lifetime peaks. Inline payloads count while queued;
   external payloads contribute their `Vec` capacity once materialized.
+
+- Inflate state is not in the report: it is per thread, not per client.
+  `wacore_binary::zlib_pool` parks one `zlib_rs::Inflate` (one ~47.5 KB block,
+  state plus the 32 KB window) per thread that ever inflated anything, shared
+  by the one-shot path (`decompress_zlib_pooled`) and the streaming one
+  (`InflateReader`, and `NodeStream` over a compressed frame). A target that
+  cannot spare it sets `set_pool_retention(0)`; one that cannot allocate it
+  late calls `warm_pool()` on the read-loop thread while the heap is fresh.
+  `parked_states()` reports the count for the current thread.
 
 Semantics: honest estimates for attribution and leak detection, not
 byte-exact accounting. The e2e `memory_soak.rs` logs the byte totals next to
@@ -188,7 +238,7 @@ group send depends on, `resolve_group_devices_memoized` and
 `DeviceMemoStats::since` subtracts an earlier snapshot to scope a workload.
 
 The reason it is per-term rather than a hit/miss pair: the group memo has three
-validity terms (entry present, `GroupInfo` `Arc` identity, topology generation
+validity terms (entry present, `GroupRoutingInfo` `Arc` identity, topology generation
 — with a scoped re-stamp between the last two) and the SKDM memo has four stale
 terms (device `Arc`, sender-key-map `Arc`, map generation, sending identity)
 plus the entry-absent condition, which is why it reports five miss counters. An
@@ -260,8 +310,21 @@ Scope caveats: the hook covers tasks spawned *by the client* through the
 future (`Bot::spawn` reaches it via `Runtime::spawn`), so the read loop is
 covered on either launch path. Work executed on the caller's own task (e.g.
 awaiting `send_message`) belongs to the caller — instrument that side
-yourself if you need it. The `voip` feature's media tasks (call driver,
-relay I/O) currently spawn directly on Tokio and are not instrumented.
+yourself if you need it.
+
+VoIP media tasks: the **call driver** is covered. It runs on the client's own
+`Arc<dyn Runtime>` — it has to, since that is the only executor a browser build
+has — so an installed instrument meters it like any other client task. Do not
+add separate attribution for it, or the work is counted twice.
+
+The native relay transport's own I/O is covered too, which this section used to
+deny: `voip-relay-native`'s UDP read task and DTLS/SCTP retransmit timers run
+under `relay_driver`, and `connect_relay_media` spawns it through the runtime
+`RelayMediaChannelFactory` was built with — the client's own, both before and
+after the transport-provider split. So an installed instrument already meters
+the relay, and attributing it separately double-counts it. The only VoIP work
+outside the hook is a transport an installed `RelayTransportProvider` supplies,
+which spawns wherever its author chose.
 
 ## `Client::resource_report()` — out-of-client resource attribution (on demand)
 
@@ -306,7 +369,7 @@ the reason for measuring against one.
 | --- | ---: | ---: |
 | HTTP: pooled TLS connection from the version fetch | 88 KiB | 0 KiB (#1243) |
 | noise: batch buffer after one 60 KiB frame | 60 KiB, vs 8 KiB small-traffic | 8 KiB (#1246) |
-| transport: retained `ClientConfig` | 14 KiB | 9 KiB (#1245) |
+| transport: retained `ClientConfig`, historical construction probe | 14 KiB | 9 KiB at #1245, not a warm-cache measurement |
 | topology log preallocation | 4 KiB | 0 KiB (#1244) |
 
 **The prekey window is a backend artifact, not a per-session cost.** Building a
@@ -333,10 +396,15 @@ and its in-call transient high-water from 63.1 KB to 42.1 KB — but retained is
 bit-identical at 42,072 B either way, because the final table is the same size.
 Reserving is worth it for the allocator traffic; it will never move the 41 KiB.
 
-**The rustls session cache is 5 KiB, not 44.** A whole retained
-`default_tls_connector()` measures 14.0 KiB; disabling resumption entirely takes
-it to 9.0 KiB, and sizing the store for the one host a factory dials takes it to
-9.4 KiB. The other 9 KiB is the config plus the webpki root store.
+**Historical rustls construction measurements.** At #1245, a retained
+`default_tls_connector()` measured 14.0 KiB; disabling resumption measured
+9.0 KiB, and the eight-ticket budget measured 9.4 KiB. These construction
+probes do not establish the footprint after processing session tickets.
+In rustls 0.23.43, that budget immediately evicts the first server-name entry.
+The corrected sixteen-ticket budget retains one name and its ticket deque;
+its empty and populated footprints have not been remeasured. Count an
+explicitly shared configuration once per owner, not once per socket. The
+transport resource estimate covers connection buffers, not this factory cache.
 
 ### Should a residency probe be permanent?
 
@@ -391,10 +459,13 @@ what a component can introspect — absent means "not reported", not zero):
   client holds. A default on an already-implemented sub-trait gives both —
   composable *and* non-breaking. SQLite reports `min(cache cap, db size)` (an
   upper bound on the page cache; Diesel doesn't expose the raw handle needed for
-  `sqlite3_db_status`), plus the DB page count. Remote backends report
+  `sqlite3_db_status`), plus the DB page count, how much of it is on the free
+  list (`freelist_count` — space the retention sweeps emptied that only a
+  `VACUUM` returns to the filesystem), and the `-wal` sidecar's size on disk.
+  Remote backends report
   `memory_bytes: Some(0)`. `InMemoryBackend` sums its own maps (table
-  allocations plus the heap its keys and values own), which is exact rather
-  than a cap, because every byte it holds is this process's heap.
+  allocations plus the heap its keys and values own). This is a retained-byte
+  estimate under the `HeapSize` accounting rules above, not an RSS measurement.
 - **Transport** — `Transport::resource_report() -> Option<TransportResourceReport>`,
   a defaulted method (clean here — `Transport` isn't blanket-impl'd). The Tokio
   WebSocket transport fills best-effort static estimates (tokio-websockets and
@@ -486,6 +557,53 @@ instrumented polls/tasks are counted (the run loop is covered since #963; work
 spawned raw on the runtime — some voip/media paths — is not). Deallocations are
 charged to whichever meter is active at free time, so `allocated` (churn) is the
 reliable signal and `freed`/`net` drift for buffers that outlive their poll.
+
+### Periodic storage maintenance — what the keepalive tick runs
+
+Three cadences hang off the keepalive tick, all driven by the tick itself rather
+than by a successful ping, so a connection with steady inbound traffic (which
+takes the idle-ping early return) still reaches them:
+
+| pass | cadence | what it does |
+| --- | --- | --- |
+| retention sweeps | every 12 ticks (~4.5 min), plus once at startup | `sent_messages`, `pending_inbound_messages`, `base_keys` and `msg_secrets` expiry, sequentially in one task, each through the store's write permit |
+| engine maintenance | ~1 h of ticks | `DeviceStore::maintenance()` — for SQLite, `analysis_limit` + `PRAGMA optimize`, an opportunistic `wal_checkpoint(TRUNCATE)`, and (only when opted in and the DB is already in `auto_vacuum=INCREMENTAL`) a bounded `incremental_vacuum` |
+| session maintenance | ~6 h of ticks | signed pre-key rotation check and the tcToken prune, both of which used to run only at connect |
+
+The retention sweep also runs once from `Client::run_startup_maintenance`, which
+client construction spawns detached in `start_services`. The keepalive cadence
+covers a connection that stays up; startup covers the gap where a process was
+closed long enough for secrets to expire, and the case of an app that opens the
+store without ever holding a connection (a batch job or an inspector), for which
+the keepalive tick may never fire at all. Startup runs the same
+`run_retention_cleanup` body as the tick, minus the pending-inbound prune (see
+below).
+
+Each delete in the sweep acquires and releases the store's write permit on its
+own, through the backend's `with_retry` wrapper; no permit is held across the
+whole sweep. An overlapping startup and keepalive sweep can therefore interleave
+their deletes, and on a store opened with `pool_size > 1` the individual
+operations can overlap outright. That is safe because every delete is idempotent
+and scoped by device and deadline: whichever sweep runs one, the result is the
+same. The startup pass does leave the pending-inbound durability buffer alone,
+because those rows are the only recoverable copy of a message whose hook has not
+committed yet; the keepalive pass, which runs only once the connection is up,
+prunes them.
+
+The last two exist because a process that holds one connection for weeks never
+reruns connect-time work: before them a session outliving the 27-day rotation
+cadence never rotated its signed pre-key, pruned tcTokens exactly once, and let
+the WAL keep whatever size its largest transaction gave it. Failures are logged
+at `warn!` — a sweep that fails every time is how a bounded table quietly stops
+being bounded.
+
+`maintenance()` is a defaulted method on `DeviceStore`, for the same reason
+`resource_report` is. What it must never do is take an exclusive lock on the
+whole database: `VACUUM` (the only thing that returns free-list pages to the
+filesystem) stays an explicit embedder call. The SQLite incremental-vacuum
+support (`SqliteStoreConfig::incremental_vacuum`) is the safe subset: it is
+opt-in, it never switches an existing database out of its mode, and it reclaims
+at most a bounded page count per pass.
 
 ### `SqliteStoreConfig::mmap_size` — page-cache tuning knob
 
@@ -690,12 +808,13 @@ Against that, the two preallocated bounded queues a session owns:
 
 | queue | capacity | payload | retained |
 | --- | ---: | ---: | ---: |
-| `major_sync_task_sender` (`Client::new`) | 32 | 56 B | 2 816 B |
+| `major_sync_task_sender` (`Client::new`) | 8 | 56 B | ~0.5 KiB |
 | transport events (`EVENT_CHANNEL_CAPACITY`, per connection) | 64 | 40 B | 3 840 B |
 
-So the sync queue is ~11% of a constructed client — but a connected session's
-marginal cost is ~530 KiB (see the table further up), against which both queues
-together are ~1.2%. **Neither is worth making lazy.** The sync queue's receiver
+(The sync queue was measured at 2 816 B when its capacity was 32; the 8-slot
+figure is computed, not re-measured.) So the sync queue is ~2% of a constructed
+client — and a connected session's marginal cost is ~530 KiB (see the table
+further up), against which both queues together are under 1%. **Neither is worth making lazy.** The sync queue's receiver
 is handed to `Bot::build` to spawn its worker, so deferring the allocation means
 an `Option` plus a builder handoff that no longer has a receiver to give; the
 transport queue is created by the transport at connect, and every connected
@@ -734,25 +853,35 @@ message can overshoot substantially on its own.
 | collection | bound | what eviction costs |
 | --- | --- | --- |
 | `group_cache` | 1h TTL, 250 | re-query on miss |
-| `device_registry_cache` | 1h TTL, 5 000 | store stays authoritative |
+| `device_registry_cache` | 1h TTL, 20 000 | store stays authoritative |
 | `recent_messages` | 5m TTL, 0 (disabled) | DB is authoritative |
 | `message_retry_counts` | 1h TTL, 500, FIFO | a forgiven `MAX_DECRYPT_RETRIES` — see below |
 | `undecryptable_dispatched` | 5m TTL, 1 000 | a duplicate event |
 | `pdo_pending_requests` / `pdo_requested` | 30s TTL, 200 / 24h TTL, 512 | a repeated PDO request |
 | `sender_key_devices_cache` | 1h TTI, 500 | a redundant SKDM |
 | `session_recreate_history` | 1h TTL, 256 | one un-throttled recreate |
-| `session_locks` / `chat_lanes` / `group_distribution_locks` | 10 000 / 5 000 / 512 | nothing: an `evict_guard` refuses to evict a lock a task holds, so the map briefly exceeds capacity instead of minting a second lock for one key |
+| `session_locks` / `chat_lanes` / `group_distribution_locks` | 10 000 / 5 000 / 512 | nothing: an `evict_guard` refuses to evict a lock a task holds, so the map briefly exceeds capacity instead of minting a second lock for one key. A chat lane's worker, which holds the inbound-message future (~9 KiB) for its whole life, exits after `LANE_IDLE_TIMEOUT` (60 s) of silence; the entry then costs one closed channel until the chat's next message replaces it or FIFO eviction drops it |
 | `resend_rate_limiter` | 4 096, FIFO | fail-open by design — an evicted bucket is recreated full, so undersizing forgives rate, never over-throttles |
 | `group_devices_memo` / `skdm_warm_memo` / `dm_devices_memo` | 64 / 64 / 512 | a recompute |
 | `SignalStoreCache` sessions / identities / sender keys | 2 000 each (+1/8 slack before an eviction scan), *while flushes succeed* | nothing: only *clean* entries are evicted, so an unpersisted record is never dropped — which also means a backend that stops accepting writes leaves everything dirty and the maps grow past the cap. Correct, and the reason to watch the counts rather than trust the number |
 | `SignalStoreCache::sender_key_locks` | 2 000, idle-only | nothing: only locks held solely by the map are dropped |
 | `inbound_commit_batch` | 400 messages / 4 MiB, checked after insert | commits early, no loss; overshoots by one message |
 | `msg_secret_buffer` | 4 096, except on cancellation | nothing: a producer that would exceed it parks on `capacity_available`, and a cancelled one force-buffers past the mark rather than losing captures |
-| device-topology changed-users log | 256 | a memo recompute; overflow can never serve stale data |
+| device-topology changed-users log | 4 096 | a memo recompute; overflow can never serve stale data |
 | `AbPropsCache` | the compile-time `WATCHED` interest set | server props outside it are discarded at parse |
 | `CallRegistry` pre-offer controls / ringing group calls / event queues | 64 entries or 1 MiB each | fail-closed admission |
 | `PendingCallLinkJoins` transitions | 32 | fail-closed |
-| `major_sync_task_sender` / transport events / noise send jobs | 32 / 64 / 8 | backpressure, no loss |
+| `major_sync_task_sender` / transport events / noise send jobs | 8 / 64 / 8 | backpressure, no loss |
+
+**A TTL is a bound only if something sweeps.** `PortableCache` expires lazily:
+an entry leaves on the access that finds it stale or under capacity pressure
+from a new insert, and a quiet connection does neither. So the keepalive's
+~5-minute maintenance tick also runs `Client::run_cache_maintenance`, which
+sweeps every TTL/TTI cache above (store-backed ones expire on their own and
+no-op). Between sweeps `memory_report()` counts include expired entries, which
+is why a count can exceed what a lookup would find; a report taken right after
+a sweep is the exact one. Capacity-only caches are not swept — they have nothing
+to expire.
 
 ### What is unbounded, and why it stays that way
 
@@ -770,14 +899,25 @@ the bound is a drain or a lifecycle, so the count is the only warning available.
   already requested or loses the dedup that keeps a stuck sender from re-asking
   every few seconds. Growth is self-limiting anyway: each new key id costs a peer
   message on the wire.
-- **`pending_device_sync`** — one entry per distinct user seen with an unknown
-  device. Offline entries are drained by `doPendingDeviceSync` at the end of the
-  backlog; entries the *online* path adds are removed only by that same drain or
-  by teardown, so a connection that never drains keeps them for its lifetime,
-  which also suppresses a second immediate refresh for those users. A cap would
-  skip a device refresh and leave the next send to that user addressed to a stale
-  device list, so the fix if this ever matters is a removal on the online path,
-  not a ceiling.
+- **`pending_device_sync`** — one entry per user with a device refresh pending
+  or in flight. Offline entries are drained by `doPendingDeviceSync` at the end
+  of the backlog; an entry the *online* path adds is released by a `scopeguard`
+  when its refresh finishes, so outside a drain the set holds only what is in
+  flight. (It used to hold online entries for the connection's lifetime, which
+  also meant a user who added a second new device weeks later never got another
+  refresh.) A cap would skip a device refresh and leave the next send to that
+  user addressed to a stale device list, so the bound stays the drain.
+- **Chat-lane queues** (`chat_lane_backlog`) — the lanes are capped, their
+  `async_channel::unbounded` queues are not, and each queued message retains
+  its whole inbound frame. The bound is the worker draining it; a backlog that
+  grows is a worker that is stuck (a slow durability hook, a hung decrypt), and
+  the count is the signal. Capping the queue would drop or redeliver messages
+  the server already considers delivered.
+- **`lid_pn_cache` side maps** (`lid_pn_contact_hash_entries`,
+  `lid_pn_persisted_entries`) — unbounded with the cache they index, one entry
+  per identifier and one per persisted pair. Their payload is the entry's own
+  strings, so the report charges them table structure only; that structure is
+  what grows with the contact list, ~10% on top of the entries themselves.
 - **`AppStateProcessor::key_cache`** — expanded app-state keys, one entry per
   distinct key id the server's patches reference, with no cap and no TTL;
   emptied only by `clear_key_cache` on reconnect. The backend stays

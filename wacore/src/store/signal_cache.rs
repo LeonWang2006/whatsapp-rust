@@ -1,6 +1,8 @@
+use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::BuildHasher;
 use std::num::NonZeroU64;
-use std::sync::{Arc, Mutex as SyncMutex, MutexGuard as SyncMutexGuard};
+use std::sync::{Arc, Mutex as SyncMutex, MutexGuard as SyncMutexGuard, OnceLock, Weak};
 
 use anyhow::Result;
 use async_lock::Mutex;
@@ -15,19 +17,197 @@ use crate::store::traits::SignalStore;
 
 type StoreIncarnation = [u8; 16];
 
+const IDENTITY_CHANGE_CAPACITY: usize = 1024;
+
+/// Process-local account changes for historical sends. Fingerprint collisions
+/// only exclude an extra account; pruned history excludes every older token.
+#[derive(Default)]
+pub struct IdentityContinuity {
+    state: SyncMutex<IdentityChanges>,
+}
+
+#[derive(Default)]
+struct IdentityChanges {
+    generation: u64,
+    floor: u64,
+    active: usize,
+    active_since: u64,
+    users: VecDeque<(u64, u64)>,
+}
+
+impl IdentityContinuity {
+    pub fn unavailable() -> Self {
+        Self {
+            state: SyncMutex::new(IdentityChanges {
+                generation: u64::MAX,
+                ..Default::default()
+            }),
+        }
+    }
+
+    pub fn snapshot(&self) -> Option<u64> {
+        let state = self.state.lock().ok()?;
+        // A send starting during a mutation must include that mutation in its
+        // later checks, even if cleanup is cancelled. Pin to before the first
+        // overlapping mutation instead of copying or retaining an active set.
+        (state.generation != u64::MAX).then_some(if state.active == 0 {
+            state.generation
+        } else {
+            state.active_since
+        })
+    }
+
+    pub fn unchanged_for<'a>(
+        &self,
+        snapshot: Option<u64>,
+        users: impl IntoIterator<Item = &'a str>,
+    ) -> bool {
+        let Some(since) = snapshot else {
+            return false;
+        };
+        let Ok(state) = self.state.lock() else {
+            return false;
+        };
+        if since < state.floor || since > state.generation || state.generation == u64::MAX {
+            return false;
+        }
+        users.into_iter().all(|user| {
+            let fingerprint = user_fingerprint(user);
+            state
+                .users
+                .iter()
+                .rev()
+                .take_while(|(generation, _)| *generation > since)
+                .all(|(_, changed)| *changed != fingerprint)
+        })
+    }
+
+    /// Hold through the entire mutation, including its asynchronous cleanup.
+    /// Pass every known alias. An empty set means unknown scope, such as a reset.
+    pub fn changing<'a>(
+        &self,
+        users: impl IntoIterator<Item = &'a str>,
+    ) -> IdentityContinuityChange<'_> {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.active == 0 {
+            state.active_since = state.generation;
+        }
+        state.generation = state.generation.saturating_add(1);
+        state.active += 1;
+        let generation = state.generation;
+        if generation == u64::MAX {
+            return IdentityContinuityChange(self);
+        }
+        let mut scoped = false;
+        for user in users {
+            scoped = true;
+            if state.users.len() == IDENTITY_CHANGE_CAPACITY
+                && let Some((evicted, _)) = state.users.pop_front()
+            {
+                // The evicted mutation is no longer examined, so the floor
+                // must move past its generation: a snapshot stamped exactly
+                // there can no longer prove that mutation left its accounts
+                // untouched.
+                state.floor = evicted.saturating_add(1);
+            }
+            state.users.push_back((generation, user_fingerprint(user)));
+        }
+        if !scoped {
+            state.floor = generation;
+            state.users.clear();
+        }
+        IdentityContinuityChange(self)
+    }
+
+    pub fn estimated_heap_bytes(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .users
+            .capacity()
+            * size_of::<(u64, u64)>()
+    }
+}
+
+#[must_use]
+pub struct IdentityContinuityChange<'a>(&'a IdentityContinuity);
+
+impl Drop for IdentityContinuityChange<'_> {
+    fn drop(&mut self) {
+        let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.active -= 1;
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PrekeyProbe {
+    Needed,
+    Durable,
+    Deferred,
+}
+
+// A weak version prevents allocation-address reuse without making ordinary
+// checkouts clone their records while the serialized snapshot is in I/O.
+fn same_flush_version<T: ?Sized>(record: &Arc<T>, version: &Weak<T>) -> bool {
+    std::ptr::eq(Arc::as_ptr(record), version.as_ptr())
+}
+
 fn new_store_incarnation() -> StoreIncarnation {
     let mut incarnation = [0; 16];
     rand::make_rng::<rand::rngs::StdRng>().fill(&mut incarnation);
     incarnation
 }
 
+struct EvictionCandidates {
+    keys: Vec<Arc<str>>,
+    negatives: usize,
+    limit: usize,
+}
+
+impl EvictionCandidates {
+    fn new(limit: usize) -> Self {
+        Self {
+            keys: Vec::new(),
+            negatives: 0,
+            limit,
+        }
+    }
+
+    fn consider(&mut self, key: &Arc<str>, negative: bool) -> bool {
+        if self.negatives == self.limit {
+            return true;
+        }
+        if self.keys.len() == self.limit {
+            if !negative {
+                return false;
+            }
+            // The prefix contains only negatives; replacing the first positive
+            // preserves priority without retaining every clean resident key.
+            self.keys[self.negatives] = key.clone();
+        } else {
+            if self.keys.is_empty() {
+                self.keys.reserve_exact(self.limit);
+            }
+            self.keys.push(key.clone());
+            if negative {
+                let last = self.keys.len() - 1;
+                self.keys.swap(self.negatives, last);
+            }
+        }
+        if negative {
+            self.negatives += 1;
+        }
+        self.negatives == self.limit
+    }
+}
+
 /// Evict clean (non-dirty, non-deleted) entries from a cache HashMap.
 /// Negative entries (None values) are evicted first.
 ///
 /// Amortized: the O(n) scan only runs once the map crosses the high watermark
-/// (`max_entries + slack`), then it trims back down to `max_entries`. Steady
-/// state over capacity therefore costs O(1) per call because a fresh scan needs
-/// `slack` more growth inserts before it can fire again. Call it from every path
+/// (`max_entries + slack`), then it trims to `max_entries` when enough entries
+/// are clean. Successful trimming amortizes the scan over `slack` more growth
+/// inserts. Call it from every path
 /// that grows the map, including read-populate (cache-miss) inserts, so the cache
 /// stays bounded even under unique-key read floods; the early-out keeps it cheap.
 fn evict_clean_entries<V>(
@@ -37,12 +217,19 @@ fn evict_clean_entries<V>(
     max_entries: usize,
 ) {
     compact_users_if_needed(cache, max_entries);
-    if cache.len() <= high_watermark(max_entries) {
+    // Dirty and deleted keys are disjoint subsets of the cache. A stalled
+    // backend can pin the whole map above the watermark; scanning it again
+    // on every write would be quadratic work that cannot reclaim anything.
+    if cache.len() <= high_watermark(max_entries)
+        || dirty.len().saturating_add(deleted.map_or(0, HashSet::len)) >= cache.len()
+    {
         return;
     }
     let overflow = cache.len().saturating_sub(max_entries);
-    let mut negative = Vec::with_capacity(overflow);
-    let mut positive = Vec::with_capacity(overflow);
+    let available = cache
+        .len()
+        .saturating_sub(dirty.len().saturating_add(deleted.map_or(0, HashSet::len)));
+    let mut candidates = EvictionCandidates::new(overflow.min(available));
     for (k, v) in cache.iter() {
         if dirty.contains(k.as_ref()) {
             continue;
@@ -52,13 +239,11 @@ fn evict_clean_entries<V>(
         {
             continue;
         }
-        if v.is_none() {
-            negative.push(k.clone());
-        } else {
-            positive.push(k.clone());
+        if candidates.consider(k, v.is_none()) {
+            break;
         }
     }
-    for key in negative.into_iter().chain(positive).take(overflow) {
+    for key in candidates.keys {
         cache.remove(&key);
     }
 }
@@ -155,7 +340,6 @@ impl PendingWireGate {
         self.addresses.is_empty()
     }
 
-    #[cfg(test)]
     fn contains(&self, address: &str) -> bool {
         self.addresses.contains(address)
     }
@@ -163,6 +347,14 @@ impl PendingWireGate {
     #[cfg(test)]
     fn iter(&self) -> impl Iterator<Item = &Arc<str>> {
         self.addresses.iter()
+    }
+
+    /// Bytes the gate's table allocates. The addresses themselves are the
+    /// cache's own `Arc<str>` keys — the gate is always a subset of `dirty` +
+    /// `deleted`, which eviction cannot drop — so charging their payloads here
+    /// would count them twice.
+    fn table_bytes(&self) -> usize {
+        crate::stats::hash_table_bytes(self.addresses.capacity(), size_of::<Arc<str>>())
     }
 
     /// `Release` so a reader whose `Acquire` load sees the lowered flag also
@@ -188,6 +380,20 @@ fn user_of_protocol_address(address: &str) -> &str {
     }
 }
 
+/// One `RandomState` for the whole process, drawn once. The user index only
+/// ever compares a fingerprint against its own set, so nothing requires a
+/// shared seed — but sharing one keeps the hasher out of every cache, and
+/// drawing it randomly keeps a peer from choosing identifiers that collide.
+fn fingerprint_hasher() -> &'static RandomState {
+    static HASHER: OnceLock<RandomState> = OnceLock::new();
+    HASHER.get_or_init(RandomState::new)
+}
+
+/// The 64-bit stand-in for a user identifier in [`UserIndexedCache::users`].
+fn user_fingerprint(user: &str) -> u64 {
+    fingerprint_hasher().hash_one(user)
+}
+
 /// A cache map that can answer "is any address here owned by this user?"
 /// without scanning every key.
 ///
@@ -197,9 +403,14 @@ fn user_of_protocol_address(address: &str) -> &str {
 /// user that has some, which is the direction that would silently skip a
 /// migration. `insert` is the only way in, so an entry cannot reach the map
 /// without registering its user.
+///
+/// Because a false `true` is already the accepted error, the set holds
+/// 64-bit fingerprints rather than the identifiers: a hash collision produces
+/// exactly that same error and nothing else, and the index stops duplicating
+/// every user string the three Signal stores already key on.
 struct UserIndexedCache<V> {
     map: HashMap<Arc<str>, V>,
-    users: HashSet<Arc<str>>,
+    users: HashSet<u64>,
     /// Counts removal events. A cold reader that saw a slot absent, released
     /// the lock, and finds it absent again cannot otherwise tell "never
     /// written" from "written, flushed, and evicted": a clean removal keeps the
@@ -227,11 +438,21 @@ impl<V> UserIndexedCache<V> {
     }
 
     fn insert(&mut self, key: Arc<str>, value: V) -> Option<V> {
-        let user = user_of_protocol_address(&key);
-        if !self.users.contains(user) {
-            self.users.insert(Arc::from(user));
+        // Overwrites are the common case — every send and decrypt writes its
+        // address back — and an address already in the map already has its
+        // user in the index, so the fingerprint (a scan for the separator and
+        // a hash of the user) is only computed for a new key.
+        match self.map.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut occupied) => {
+                Some(occupied.insert(value))
+            }
+            std::collections::hash_map::Entry::Vacant(vacant) => {
+                self.users
+                    .insert(user_fingerprint(user_of_protocol_address(vacant.key())));
+                vacant.insert(value);
+                None
+            }
         }
-        self.map.insert(key, value)
     }
 
     /// Stamp to take before a cold read releases the lock.
@@ -273,35 +494,44 @@ impl<V> UserIndexedCache<V> {
         // address begins with `user`, so a separator inside `user` is also the
         // address's first one and both collapse to the same key: an addressed
         // `19995551006:5` and a bare `19995551006` are one entry here.
-        self.users.contains(user_of_protocol_address(user))
+        self.users
+            .contains(&user_fingerprint(user_of_protocol_address(user)))
     }
 
     /// Drop users no longer backed by an entry. Bounds the superset's drift
     /// after eviction; callers gate it on a watermark so it stays amortized.
     fn compact_users(&mut self) {
         self.users.clear();
-        let users: Vec<Arc<str>> = self
-            .map
-            .keys()
-            .map(|key| Arc::from(user_of_protocol_address(key)))
-            .collect();
-        self.users.extend(users);
+        // Fingerprints are `Copy`, so the rebuild reads straight off the live
+        // keys — no intermediate `Vec` and no `Arc<str>` per surviving user,
+        // which is what this used to allocate under the store's global mutex.
+        self.users.extend(
+            self.map
+                .keys()
+                .map(|key| user_fingerprint(user_of_protocol_address(key))),
+        );
     }
 
     fn users_len(&self) -> usize {
         self.users.len()
     }
 
-    /// Retained bytes of the bookkeeping beside the primary map: the user
-    /// index, plus the removal window, whose keys outlive the entries they
-    /// name and so are owned solely here. Keeps `memory_stats` from reporting
-    /// only the map.
+    /// Retained bytes of everything this cache allocates except the entry
+    /// payloads: the primary map's buckets, the user index, the removal ring,
+    /// and the removal window's keys — which outlive the entries they name and
+    /// so are owned solely here.
+    ///
+    /// Slots, not entries: a `HashMap` holding n entries owns more buckets than
+    /// n (see [`crate::stats::hash_table_bytes`]), and it is the buckets the
+    /// allocator is holding. `memory_stats` adds the keys and payloads on top.
     fn overhead_bytes(&self) -> usize {
-        self.users.iter().map(|user| user.len()).sum::<usize>()
+        crate::stats::hash_table_bytes(self.map.capacity(), size_of::<(Arc<str>, V)>())
+            + crate::stats::hash_table_bytes(self.users.capacity(), size_of::<u64>())
+            + self.recent_removals.capacity() * size_of::<(u64, Arc<str>)>()
             + self
                 .recent_removals
                 .iter()
-                .map(|(_, key)| key.len() + size_of::<u64>())
+                .map(|(_, key)| key.len())
                 .sum::<usize>()
     }
 
@@ -370,15 +600,18 @@ impl<V> UserIndexedCache<V> {
 /// misses) evicts non-dirty entries once the high watermark is crossed, trimming
 /// back to `max_entries` (amortized O(1) thanks to the slack early-out).
 pub struct SignalStoreCache {
+    /// Orders persistence and teardown. Cache get/put methods do not acquire it.
+    flush_lock: Mutex<()>,
     sessions: Mutex<SessionStoreState>,
     /// The gates' own flags (see `PendingWireGate`), so a send answers
-    /// `needs_pre_wire_flush` without queueing behind a flush that holds either
-    /// store lock across its backend I/O.
+    /// `needs_pre_wire_flush` without queueing behind cache mutations or snapshot
+    /// capture.
     session_wire_gate: Arc<AtomicBool>,
     session_recovery_generation: AtomicU64,
     has_pending_session_restores: AtomicBool,
     pending_session_restores: SyncMutex<Vec<PendingSessionRestore>>,
     identities: Mutex<ByteStoreState>,
+    pub identity_continuity: IdentityContinuity,
     sender_keys: Mutex<SenderKeyStoreState>,
     sender_key_wire_gate: Arc<AtomicBool>,
     /// Fast-path guard for the normally-empty pending distribution map. Warm
@@ -408,10 +641,22 @@ enum SessionEntry {
     CheckedOut {
         had_session: bool,
         token: NonZeroU64,
+        /// A prior encrypt can still need this lease durably published while
+        /// the next operation owns the mutable record. Retained only until the
+        /// lease is persisted; ordinary covered checkouts remain move-only.
+        wire_snapshot: Option<Arc<SessionRecord>>,
     },
 }
 
 impl SessionEntry {
+    fn flushable_record(&self) -> Option<&Arc<SessionRecord>> {
+        match self {
+            Self::Present(record) => Some(record),
+            Self::CheckedOut { wire_snapshot, .. } => wire_snapshot.as_ref(),
+            Self::Absent => None,
+        }
+    }
+
     fn exists(&self) -> bool {
         matches!(
             self,
@@ -424,6 +669,10 @@ impl SessionEntry {
     }
 }
 
+/// A transient return value, matched and moved out of by its caller on the
+/// per-message decrypt path; boxing the record arm would put an allocation on
+/// every checkout to save nothing, since the enum is never stored.
+#[allow(clippy::large_enum_variant)]
 enum CachedSessionCheckout {
     Missing(SessionCheckoutKey),
     Absent(SessionCheckoutKey),
@@ -469,6 +718,27 @@ impl SessionStoreState {
         }
     }
 
+    fn prekey_probe(
+        &self,
+        removed: &HashMap<u32, Arc<str>>,
+        id: u32,
+        address: &Arc<str>,
+    ) -> PrekeyProbe {
+        if !removed
+            .get(&id)
+            .is_some_and(|current| Arc::ptr_eq(current, address))
+            || self.dirty.contains(address.as_ref())
+            || self.deleted.contains(address.as_ref())
+        {
+            return PrekeyProbe::Deferred;
+        }
+        match self.cache.get(address.as_ref()) {
+            Some(SessionEntry::Present(_)) => PrekeyProbe::Durable,
+            Some(SessionEntry::CheckedOut { .. }) => PrekeyProbe::Deferred,
+            Some(SessionEntry::Absent) | None => PrekeyProbe::Needed,
+        }
+    }
+
     fn put(&mut self, address: &str, record: SessionRecord) {
         let addr = self.key_for(address);
         self.put_with_key(addr, record);
@@ -483,8 +753,11 @@ impl SessionStoreState {
         }
         self.cache
             .insert(addr.clone(), SessionEntry::Present(Arc::new(record)));
-        self.dirty.insert(addr.clone());
-        self.deleted.remove(&addr);
+        // `deleted` is empty on every ordinary write-back; skip its hash.
+        if !self.deleted.is_empty() {
+            self.deleted.remove(&addr);
+        }
+        self.dirty.insert(addr);
     }
 
     fn checkout(&mut self, address: &str) -> CachedSessionCheckout {
@@ -498,12 +771,16 @@ impl SessionStoreState {
             return CachedSessionCheckout::Missing(checkout);
         };
         match entry {
-            SessionEntry::Present(_) => {
+            SessionEntry::Present(record) => {
+                let wire_snapshot = (!self.reservation_pending.is_empty()
+                    && self.reservation_pending.contains(address))
+                .then(|| Arc::clone(record));
                 let SessionEntry::Present(record) = std::mem::replace(
                     entry,
                     SessionEntry::CheckedOut {
                         had_session: true,
                         token,
+                        wire_snapshot,
                     },
                 ) else {
                     unreachable!()
@@ -517,6 +794,7 @@ impl SessionStoreState {
                 *entry = SessionEntry::CheckedOut {
                     had_session: false,
                     token,
+                    wire_snapshot: None,
                 };
                 CachedSessionCheckout::Absent(checkout)
             }
@@ -557,23 +835,31 @@ impl SessionStoreState {
 
     fn evict_if_needed(&mut self, max_entries: usize) {
         compact_users_if_needed(&mut self.cache, max_entries);
-        if self.cache.len() <= high_watermark(max_entries) {
+        if self.cache.len() <= high_watermark(max_entries)
+            || self.dirty.len().saturating_add(self.deleted.len()) >= self.cache.len()
+        {
             return;
         }
         let overflow = self.cache.len().saturating_sub(max_entries);
-        let mut negative = Vec::with_capacity(overflow);
-        let mut positive = Vec::with_capacity(overflow);
+        let available = self
+            .cache
+            .len()
+            .saturating_sub(self.dirty.len().saturating_add(self.deleted.len()));
+        let mut candidates = EvictionCandidates::new(overflow.min(available));
         for (k, v) in self.cache.iter() {
             if self.dirty.contains(k.as_ref()) || self.deleted.contains(k.as_ref()) {
                 continue;
             }
-            match v {
-                SessionEntry::CheckedOut { .. } => continue, // never evict checked-out
-                SessionEntry::Absent => negative.push(k.clone()),
-                SessionEntry::Present(_) => positive.push(k.clone()),
+            let negative = match v {
+                SessionEntry::CheckedOut { .. } => continue,
+                SessionEntry::Absent => true,
+                SessionEntry::Present(_) => false,
+            };
+            if candidates.consider(k, negative) {
+                break;
             }
         }
-        for key in negative.into_iter().chain(positive).take(overflow) {
+        for key in candidates.keys {
             self.cache.remove(&key);
         }
     }
@@ -621,10 +907,18 @@ impl SenderKeyStoreState {
     }
 
     fn key_for(&self, address: &str) -> Arc<str> {
-        match self.cache.get_key_value(address) {
-            Some((existing, _)) => existing.clone(),
-            None => Arc::from(address),
+        if let Some((existing, _)) = self.cache.get_key_value(address) {
+            return existing.clone();
         }
+        // The other place this address may already own an `Arc`: a
+        // distribution is retained when its durability gate fails, which can
+        // happen before the record itself reaches the cache. Reusing that key
+        // keeps one allocation per address instead of two, and keeps
+        // `memory_stats` from charging a string the store holds twice.
+        if let Some((existing, _)) = self.pending_distributions.get_key_value(address) {
+            return existing.clone();
+        }
+        Arc::from(address)
     }
 
     fn put(&mut self, address: &str, mut record: SenderKeyRecord) {
@@ -750,6 +1044,7 @@ impl SignalStoreCache {
         let sessions = SessionStoreState::new(incarnation);
         let sender_keys = SenderKeyStoreState::new(incarnation);
         Self {
+            flush_lock: Mutex::new(()),
             session_wire_gate: sessions.reservation_pending.flag(),
             sender_key_wire_gate: sender_keys.wire_gate_pending.flag(),
             sessions: Mutex::new(sessions),
@@ -757,6 +1052,7 @@ impl SignalStoreCache {
             has_pending_session_restores: AtomicBool::new(false),
             pending_session_restores: SyncMutex::new(Vec::new()),
             identities: Mutex::new(ByteStoreState::new()),
+            identity_continuity: IdentityContinuity::default(),
             sender_keys: Mutex::new(sender_keys),
             has_pending_sender_key_distributions: AtomicBool::new(false),
             removed_prekeys: Mutex::new(HashMap::new()),
@@ -790,6 +1086,7 @@ impl SignalStoreCache {
                     SessionEntry::CheckedOut {
                         had_session: was_present,
                         token,
+                        ..
                     },
                 )) = state.cache.get_key_value(address.as_ref())
                 && *was_present == had_session
@@ -851,6 +1148,7 @@ impl SignalStoreCache {
                 SessionEntry::CheckedOut {
                     had_session: was_present,
                     token,
+                    ..
                 },
             )) = state.cache.get_key_value(address.as_str())
             else {
@@ -911,6 +1209,7 @@ impl SignalStoreCache {
                 SessionEntry::CheckedOut {
                     had_session: false,
                     token,
+                    ..
                 },
             )) = state.cache.get_key_value(address.as_str())
             && *token == checkout.token()
@@ -1121,6 +1420,7 @@ impl SignalStoreCache {
             SessionEntry::CheckedOut {
                 had_session: record.is_some(),
                 token: checkout.token(),
+                wire_snapshot: None,
             },
         );
         state.evict_if_needed(self.max_entries);
@@ -1304,6 +1604,70 @@ impl SignalStoreCache {
             .is_some())
     }
 
+    /// Fault a send's candidate session addresses into the cache in one backend
+    /// round-trip instead of one per cold device.
+    ///
+    /// Only addresses the cache does not already know are read; a warm send
+    /// therefore pays a lock scan and no backend call at all. Each row installs
+    /// exactly as a cold [`Self::checkout_session`] would have left it —
+    /// positively, or negatively when the backend has no row (or this build
+    /// cannot decode it) — so a later checkout or probe answers from cache.
+    /// An entry that appeared while the batch was in flight is never clobbered:
+    /// it is newer than anything the batch could have read.
+    pub async fn prefetch_sessions(
+        &self,
+        addresses: &[ProtocolAddress],
+        backend: &dyn SignalStore,
+    ) -> Result<()> {
+        let (missing, since) = {
+            let state = self.lock_sessions().await;
+            let mut missing = Vec::new();
+            for address in addresses {
+                let key = address.as_str();
+                if state.cache.get(key).is_none() {
+                    missing.push(state.key_for(key));
+                }
+            }
+            (missing, state.cache.removal_seq())
+        };
+        if missing.is_empty() {
+            return Ok(());
+        }
+        // Backend I/O outside the lock, like every other cold path.
+        let loaded = backend.get_sessions_batch(&missing).await?;
+        let mut state = self.lock_sessions().await;
+        let mut found: HashMap<&str, &[u8]> = HashMap::with_capacity(loaded.len());
+        for (address, record) in &loaded {
+            found.insert(address.as_ref(), record.as_ref());
+        }
+        for key in &missing {
+            // Raced with a concurrent install, checkout or eviction: keep the
+            // newer entry, or skip a key whose newer write was dropped behind
+            // us, rather than rewinding it with the batch's older read. This is
+            // the multi-key form of the stamp `checkout_session` re-checks.
+            if state.cache.get(key.as_ref()).is_some()
+                || state.cache.removed_since(key.as_ref(), since)
+            {
+                continue;
+            }
+            // Decoded against the current incarnation, which may have bumped
+            // while the batch was in flight; the rows are still the backend's
+            // truth either way.
+            let record = found
+                .get(key.as_ref())
+                .copied()
+                .and_then(|bytes| Self::decode_stored_session(key, bytes, &state.incarnation))
+                .map(Arc::new);
+            let entry = match &record {
+                Some(record) => SessionEntry::Present(record.clone()),
+                None => SessionEntry::Absent,
+            };
+            state.cache.insert(key.clone(), entry);
+        }
+        state.evict_if_needed(self.max_entries);
+        Ok(())
+    }
+
     // === Identities ===
 
     pub async fn get_identity(
@@ -1356,6 +1720,7 @@ impl SignalStoreCache {
 
     pub async fn put_identity(&self, address: &ProtocolAddress, data: &[u8]) {
         let mut state = self.identities.lock().await;
+        let _change = self.identity_write_change(&state, address, data);
         state.put_dedup(address.as_str(), data);
         state.evict_if_needed(self.max_entries);
     }
@@ -1373,6 +1738,7 @@ impl SignalStoreCache {
     pub fn try_put_identity(&self, address: &ProtocolAddress, data: &[u8]) -> bool {
         match self.identities.try_lock() {
             Some(mut state) => {
+                let _change = self.identity_write_change(&state, address, data);
                 state.put_dedup(address.as_str(), data);
                 state.evict_if_needed(self.max_entries);
                 true
@@ -1383,7 +1749,28 @@ impl SignalStoreCache {
 
     pub async fn delete_identity(&self, address: &ProtocolAddress) {
         let mut state = self.identities.lock().await;
+        let _change = self
+            .identity_continuity
+            .changing([user_of_protocol_address(address.name())]);
         state.delete(address.as_str());
+    }
+
+    fn identity_write_change(
+        &self,
+        state: &ByteStoreState,
+        address: &ProtocolAddress,
+        data: &[u8],
+    ) -> Option<IdentityContinuityChange<'_>> {
+        match state.cache.get(address.as_str()) {
+            Some(None) => None,
+            Some(Some(previous)) if previous.as_ref() == data => None,
+            // An uncached write cannot prove this is a first identity. Normal
+            // Signal saves load the old row before writing, including absence.
+            _ => Some(
+                self.identity_continuity
+                    .changing([user_of_protocol_address(address.name())]),
+            ),
+        }
     }
 
     // === Sender Keys ===
@@ -1435,7 +1822,12 @@ impl SignalStoreCache {
             // the chain resume an iteration that has already been published.
             if state.incarnation == incarnation && !state.cache.removed_since(key, since) {
                 let record = decoded?;
-                state.cache.insert(Arc::from(key), record.clone());
+                // Through `key_for`, not `Arc::from`: a distribution retained
+                // for this address while the record was still cold already
+                // owns a key, and allocating a second one for the same string
+                // is what the canonicalization exists to avoid.
+                let addr = state.key_for(key);
+                state.cache.insert(addr, record.clone());
                 state.evict_if_needed(self.max_entries);
                 return Ok(record);
             }
@@ -1453,7 +1845,8 @@ impl SignalStoreCache {
             )?)),
             None => None,
         };
-        state.cache.insert(Arc::from(key), record.clone());
+        let addr = state.key_for(key);
+        state.cache.insert(addr, record.clone());
         state.evict_if_needed(self.max_entries);
         Ok(record)
     }
@@ -1570,6 +1963,7 @@ impl SignalStoreCache {
     ) -> Result<()> {
         let lock = self.sender_key_lock(name).await;
         let _guard = lock.lock().await;
+        let _flush_guard = self.flush_lock.lock().await;
         let cache_key = name.cache_key();
         {
             let mut state = self.sender_keys.lock().await;
@@ -1617,136 +2011,148 @@ impl SignalStoreCache {
 
     // === Flush ===
 
-    /// Flush all dirty state to the backend.
-    ///
-    /// Identities and sender keys are flushed independently under their own lock,
-    /// so each is locked only during its own I/O while the others stay free for
-    /// concurrent encrypt/decrypt. Sessions and consumed pre-keys are committed
-    /// together under the single sessions lock: the prekey delete must be atomic
-    /// with the session put against concurrent buffering, so they cannot use
-    /// separate lock scopes. Within each scope the lock is held across snapshot,
-    /// I/O, and clear, so there is no race between snapshot and clear and dirty
-    /// sets are cleared only after successful writes.
+    /// Flush the current dirty snapshots, in backend order. The cache mutexes
+    /// cover capture and confirmation of record writes. Consumed-prekey removal
+    /// additionally excludes session mutations through its destructive I/O.
+    /// A concurrent mutation stays dirty unless that exact record was persisted.
     pub async fn flush(&self, backend: &dyn SignalStore) -> Result<()> {
-        // Flush sessions: one batched write for all dirty puts instead of one
-        // backend call (and one SQLite transaction) per session.
-        {
-            let mut state = self.lock_sessions().await;
-            let incarnation = state.incarnation;
-            let dirty_keys: Vec<_> = state.dirty.iter().cloned().collect();
-            let deleted_keys: Vec<_> = state.deleted.iter().cloned().collect();
+        let _flush_guard = self.flush_lock.lock().await;
+        self.flush_sessions(backend).await?;
+        self.flush_identities(backend).await?;
+        self.flush_sender_keys(backend).await
+    }
 
-            let mut batch: Vec<(Arc<str>, bytes::Bytes)> = Vec::new();
-            for address in &dirty_keys {
-                // A dirty key is Present (promoted) or CheckedOut (taken by a
-                // concurrent reader). Only the Present ones can be persisted now;
-                // a CheckedOut one stays volatile and its consumed prekey is
-                // deferred below until a later flush sees it durable.
-                if let Some(SessionEntry::Present(record)) = state.cache.get(address.as_ref()) {
-                    let mut buf = Vec::new();
-                    record.serialize_into_for_store(&mut buf, &incarnation);
-                    batch.push((address.clone(), bytes::Bytes::from(buf)));
+    async fn flush_sessions(&self, backend: &dyn SignalStore) -> Result<()> {
+        let (batch, versions, deleted, mut prekeys) = {
+            let state = self.lock_sessions().await;
+            let mut batch = Vec::with_capacity(state.dirty.len());
+            let mut versions = Vec::with_capacity(state.dirty.len());
+            for address in &state.dirty {
+                if let Some(record) = state
+                    .cache
+                    .get(address.as_ref())
+                    .and_then(SessionEntry::flushable_record)
+                {
+                    let mut bytes = Vec::new();
+                    record.serialize_into_for_store(&mut bytes, &state.incarnation);
+                    batch.push((address.clone(), bytes::Bytes::from(bytes)));
+                    versions.push((address.clone(), Arc::downgrade(record)));
                 }
             }
-            if !batch.is_empty() {
-                backend.put_sessions_batch(&batch).await?;
-                // These leases are durable now; only the written addresses
-                // leave the pending set (a CheckedOut session stays gated).
-                for (address, _) in &batch {
+            // Capture consumption together with its session snapshot: a prekey
+            // buffered during the I/O must wait for the next snapshot, even if
+            // this flush persisted an older session at the same address.
+            let removed = self.removed_prekeys.lock().await;
+            let prekeys = removed
+                .iter()
+                .map(|(&id, address)| (id, address.clone(), PrekeyProbe::Needed))
+                .collect::<Vec<_>>();
+            (
+                batch,
+                versions,
+                state.deleted.iter().cloned().collect::<Vec<_>>(),
+                prekeys,
+            )
+        };
+
+        if !batch.is_empty() {
+            backend.put_sessions_batch(&batch).await?;
+            let mut state = self.lock_sessions().await;
+            for (address, version) in &versions {
+                if state
+                    .cache
+                    .get(address.as_ref())
+                    .and_then(SessionEntry::flushable_record)
+                    .is_some_and(|record| same_flush_version(record, version))
+                {
+                    state.dirty.remove(address);
+                    state.reservation_pending.remove(address);
+                    if let Some(SessionEntry::CheckedOut { wire_snapshot, .. }) =
+                        state.cache.get_mut(address.as_ref())
+                    {
+                        *wire_snapshot = None;
+                    }
+                }
+            }
+            state.evict_if_needed(self.max_entries);
+        }
+        if !deleted.is_empty() {
+            backend.delete_sessions_batch(&deleted).await?;
+            let mut state = self.lock_sessions().await;
+            for address in &deleted {
+                if matches!(
+                    state.cache.get(address.as_ref()),
+                    Some(SessionEntry::Absent)
+                ) {
+                    state.deleted.remove(address);
                     state.reservation_pending.remove(address);
                 }
             }
-            for address in &deleted_keys {
-                backend.delete_session(address).await?;
-                state.reservation_pending.remove(address);
-            }
-
-            for key in &dirty_keys {
-                if !matches!(
-                    state.cache.get(key.as_ref()),
-                    Some(SessionEntry::CheckedOut { .. })
-                ) {
-                    state.dirty.remove(key);
-                }
-            }
-            for key in &deleted_keys {
-                state.deleted.remove(key);
-            }
             state.evict_if_needed(self.max_entries);
-
-            // Delete a consumed one-time prekey only once its session is durable.
-            // Durability is decided per session, not from a single flush's batch:
-            // a Present (clean at drain) entry is persisted (by this flush or an
-            // earlier one); a CheckedOut entry is the still-volatile promoted copy,
-            // so defer; an absent/deleted/evicted/cleared entry is ambiguous, so
-            // ask the backend. This covers a prekey buffered just after a
-            // concurrent flush already persisted its session (it would never
-            // re-enter a batch) and never deletes a prekey whose session was
-            // dropped before reaching the backend (which would make a redelivered
-            // pkmsg permanently undecryptable). Staying under the sessions lock
-            // keeps the session commit and the prekey delete atomic against a
-            // decrypt buffering its own prekey (it must take this same lock to
-            // store its session first), matching WAWebSignalProtocolStoreUnifiedApi
-            // (bulkPutSession + bulkRemovePreKey under one lock). The buffer is
-            // mutated only after each delete succeeds, so a failed flush leaves the
-            // IDs for the next attempt.
-            {
-                let mut removed = self.removed_prekeys.lock().await;
-                if !removed.is_empty() {
-                    let mut deletable: Vec<u32> = Vec::new();
-                    for (id, addr) in removed.iter() {
-                        // Resolve to an owned decision before any await so no cache
-                        // borrow is held across the backend roundtrip.
-                        let durable = match state.cache.get(addr.as_ref()) {
-                            Some(SessionEntry::Present(_)) => Some(true),
-                            Some(SessionEntry::CheckedOut { .. }) => Some(false),
-                            Some(SessionEntry::Absent) | None => None,
-                        };
-                        let durable = match durable {
-                            Some(d) => d,
-                            // Row existence is not enough: a row that does not
-                            // decode is no session at all, and deleting the
-                            // prekey against it is the very outcome this block
-                            // exists to prevent -- a redelivered pkmsg would
-                            // have neither a usable session nor the prekey to
-                            // rebuild one. Decoded under the sessions lock we
-                            // already hold, so the decision stays atomic
-                            // against a decrypt storing its own session.
-                            None => backend
-                                .get_session(addr.as_ref())
-                                .await?
-                                .as_deref()
-                                .and_then(|bytes| {
-                                    Self::decode_stored_session(
-                                        addr.as_ref(),
-                                        bytes,
-                                        &state.incarnation,
-                                    )
-                                })
-                                .is_some(),
-                        };
-                        if durable {
-                            deletable.push(*id);
-                        }
-                    }
-                    for id in &deletable {
-                        backend.remove_prekey(*id).await?;
-                    }
-                    for id in &deletable {
-                        removed.remove(id);
-                    }
-                }
-            }
         }
 
-        // Flush identities
-        {
-            let mut state = self.identities.lock().await;
-            let dirty_keys: Vec<_> = state.dirty.iter().cloned().collect();
-            let deleted_keys: Vec<_> = state.deleted.iter().cloned().collect();
+        if prekeys.is_empty() {
+            return Ok(());
+        }
+        let incarnation = {
+            let state = self.lock_sessions().await;
+            let removed = self.removed_prekeys.lock().await;
+            for (id, address, probe) in &mut prekeys {
+                *probe = state.prekey_probe(&removed, *id, address);
+            }
+            state.incarnation
+        };
+        // Read-only probes can release both locks. The outer flush gate keeps
+        // backend writes ordered; the destructive phase rechecks live cache
+        // state and consumption identity before trusting a probe result.
+        for (_, address, probe) in &mut prekeys {
+            if *probe == PrekeyProbe::Needed {
+                let durable = backend
+                    .get_session(address.as_ref())
+                    .await?
+                    .as_deref()
+                    .and_then(|bytes| Self::decode_stored_session(address, bytes, &incarnation))
+                    .is_some();
+                *probe = if durable {
+                    PrekeyProbe::Durable
+                } else {
+                    PrekeyProbe::Deferred
+                };
+            }
+        }
+        // Private-key deletion is irreversible: a new checkout could consume
+        // the same key before its newer session becomes durable. Exclude that
+        // window, including the gap between session return and consumption
+        // buffering, rather than merely retaining a newer buffer entry after
+        // its private key has already been destroyed.
+        let state = self.lock_sessions().await;
+        let mut removed = self.removed_prekeys.lock().await;
+        let mut deletable = Vec::new();
+        for (id, address, probe) in prekeys {
+            let durable = match state.prekey_probe(&removed, id, &address) {
+                PrekeyProbe::Durable => true,
+                PrekeyProbe::Deferred => false,
+                PrekeyProbe::Needed => probe == PrekeyProbe::Durable,
+            };
+            if durable {
+                deletable.push(id);
+            }
+        }
+        if !deletable.is_empty() {
+            backend.remove_prekeys_batch(&deletable).await?;
+            for id in deletable {
+                removed.remove(&id);
+            }
+        }
+        Ok(())
+    }
 
-            let mut batch: Vec<(Arc<str>, [u8; 32])> = Vec::new();
-            for address in &dirty_keys {
+    async fn flush_identities(&self, backend: &dyn SignalStore) -> Result<()> {
+        let (batch, versions, deleted) = {
+            let state = self.identities.lock().await;
+            let mut batch = Vec::with_capacity(state.dirty.len());
+            let mut versions = Vec::with_capacity(state.dirty.len());
+            for address in &state.dirty {
                 if let Some(Some(data)) = state.cache.get(address.as_ref()) {
                     let key: [u8; 32] = data.as_ref().try_into().map_err(|_| {
                         anyhow::anyhow!(
@@ -1755,59 +2161,86 @@ impl SignalStoreCache {
                         )
                     })?;
                     batch.push((address.clone(), key));
+                    versions.push((address.clone(), Arc::downgrade(data)));
                 }
             }
-            if !batch.is_empty() {
-                backend.put_identities_batch(&batch).await?;
-            }
-            for address in &deleted_keys {
-                backend.delete_identity(address).await?;
-            }
-
-            for key in &dirty_keys {
-                state.dirty.remove(key);
-            }
-            for key in &deleted_keys {
-                state.deleted.remove(key);
+            (
+                batch,
+                versions,
+                state.deleted.iter().cloned().collect::<Vec<_>>(),
+            )
+        };
+        if !batch.is_empty() {
+            backend.put_identities_batch(&batch).await?;
+            let mut state = self.identities.lock().await;
+            for (address, version) in versions {
+                if matches!(state.cache.get(address.as_ref()), Some(Some(record)) if same_flush_version(record, &version))
+                {
+                    state.dirty.remove(&address);
+                }
             }
             state.evict_if_needed(self.max_entries);
         }
+        if !deleted.is_empty() {
+            backend.delete_identities_batch(&deleted).await?;
+            let mut state = self.identities.lock().await;
+            for address in deleted {
+                if matches!(state.cache.get(address.as_ref()), Some(None)) {
+                    state.deleted.remove(&address);
+                }
+            }
+            state.evict_if_needed(self.max_entries);
+        }
+        Ok(())
+    }
 
-        // Flush sender keys
-        {
-            let mut state = self.sender_keys.lock().await;
-            let incarnation = state.incarnation;
-            let dirty_keys: Vec<_> = state.dirty.iter().cloned().collect();
-
-            let mut batch: Vec<(Arc<str>, bytes::Bytes)> = Vec::new();
-            for name in &dirty_keys {
-                match state.cache.get(name.as_ref()) {
+    async fn flush_sender_keys(&self, backend: &dyn SignalStore) -> Result<()> {
+        let (batch, versions, deleted) = {
+            let state = self.sender_keys.lock().await;
+            let mut batch = Vec::with_capacity(state.dirty.len());
+            let mut versions = Vec::with_capacity(state.dirty.len());
+            let mut deleted = Vec::new();
+            for address in &state.dirty {
+                match state.cache.get(address.as_ref()) {
                     Some(Some(record)) => {
-                        let bytes = record
-                            .serialize_for_store(&incarnation)
-                            .map_err(|e| anyhow::anyhow!("sender key serialize for {name}: {e}"))?;
-                        batch.push((name.clone(), bytes::Bytes::from(bytes)));
+                        let bytes =
+                            record
+                                .serialize_for_store(&state.incarnation)
+                                .map_err(|e| {
+                                    anyhow::anyhow!("sender key serialize for {address}: {e}")
+                                })?;
+                        batch.push((address.clone(), bytes::Bytes::from(bytes)));
+                        versions.push((address.clone(), Arc::downgrade(record)));
                     }
-                    Some(None) => {
-                        backend.delete_sender_key(name).await?;
-                        state.wire_gate_pending.remove(name);
-                    }
+                    Some(None) => deleted.push(address.clone()),
                     None => {}
                 }
             }
-            if !batch.is_empty() {
-                backend.put_sender_keys_batch(&batch).await?;
-                for (name, _) in &batch {
-                    state.wire_gate_pending.remove(name);
+            (batch, versions, deleted)
+        };
+        if !deleted.is_empty() {
+            backend.delete_sender_keys_batch(&deleted).await?;
+            let mut state = self.sender_keys.lock().await;
+            for address in deleted {
+                if matches!(state.cache.get(address.as_ref()), Some(None)) {
+                    state.dirty.remove(&address);
+                    state.wire_gate_pending.remove(&address);
                 }
-            }
-
-            for key in &dirty_keys {
-                state.dirty.remove(key);
             }
             state.evict_if_needed(self.max_entries);
         }
-
+        if !batch.is_empty() {
+            backend.put_sender_keys_batch(&batch).await?;
+            let mut state = self.sender_keys.lock().await;
+            for (address, version) in versions {
+                if matches!(state.cache.get(address.as_ref()), Some(Some(record)) if same_flush_version(record, &version))
+                {
+                    state.dirty.remove(&address);
+                    state.wire_gate_pending.remove(&address);
+                }
+            }
+            state.evict_if_needed(self.max_entries);
+        }
         Ok(())
     }
 
@@ -1819,7 +2252,7 @@ impl SignalStoreCache {
     /// coalesced write-behind.
     ///
     /// Answered from the gates' flags so the common (open) case does not take
-    /// either store lock, which a flush holds across its backend I/O.
+    /// either store lock.
     pub async fn needs_pre_wire_flush(&self) -> bool {
         if self.wire_gates_raised() {
             return true;
@@ -1845,13 +2278,34 @@ impl SignalStoreCache {
     }
 
     /// Entry counts and estimated retained bytes for each store
-    /// (sessions, identities, sender_keys). Sizes use the records' encoded-size
-    /// proxy (see `SessionRecord::estimated_size`); on-demand only — walks the
-    /// caches under their locks.
+    /// (sessions, identities, sender_keys). Sizes walk the records' live
+    /// structures (see `SessionRecord::estimated_size`); on-demand only — walks
+    /// the caches under their locks.
     ///
     /// Session entry counts include negative (`Absent`) and checked-out slots
     /// — they occupy the map. Byte totals include the key length for every
-    /// slot, but the estimated record payload only for `Present` entries.
+    /// slot; record payloads cover `Present` entries and retained immutable
+    /// lease snapshots in checked-out slots.
+    ///
+    /// Structural allocations are charged too, through
+    /// [`crate::stats::hash_table_bytes`]: each cache's own tables (see
+    /// `UserIndexedCache::overhead_bytes`) plus the dirty/deleted sets and the
+    /// pre-wire gates beside it. Those sets are charged for their slots only —
+    /// their addresses are the cache's `Arc<str>` keys, which eviction cannot
+    /// drop while an address is dirty, deleted or pending, so charging the
+    /// payloads again would double-count them.
+    ///
+    /// The sender-key figure additionally covers `pending_distributions`: its
+    /// table slots, its distribution payloads, and the key bytes of entries
+    /// the cache no longer holds (a pending entry whose record is in the cache
+    /// shares that key, which `key_for` canonicalizes, so it is charged once).
+    /// Its entry count includes those pending-only addresses.
+    ///
+    /// One residual overlap is accepted rather than tracked: an address
+    /// evicted while still pending is charged both as a pending-only key and
+    /// in the removal window that named it. That window holds 64 entries,
+    /// which bounds the overstatement to a handful of addresses — cheaper to
+    /// state than to reconcile on a report that is an estimate by contract.
     pub async fn memory_stats(
         &self,
     ) -> (
@@ -1861,7 +2315,7 @@ impl SignalStoreCache {
     ) {
         use crate::stats::CollectionStats;
 
-        // Sizing a record walks its whole protobuf tree, and these mutexes
+        // Sizing a record walks its whole structure tree, and these mutexes
         // serialize the Signal encrypt/decrypt path — so only key lengths and
         // Arc refcount bumps happen under the locks; the estimated_size walks
         // run after each guard drops. Identities are raw bytes (len is free)
@@ -1874,13 +2328,13 @@ impl SignalStoreCache {
                 .iter()
                 .filter_map(|(k, v)| {
                     keys_len += k.len();
-                    match v {
-                        SessionEntry::Present(rec) => Some(rec.clone()),
-                        SessionEntry::Absent | SessionEntry::CheckedOut { .. } => None,
-                    }
+                    v.flushable_record().cloned()
                 })
                 .collect();
-            keys_len += s.cache.overhead_bytes();
+            keys_len += s.cache.overhead_bytes()
+                + crate::stats::hash_table_bytes(s.dirty.capacity(), size_of::<Arc<str>>())
+                + crate::stats::hash_table_bytes(s.deleted.capacity(), size_of::<Arc<str>>())
+                + s.reservation_pending.table_bytes();
             (s.cache.len() as u64, keys_len, recs)
         };
         let session_bytes: usize = session_keys_len
@@ -1897,7 +2351,10 @@ impl SignalStoreCache {
                 .iter()
                 .map(|(k, v)| k.len() + v.as_ref().map_or(0, |b| b.len()))
                 .sum::<usize>()
-                + i.cache.overhead_bytes();
+                + i.cache.overhead_bytes()
+                + crate::stats::hash_table_bytes(i.dirty.capacity(), size_of::<Arc<str>>())
+                + crate::stats::hash_table_bytes(i.deleted.capacity(), size_of::<Arc<str>>())
+                + self.identity_continuity.estimated_heap_bytes();
             CollectionStats::new(i.cache.len() as u64, bytes as u64)
         };
 
@@ -1924,7 +2381,14 @@ impl SignalStoreCache {
                 .fold((0usize, 0usize), |(count, bytes), key| {
                     (count + 1, bytes + key.len())
                 });
-            keys_len += pending_only_key_bytes + sk.cache.overhead_bytes();
+            keys_len += pending_only_key_bytes
+                + sk.cache.overhead_bytes()
+                + crate::stats::hash_table_bytes(sk.dirty.capacity(), size_of::<Arc<str>>())
+                + sk.wire_gate_pending.table_bytes()
+                + crate::stats::hash_table_bytes(
+                    sk.pending_distributions.capacity(),
+                    size_of::<(Arc<str>, Arc<[u8]>)>(),
+                );
             (
                 (sk.cache.len() + pending_only_count) as u64,
                 keys_len,
@@ -1946,8 +2410,10 @@ impl SignalStoreCache {
     }
 
     async fn clear_with_incarnation(&self, incarnation: StoreIncarnation) {
+        let _identity_change = self.identity_continuity.changing([]);
         self.session_recovery_generation
             .fetch_add(1, Ordering::AcqRel);
+        let _flush_guard = self.flush_lock.lock().await;
         {
             let mut sessions = self.sessions.lock().await;
             let mut pending = self.pending_session_restores();
@@ -1970,6 +2436,7 @@ impl SignalStoreCache {
     /// Only a discard can make a post-flush write's stale snapshot reloadable.
     #[doc(hidden)]
     pub async fn clear_after_flush(&self) {
+        let _flush_guard = self.flush_lock.lock().await;
         let mut sessions = self.lock_sessions().await;
         if sessions.dirty.is_empty()
             && sessions.deleted.is_empty()
@@ -2246,6 +2713,128 @@ mod sender_key_lock_tests {
             .sender_key_state()
             .expect("record must carry a state")
             .chain_id()
+    }
+
+    /// The report has to charge what the allocator is holding, not what the
+    /// entries measure: a `HashMap` of n identities owns more buckets than n,
+    /// and the dirty set, the user index and the pre-wire gate beside it are
+    /// allocations too. Before these were counted the identity store reported
+    /// only its keys and payloads — which is exactly the figure that stays
+    /// quiet while the tables are what is growing.
+    #[tokio::test]
+    async fn identity_report_charges_the_tables_not_just_the_entries() {
+        const IDENTITIES: usize = 200;
+
+        let cache = SignalStoreCache::new();
+        let mut entry_bytes = 0usize;
+        for i in 0..IDENTITIES {
+            let address = format!("1999555{i:04}:0");
+            entry_bytes += address.len() + 32;
+            cache
+                .put_identity(&ProtocolAddress::new(&address, 0.into()), &[7u8; 32])
+                .await;
+        }
+
+        let (_, identities, _) = cache.memory_stats().await;
+        assert_eq!(identities.entries, IDENTITIES as u64);
+        assert!(
+            identities.bytes > entry_bytes as u64,
+            "the report must exceed the {entry_bytes} B of keys and payloads it holds, \
+             got {}",
+            identities.bytes
+        );
+    }
+
+    /// A distribution is retained when its durability gate fails, which can
+    /// land before the record itself reaches the cache. Both orders must end
+    /// up sharing one `Arc<str>`: two allocations for one address is a real
+    /// (if small) waste, and it also makes `memory_stats` charge the string
+    /// once for storage it holds twice.
+    #[tokio::test]
+    async fn pending_distribution_and_cache_share_one_key() {
+        for pending_first in [true, false] {
+            let cache = SignalStoreCache::new();
+            let name =
+                SenderKeyName::from_parts("19995550001@g.us", "19995550002@s.whatsapp.net:0");
+
+            let retain = || async {
+                cache
+                    .cache_pending_sender_key_distribution(&name, Arc::from(&[1u8, 2, 3][..]))
+                    .await
+            };
+            let store = || async {
+                cache
+                    .put_sender_key(&name, sender_key_record_with_chain(3))
+                    .await
+            };
+
+            if pending_first {
+                retain().await;
+                store().await;
+            } else {
+                store().await;
+                retain().await;
+            }
+
+            let state = cache.sender_keys.lock().await;
+            let (cache_key, _) = state
+                .cache
+                .get_key_value(name.cache_key())
+                .expect("record cached");
+            let (pending_key, _) = state
+                .pending_distributions
+                .get_key_value(name.cache_key())
+                .expect("distribution retained");
+            assert!(
+                Arc::ptr_eq(cache_key, pending_key),
+                "pending_first={pending_first}: the two sides must share one allocation"
+            );
+        }
+    }
+
+    /// The third way a record reaches the cache: not a `put`, but a cold read
+    /// populating it from the backend. It has to canonicalize too, or a
+    /// distribution retained while the record was still cold leaves the store
+    /// holding two keys for one address.
+    #[tokio::test]
+    async fn a_cold_load_reuses_a_pending_distribution_key() {
+        let cache = SignalStoreCache::new();
+        let backend = crate::store::in_memory::InMemoryBackend::new();
+        let name = SenderKeyName::from_parts("19995550001@g.us", "19995550002@s.whatsapp.net:0");
+        backend
+            .put_sender_key(
+                name.cache_key(),
+                &sender_key_record_with_chain(5)
+                    .serialize()
+                    .expect("serialize record"),
+            )
+            .await
+            .expect("seed backend");
+
+        // Retained first, so the pending map owns the only key for this
+        // address when the cold load goes to insert its own.
+        cache
+            .cache_pending_sender_key_distribution(&name, Arc::from(&[9u8, 8][..]))
+            .await;
+        cache
+            .get_sender_key(&name, &backend)
+            .await
+            .expect("cold load")
+            .expect("record present");
+
+        let state = cache.sender_keys.lock().await;
+        let (cache_key, _) = state
+            .cache
+            .get_key_value(name.cache_key())
+            .expect("record cached");
+        let (pending_key, _) = state
+            .pending_distributions
+            .get_key_value(name.cache_key())
+            .expect("distribution retained");
+        assert!(
+            Arc::ptr_eq(cache_key, pending_key),
+            "the cold load must adopt the pending key, not allocate a second"
+        );
     }
 
     #[tokio::test]
@@ -3296,6 +3885,66 @@ mod sender_key_lock_tests {
         );
     }
 
+    /// A send faults its whole fan-out with one backend read: hits install as
+    /// present, misses as absent, and afterwards every probe and checkout is
+    /// served synchronously with no backend consult left to make.
+    #[tokio::test]
+    async fn prefetch_faults_a_whole_fanout_in_one_backend_read() {
+        let backend = crate::store::in_memory::InMemoryBackend::new();
+        let writer = SignalStoreCache::with_max_entries_and_incarnation(
+            DEFAULT_MAX_CACHE_ENTRIES,
+            [0xA1; 16],
+        );
+        let present: Vec<ProtocolAddress> = (0..4u8)
+            .map(|i| ProtocolAddress::new(&format!("199955510{i}@c.us"), 0.into()))
+            .collect();
+        for addr in &present {
+            writer.put_session(addr, SessionRecord::new_fresh()).await;
+        }
+        writer.flush(&backend).await.expect("seed flush");
+
+        let cache = SignalStoreCache::with_max_entries_and_incarnation(
+            DEFAULT_MAX_CACHE_ENTRIES,
+            [0xA1; 16],
+        );
+        let missing = ProtocolAddress::new("19995551999@c.us", 0.into());
+        let fanout: Vec<ProtocolAddress> = present
+            .iter()
+            .cloned()
+            .chain(std::iter::once(missing.clone()))
+            .collect();
+        cache
+            .prefetch_sessions(&fanout, &backend)
+            .await
+            .expect("prefetch");
+
+        for addr in &present {
+            assert_eq!(
+                cache.try_has_session(addr),
+                Some(true),
+                "a prefetched hit must answer synchronously"
+            );
+            let (record, checkout) = cache
+                .try_checkout_session(addr)
+                .expect("lock free")
+                .expect("cached hit checks out");
+            assert!(record.is_some(), "the prefetched row must decode");
+            cache.cancel_session_checkout(addr, checkout);
+        }
+        assert_eq!(
+            cache.try_has_session(&missing),
+            Some(false),
+            "a prefetched miss must answer negatively without a backend read"
+        );
+
+        // A warm prefetch is only the lock scan: everything is already known.
+        cache
+            .prefetch_sessions(&fanout, &backend)
+            .await
+            .expect("warm prefetch");
+        assert_eq!(cache.try_has_session(&missing), Some(false));
+    }
+
     #[tokio::test]
     async fn try_identity_paths_cover_hit_miss_and_contention() {
         let cache = SignalStoreCache::new();
@@ -3769,18 +4418,7 @@ mod consumed_prekey_atomicity_tests {
         );
     }
 
-    /// A decrypt racing a flush must never lose the session<->prekey atomicity.
-    ///
-    /// Sender A's flush holds the sessions lock across both the session commit AND
-    /// the consumed-prekey drain. While it is mid-flush, sender B's decrypt tries to
-    /// promote B's session and buffer B's consumed prekey. Because the prekey buffer
-    /// is drained under that same sessions lock, B cannot reach the buffer until A's
-    /// flush has fully committed and released the lock, so A's flush can never delete
-    /// B's prekey while B's session is still volatile. The buggy form (prekey drain
-    /// in a separate lock scope) releases the sessions lock first, leaving a window
-    /// where B buffers its prekey and A then durably deletes it with B's session
-    /// unflushed. The backend asserts the sessions lock is held at the moment the
-    /// prekey is deleted, which directly distinguishes the fixed and buggy forms.
+    /// A prekey buffered during I/O belongs to the next session snapshot.
     #[tokio::test]
     async fn concurrent_decrypt_does_not_lose_prekey_during_flush() {
         use std::sync::Arc as StdArc;
@@ -3789,22 +4427,13 @@ mod consumed_prekey_atomicity_tests {
         const PREKEY_A: u32 = 1001;
         const PREKEY_B: u32 = 1002;
 
-        /// Wraps an InMemoryBackend. `put_sessions_batch` yields the executor many
-        /// times before doing the real write, so a concurrently spawned decrypt has
-        /// every chance to reach (and block on) the sessions lock while A's flush
-        /// holds it. `remove_prekey` records whether the sessions lock was actually
-        /// held (the core invariant the fix establishes) and flags any prekey delete
-        /// whose owning session is not yet durable.
         struct GatedBackend {
             inner: InMemoryBackend,
-            // The cache under flush, so the backend can probe the sessions lock.
-            cache: StdArc<SignalStoreCache>,
-            // Set if a prekey was deleted while the sessions lock was NOT held: that
-            // is the regression (prekey drain outside the sessions lock scope).
-            drained_without_sessions_lock: StdArc<AtomicBool>,
-            // Set if a prekey delete ever ran while its session was still volatile.
             violation: StdArc<AtomicBool>,
             addr_b: String,
+            gate: AtomicBool,
+            entered: async_channel::Sender<()>,
+            release: async_channel::Receiver<()>,
         }
 
         #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
@@ -3814,11 +4443,9 @@ mod consumed_prekey_atomicity_tests {
                 &self,
                 sessions: &[(Arc<str>, bytes::Bytes)],
             ) -> crate::store::error::Result<()> {
-                // A's flush holds the sessions lock here; yield repeatedly so B's
-                // spawned decrypt gets scheduled and blocks on that lock before the
-                // session commit (and the prekey drain) completes.
-                for _ in 0..64 {
-                    tokio::task::yield_now().await;
+                if self.gate.swap(false, Ordering::SeqCst) {
+                    self.entered.send(()).await.unwrap();
+                    self.release.recv().await.unwrap();
                 }
                 self.inner.put_sessions_batch(sessions).await
             }
@@ -3826,13 +4453,6 @@ mod consumed_prekey_atomicity_tests {
                 self.inner.mark_prekeys_uploaded(ids).await
             }
             async fn remove_prekey(&self, id: u32) -> crate::store::error::Result<()> {
-                // The fix drains prekeys under the sessions lock, so a try_lock here
-                // must fail while a flush is deleting. If it succeeds, the drain ran
-                // outside the sessions lock: the exact regression.
-                if self.cache.sessions.try_lock().is_some() {
-                    self.drained_without_sessions_lock
-                        .store(true, Ordering::SeqCst);
-                }
                 // B's prekey may only be deleted once B's session is durable.
                 if id == PREKEY_B
                     && self
@@ -3950,12 +4570,14 @@ mod consumed_prekey_atomicity_tests {
 
         let cache = StdArc::new(SignalStoreCache::new());
         let violation = StdArc::new(AtomicBool::new(false));
-        let drained_without_sessions_lock = StdArc::new(AtomicBool::new(false));
+        let (entered_tx, entered_rx) = async_channel::bounded(1);
+        let (release_tx, release_rx) = async_channel::bounded(1);
 
         let backend = StdArc::new(GatedBackend {
             inner,
-            cache: cache.clone(),
-            drained_without_sessions_lock: drained_without_sessions_lock.clone(),
+            gate: AtomicBool::new(true),
+            entered: entered_tx,
+            release: release_rx,
             violation: violation.clone(),
             addr_b: addr_b.as_str().to_string(),
         });
@@ -3964,32 +4586,25 @@ mod consumed_prekey_atomicity_tests {
         cache.put_session(&addr_a, SessionRecord::new_fresh()).await;
         cache.remove_prekey(PREKEY_A, addr_a.as_str()).await;
 
-        // Sender B's decrypt races A's flush: it promotes B's session and buffers
-        // B's consumed prekey. put_session must take the sessions lock, so while A's
-        // flush holds it (yielding inside put_sessions_batch) B blocks here and can
-        // only buffer once A's flush has committed and released the lock.
-        let b_cache = cache.clone();
-        let addr_b_task = addr_b.clone();
-        let b_task = tokio::spawn(async move {
-            b_cache
-                .put_session(&addr_b_task, SessionRecord::new_fresh())
-                .await;
-            b_cache.remove_prekey(PREKEY_B, addr_b_task.as_str()).await;
-        });
-
-        // A's flush runs concurrently with B's spawned decrypt. It holds the
-        // sessions lock across its yielding I/O and the prekey drain, so B cannot
-        // insert into removed_prekeys until A is done: A can never delete B's prekey.
-        cache.flush(backend.as_ref()).await.unwrap();
-        b_task.await.unwrap();
-
-        // The core invariant: every prekey delete during the flush ran while the
-        // sessions lock was held, so no concurrent decrypt could have buffered a
-        // prekey into the same drain. This is what makes session+prekey atomic.
+        let mut flush = Box::pin(cache.flush(backend.as_ref()));
+        assert!(futures::poll!(flush.as_mut()).is_pending());
+        entered_rx.try_recv().unwrap();
         assert!(
-            !drained_without_sessions_lock.load(Ordering::SeqCst),
-            "prekey was drained without holding the sessions lock (regression)"
+            cache
+                .try_put_session(&addr_b, SessionRecord::new_fresh())
+                .is_ok()
         );
+        cache.remove_prekey(PREKEY_B, addr_b.as_str()).await;
+        assert!(
+            backend
+                .inner
+                .get_session(addr_b.as_str())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        release_tx.try_send(()).unwrap();
+        flush.await.unwrap();
 
         // The flush must never have deleted B's prekey while B's session was
         // volatile.
@@ -4012,8 +4627,7 @@ mod consumed_prekey_atomicity_tests {
             "sender A's consumed prekey must be deleted with its session"
         );
 
-        // B buffered its prekey only after A's flush completed, so B's prekey is
-        // still durable and still buffered for B's own next flush.
+        // B was absent from the snapshot, so its prekey must survive this flush.
         assert!(
             backend.load_prekey(PREKEY_B).await.unwrap().is_some(),
             "B's prekey must survive a concurrent flush that did not persist B's session"
@@ -4047,6 +4661,33 @@ mod consumed_prekey_atomicity_tests {
 #[cfg(test)]
 mod eviction_tests {
     use super::*;
+
+    #[test]
+    fn bounded_candidates_keep_negative_priority_without_retaining_every_key() {
+        let positives: Vec<Arc<str>> = (0..64)
+            .map(|i| Arc::from(format!("positive-{i}")))
+            .collect();
+        let mut candidates = EvictionCandidates::new(4);
+        for key in &positives {
+            assert!(!candidates.consider(key, false));
+            assert!(candidates.keys.len() <= 4);
+        }
+        assert_eq!(Arc::strong_count(&positives[63]), 1);
+        for i in 0..4 {
+            let key = Arc::from(format!("negative-{i}"));
+            assert_eq!(candidates.consider(&key, true), i == 3);
+            assert_eq!(candidates.keys.len(), 4);
+        }
+        assert!(
+            candidates
+                .keys
+                .iter()
+                .all(|key| key.starts_with("negative-"))
+        );
+        assert!(candidates.consider(&Arc::from("extra"), false));
+        assert_eq!(candidates.keys.len(), 4);
+        assert!(EvictionCandidates::new(0).consider(&Arc::from("unused"), true));
+    }
     use crate::libsignal::protocol::{DeviceId, ProtocolAddress};
     use crate::store::in_memory::InMemoryBackend;
 
@@ -4686,6 +5327,53 @@ mod pre_wire_gate_tests {
         record
     }
 
+    #[tokio::test]
+    async fn leased_checkout_preserves_a_flushable_snapshot_and_gates_its_next_lease() {
+        let backend = InMemoryBackend::new();
+        let cache = SignalStoreCache::new();
+        let address = addr("19995551020");
+        cache.put_session(&address, leased_record()).await;
+        let mut taken = cache
+            .get_session(&address, &backend)
+            .await
+            .unwrap()
+            .unwrap();
+        cache.flush(&backend).await.unwrap();
+        assert!(
+            !cache.needs_pre_wire_flush().await,
+            "a checkout must not hide the lease needed by an already completed encrypt"
+        );
+        taken.reserve_sender_chain_counters(64);
+        cache.put_session(&address, taken).await;
+        assert!(cache.needs_pre_wire_flush().await);
+        cache.flush(&backend).await.unwrap();
+        assert!(!cache.needs_pre_wire_flush().await);
+    }
+
+    #[tokio::test]
+    async fn a_checkout_snapshot_settles_its_lease_but_keeps_its_prekey() {
+        let backend = InMemoryBackend::new();
+        let cache = SignalStoreCache::new();
+        let address = addr("19995551032");
+        backend.store_prekey(9202, b"key", false).await.unwrap();
+        cache.put_session(&address, leased_record()).await;
+        cache.remove_prekey(9202, address.as_str()).await;
+        let taken = cache
+            .get_session(&address, &backend)
+            .await
+            .unwrap()
+            .unwrap();
+        cache.flush(&backend).await.unwrap();
+        assert!(!cache.needs_pre_wire_flush().await);
+        assert!(
+            backend.load_prekey(9202).await.unwrap().is_some(),
+            "the mutable owner can still consume this key"
+        );
+        cache.put_session(&address, taken).await;
+        cache.flush(&backend).await.unwrap();
+        assert!(backend.load_prekey(9202).await.unwrap().is_none());
+    }
+
     /// The lock-free flags only exist to answer `needs_pre_wire_flush`, so
     /// every mutation of either pending set has to leave them agreeing with it.
     async fn assert_gate_agrees(cache: &SignalStoreCache, after: &str) {
@@ -4923,11 +5611,8 @@ mod pre_wire_gate_tests {
         assert!(!cache.needs_pre_wire_flush().await);
     }
 
-    /// A checked-out session cannot be persisted by a flush, so its pending
-    /// lease must survive that flush and release only once the returned
-    /// record is actually written.
     #[tokio::test]
-    async fn checked_out_session_keeps_its_lease_pending_across_a_flush() {
+    async fn a_checked_out_lease_stays_gated_when_its_snapshot_write_fails() {
         let backend = InMemoryBackend::new();
         let cache = SignalStoreCache::new();
         let a = addr("15550000004");
@@ -4935,12 +5620,15 @@ mod pre_wire_gate_tests {
         cache.put_session(&a, leased_record()).await;
         let taken = cache.get_session(&a, &backend).await.unwrap().unwrap();
 
-        cache.flush(&backend).await.unwrap();
+        backend.set_fail_session_writes(true);
+        assert!(cache.flush(&backend).await.is_err());
         assert!(
             cache.needs_pre_wire_flush().await,
-            "a checked-out lease was not persisted and must keep the gate closed"
+            "a failed snapshot write must keep the checked-out lease gated"
         );
-
+        backend.set_fail_session_writes(false);
+        cache.flush(&backend).await.unwrap();
+        assert!(!cache.needs_pre_wire_flush().await);
         cache.put_session(&a, taken).await;
         cache.flush(&backend).await.unwrap();
         assert!(!cache.needs_pre_wire_flush().await);
@@ -4970,6 +5658,52 @@ mod pre_wire_gate_tests {
 
         cache.flush(&backend).await.unwrap();
         assert!(!cache.needs_pre_wire_flush().await);
+    }
+
+    /// A backend can commit a prefix of a default per-key batch and then
+    /// report an error. The cache must retain every gate until a later retry
+    /// confirms all current values, including the row after the prefix.
+    #[tokio::test]
+    async fn partial_session_batch_failure_keeps_all_gates_for_retry() {
+        let backend = InMemoryBackend::new();
+        let cache = SignalStoreCache::new();
+        let first = addr("15550001021");
+        let second = addr("15550001022");
+        cache.put_session(&first, leased_record()).await;
+        cache.put_session(&second, leased_record()).await;
+        backend.set_fail_session_after_prefix(Some(1));
+
+        assert!(cache.flush(&backend).await.is_err());
+        assert!(cache.needs_pre_wire_flush().await);
+        {
+            let state = cache.lock_sessions().await;
+            assert!(state.dirty.contains(first.as_str()));
+            assert!(state.dirty.contains(second.as_str()));
+            assert!(state.reservation_pending.contains(first.as_str()));
+            assert!(state.reservation_pending.contains(second.as_str()));
+        }
+        let first_written = backend.get_session(first.as_str()).await.unwrap().is_some();
+        let second_written = backend
+            .get_session(second.as_str())
+            .await
+            .unwrap()
+            .is_some();
+        assert_ne!(
+            first_written, second_written,
+            "the injected backend must commit exactly one prefix row"
+        );
+
+        backend.set_fail_session_after_prefix(None);
+        cache.flush(&backend).await.unwrap();
+        assert!(!cache.needs_pre_wire_flush().await);
+        assert!(backend.get_session(first.as_str()).await.unwrap().is_some());
+        assert!(
+            backend
+                .get_session(second.as_str())
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     /// The sender-key counterpart of `failed_flush_keeps_the_gate_closed`: a
@@ -6003,5 +6737,1063 @@ mod cold_read_race_tests {
 }
 
 #[cfg(test)]
+mod flush_contention_reproduction_tests {
+    use super::*;
+    use crate::libsignal::protocol::{
+        ChainKey, IdentityKey, KeyPair, ProtocolAddress, RootKey, SessionRecord, SessionState,
+    };
+    use crate::store::in_memory::InMemoryBackend;
+    use crate::store::traits::SignalStore;
+    use std::future::poll_fn;
+    use std::pin::pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::Poll;
+
+    fn session_at_index(index: u32) -> SessionRecord {
+        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let local = IdentityKey::new(KeyPair::generate(&mut rng).public_key);
+        let remote = IdentityKey::new(KeyPair::generate(&mut rng).public_key);
+        let base_key = KeyPair::generate(&mut rng).public_key;
+        let mut state = SessionState::new(3, &local, &remote, &RootKey::new([4u8; 32]), &base_key);
+        state.set_sender_chain(
+            &KeyPair::generate(&mut rng),
+            &ChainKey::new([7u8; 32], index),
+        );
+        SessionRecord::new(state)
+    }
+
+    fn chain_index_of(record: &SessionRecord) -> u32 {
+        record
+            .session_state()
+            .expect("session state")
+            .get_sender_chain_key()
+            .expect("sender chain")
+            .index()
+    }
+
+    fn signal_address(user: &str) -> ProtocolAddress {
+        ProtocolAddress::new(&format!("{user}@s.whatsapp.net"), 0.into())
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum FlushTarget {
+        Sessions,
+        SessionReads,
+        Identities,
+        SenderKeys,
+        SessionDeletes,
+        SenderKeyDeletes,
+        Prekeys,
+    }
+
+    struct ContentionGatedBackend {
+        inner: InMemoryBackend,
+        gating_enabled: AtomicBool,
+        target: FlushTarget,
+        entered_tx: async_channel::Sender<()>,
+        release_rx: async_channel::Receiver<()>,
+    }
+
+    impl ContentionGatedBackend {
+        fn new(
+            entered_tx: async_channel::Sender<()>,
+            release_rx: async_channel::Receiver<()>,
+        ) -> Self {
+            Self {
+                inner: InMemoryBackend::new(),
+                gating_enabled: AtomicBool::new(false),
+                target: FlushTarget::Sessions,
+                entered_tx,
+                release_rx,
+            }
+        }
+
+        fn enable_gating(&self) {
+            self.gating_enabled.store(true, Ordering::Release);
+        }
+
+        async fn gate(&self, target: FlushTarget) {
+            if self.gating_enabled.load(Ordering::Acquire) && self.target == target {
+                self.entered_tx.send(()).await.unwrap();
+                self.release_rx.recv().await.unwrap();
+            }
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+    impl SignalStore for ContentionGatedBackend {
+        async fn put_sessions_batch(
+            &self,
+            sessions: &[(Arc<str>, bytes::Bytes)],
+        ) -> crate::store::error::Result<()> {
+            self.gate(FlushTarget::Sessions).await;
+            self.inner.put_sessions_batch(sessions).await
+        }
+
+        async fn put_identities_batch(
+            &self,
+            rows: &[(Arc<str>, [u8; 32])],
+        ) -> crate::store::error::Result<()> {
+            self.gate(FlushTarget::Identities).await;
+            self.inner.put_identities_batch(rows).await
+        }
+
+        async fn put_sender_keys_batch(
+            &self,
+            rows: &[(Arc<str>, bytes::Bytes)],
+        ) -> crate::store::error::Result<()> {
+            self.gate(FlushTarget::SenderKeys).await;
+            self.inner.put_sender_keys_batch(rows).await
+        }
+
+        async fn delete_sender_keys_batch(
+            &self,
+            rows: &[Arc<str>],
+        ) -> crate::store::error::Result<()> {
+            self.gate(FlushTarget::SenderKeyDeletes).await;
+            self.inner.delete_sender_keys_batch(rows).await
+        }
+
+        async fn get_session(
+            &self,
+            address: &str,
+        ) -> crate::store::error::Result<Option<bytes::Bytes>> {
+            self.gate(FlushTarget::SessionReads).await;
+            self.inner.get_session(address).await
+        }
+
+        async fn put_session(
+            &self,
+            address: &str,
+            session: &[u8],
+        ) -> crate::store::error::Result<()> {
+            self.inner.put_session(address, session).await
+        }
+
+        async fn delete_session(&self, address: &str) -> crate::store::error::Result<()> {
+            self.inner.delete_session(address).await
+        }
+
+        async fn delete_sessions_batch(
+            &self,
+            addresses: &[Arc<str>],
+        ) -> crate::store::error::Result<()> {
+            self.gate(FlushTarget::SessionDeletes).await;
+            self.inner.delete_sessions_batch(addresses).await
+        }
+
+        async fn get_sessions_batch(
+            &self,
+            addresses: &[Arc<str>],
+        ) -> crate::store::error::Result<Vec<(Arc<str>, bytes::Bytes)>> {
+            self.inner.get_sessions_batch(addresses).await
+        }
+
+        async fn load_identity(
+            &self,
+            address: &str,
+        ) -> crate::store::error::Result<Option<[u8; 32]>> {
+            self.inner.load_identity(address).await
+        }
+
+        async fn put_identity(
+            &self,
+            address: &str,
+            key: [u8; 32],
+        ) -> crate::store::error::Result<()> {
+            self.inner.put_identity(address, key).await
+        }
+
+        async fn delete_identity(&self, address: &str) -> crate::store::error::Result<()> {
+            self.inner.delete_identity(address).await
+        }
+
+        async fn store_prekey(
+            &self,
+            id: u32,
+            record: &[u8],
+            uploaded: bool,
+        ) -> crate::store::error::Result<()> {
+            self.inner.store_prekey(id, record, uploaded).await
+        }
+
+        async fn load_prekey(&self, id: u32) -> crate::store::error::Result<Option<bytes::Bytes>> {
+            self.inner.load_prekey(id).await
+        }
+
+        async fn mark_prekeys_uploaded(&self, ids: &[u32]) -> crate::store::error::Result<()> {
+            self.inner.mark_prekeys_uploaded(ids).await
+        }
+
+        async fn remove_prekey(&self, id: u32) -> crate::store::error::Result<()> {
+            self.inner.remove_prekey(id).await
+        }
+
+        async fn remove_prekeys_batch(&self, ids: &[u32]) -> crate::store::error::Result<()> {
+            self.gate(FlushTarget::Prekeys).await;
+            self.inner.remove_prekeys_batch(ids).await
+        }
+
+        async fn get_max_prekey_id(&self) -> crate::store::error::Result<u32> {
+            self.inner.get_max_prekey_id().await
+        }
+
+        async fn store_signed_prekey(
+            &self,
+            id: u32,
+            record: &[u8],
+        ) -> crate::store::error::Result<()> {
+            self.inner.store_signed_prekey(id, record).await
+        }
+
+        async fn load_signed_prekey(
+            &self,
+            id: u32,
+        ) -> crate::store::error::Result<Option<Vec<u8>>> {
+            self.inner.load_signed_prekey(id).await
+        }
+
+        async fn load_all_signed_prekeys(
+            &self,
+        ) -> crate::store::error::Result<Vec<(u32, Vec<u8>)>> {
+            self.inner.load_all_signed_prekeys().await
+        }
+
+        async fn remove_signed_prekey(&self, id: u32) -> crate::store::error::Result<()> {
+            self.inner.remove_signed_prekey(id).await
+        }
+
+        async fn put_sender_key(
+            &self,
+            address: &str,
+            record: &[u8],
+        ) -> crate::store::error::Result<()> {
+            self.inner.put_sender_key(address, record).await
+        }
+
+        async fn get_sender_key(
+            &self,
+            address: &str,
+        ) -> crate::store::error::Result<Option<Vec<u8>>> {
+            self.inner.get_sender_key(address).await
+        }
+
+        async fn delete_sender_key(&self, address: &str) -> crate::store::error::Result<()> {
+            self.inner.delete_sender_key(address).await
+        }
+    }
+
+    #[tokio::test]
+    async fn cold_prekey_probes_allow_progress_and_revalidate_before_deletion() {
+        #[derive(Clone, Copy, Debug)]
+        enum Race {
+            None,
+            Checkout,
+            Write,
+            Delete,
+            Reconsume,
+        }
+
+        for race in [
+            Race::None,
+            Race::Checkout,
+            Race::Write,
+            Race::Delete,
+            Race::Reconsume,
+        ] {
+            let (entered_tx, entered_rx) = async_channel::bounded(1);
+            let (release_tx, release_rx) = async_channel::bounded(1);
+            let mut backend = ContentionGatedBackend::new(entered_tx, release_rx);
+            backend.target = FlushTarget::SessionReads;
+            let cache = SignalStoreCache::new();
+            let address = signal_address("cold-probe-owner");
+            let incarnation = cache.lock_sessions().await.incarnation;
+            let mut raw = Vec::new();
+            session_at_index(20).serialize_into_for_store(&mut raw, &incarnation);
+            backend
+                .inner
+                .put_session(address.as_str(), &raw)
+                .await
+                .unwrap();
+            backend
+                .inner
+                .store_prekey(9301, b"key", false)
+                .await
+                .unwrap();
+            cache.remove_prekey(9301, address.as_str()).await;
+            backend.enable_gating();
+            let mut flush = Box::pin(cache.flush(&backend));
+            assert!(futures::poll!(flush.as_mut()).is_pending());
+            entered_rx.try_recv().unwrap();
+            backend.gating_enabled.store(false, Ordering::Release);
+            let mut owner = None;
+            match race {
+                Race::None => {}
+                Race::Checkout => {
+                    let mut checkout = Box::pin(cache.checkout_session(&address, &backend));
+                    let Poll::Ready(Ok((record, token))) = futures::poll!(checkout.as_mut()) else {
+                        panic!("readonly durability probe blocked session checkout");
+                    };
+                    owner = Some((record.unwrap(), token));
+                }
+                Race::Write => assert!(
+                    cache
+                        .try_put_session(&address, session_at_index(21))
+                        .is_ok()
+                ),
+                Race::Delete => {
+                    let mut delete = Box::pin(cache.delete_session(&address));
+                    assert!(futures::poll!(delete.as_mut()).is_ready());
+                }
+                Race::Reconsume => {
+                    let mut reconsume = Box::pin(cache.remove_prekey(9301, address.as_str()));
+                    assert!(futures::poll!(reconsume.as_mut()).is_ready());
+                }
+            }
+            release_tx.try_send(()).unwrap();
+            flush.await.unwrap();
+            assert_eq!(
+                backend.inner.load_prekey(9301).await.unwrap().is_none(),
+                matches!(race, Race::None),
+                "{race:?}"
+            );
+            if let Some((record, token)) = owner {
+                cache.restore_session_from_checkout(&address, record, token, true);
+            }
+            cache.flush(&backend).await.unwrap();
+            assert_eq!(
+                backend.inner.load_prekey(9301).await.unwrap().is_some(),
+                matches!(race, Race::Delete),
+                "{race:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn identity_and_sender_key_mutations_survive_an_older_flush() {
+        for target in [FlushTarget::Identities, FlushTarget::SenderKeys] {
+            let (entered_tx, entered_rx) = async_channel::bounded(1);
+            let (release_tx, release_rx) = async_channel::bounded(1);
+            let mut backend = ContentionGatedBackend::new(entered_tx, release_rx);
+            backend.target = target;
+            let cache = SignalStoreCache::new();
+            let address = signal_address("19995551025");
+            let name = SenderKeyName::from_parts("120363000000000025@g.us", address.as_str());
+            if target == FlushTarget::Identities {
+                cache.put_identity(&address, &[1; 32]).await;
+            } else {
+                let mut record = SenderKeyRecord::new_empty();
+                record.mark_wire_gated();
+                cache.put_sender_key(&name, record).await;
+            }
+            backend.enable_gating();
+            let mut flush = Box::pin(cache.flush(&backend));
+            assert!(futures::poll!(flush.as_mut()).is_pending());
+            entered_rx.try_recv().unwrap();
+            if target == FlushTarget::Identities {
+                assert!(cache.try_put_identity(&address, &[2; 32]));
+            } else {
+                let mut record = SenderKeyRecord::new_empty();
+                record.mark_wire_gated();
+                let mut put = Box::pin(cache.put_sender_key(&name, record));
+                assert!(futures::poll!(put.as_mut()).is_ready());
+            }
+            release_tx.try_send(()).unwrap();
+            flush.await.unwrap();
+            if target == FlushTarget::Identities {
+                assert!(
+                    cache
+                        .identities
+                        .lock()
+                        .await
+                        .dirty
+                        .contains(address.as_str())
+                );
+                assert_eq!(
+                    backend.inner.load_identity(address.as_str()).await.unwrap(),
+                    Some([1; 32])
+                );
+            } else {
+                assert!(
+                    cache
+                        .sender_keys
+                        .lock()
+                        .await
+                        .dirty
+                        .contains(name.cache_key())
+                );
+                assert!(cache.needs_pre_wire_flush().await);
+            }
+            backend.gating_enabled.store(false, Ordering::Release);
+            cache.flush(&backend).await.unwrap();
+            assert!(!cache.needs_pre_wire_flush().await);
+            if target == FlushTarget::Identities {
+                assert_eq!(
+                    backend.inner.load_identity(address.as_str()).await.unwrap(),
+                    Some([2; 32])
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn replacements_during_tombstone_io_remain_dirty_and_gated() {
+        for target in [FlushTarget::SessionDeletes, FlushTarget::SenderKeyDeletes] {
+            let (entered_tx, entered_rx) = async_channel::bounded(1);
+            let (release_tx, release_rx) = async_channel::bounded(1);
+            let mut backend = ContentionGatedBackend::new(entered_tx, release_rx);
+            backend.target = target;
+            let cache = SignalStoreCache::new();
+            let address = signal_address("19995551026");
+            let name = SenderKeyName::from_parts("120363000000000026@g.us", address.as_str());
+            if target == FlushTarget::SessionDeletes {
+                cache.delete_session(&address).await;
+            } else {
+                cache.delete_sender_key(name.cache_key()).await;
+            }
+            backend.enable_gating();
+            let mut flush = Box::pin(cache.flush(&backend));
+            assert!(futures::poll!(flush.as_mut()).is_pending());
+            entered_rx.try_recv().unwrap();
+            if target == FlushTarget::SessionDeletes {
+                let mut record = session_at_index(64);
+                record.reserve_sender_chain_counters(64);
+                assert!(cache.try_put_session(&address, record).is_ok());
+            } else {
+                let mut record = SenderKeyRecord::new_empty();
+                record.mark_wire_gated();
+                let mut put = Box::pin(cache.put_sender_key(&name, record));
+                assert!(futures::poll!(put.as_mut()).is_ready());
+            }
+            release_tx.try_send(()).unwrap();
+            flush.await.unwrap();
+            assert!(cache.needs_pre_wire_flush().await);
+            backend.gating_enabled.store(false, Ordering::Release);
+            cache.flush(&backend).await.unwrap();
+            assert!(!cache.needs_pre_wire_flush().await);
+            if target == FlushTarget::SessionDeletes {
+                assert!(
+                    backend
+                        .inner
+                        .get_session(address.as_str())
+                        .await
+                        .unwrap()
+                        .is_some()
+                );
+            } else {
+                assert!(
+                    backend
+                        .inner
+                        .get_sender_key(name.cache_key())
+                        .await
+                        .unwrap()
+                        .is_some()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_session_tombstone_created_during_put_io_is_not_lost() {
+        let (entered_tx, entered_rx) = async_channel::bounded(1);
+        let (release_tx, release_rx) = async_channel::bounded(1);
+        let backend = ContentionGatedBackend::new(entered_tx, release_rx);
+        let cache = SignalStoreCache::new();
+        let address = signal_address("19995551027");
+        let mut record = session_at_index(20);
+        record.reserve_sender_chain_counters(20);
+        cache.put_session(&address, record).await;
+        backend.enable_gating();
+        let mut flush = Box::pin(cache.flush(&backend));
+        assert!(futures::poll!(flush.as_mut()).is_pending());
+        entered_rx.try_recv().unwrap();
+        let mut delete = Box::pin(cache.delete_session(&address));
+        assert!(futures::poll!(delete.as_mut()).is_ready());
+        release_tx.try_send(()).unwrap();
+        flush.await.unwrap();
+        assert!(
+            cache
+                .lock_sessions()
+                .await
+                .deleted
+                .contains(address.as_str())
+        );
+        assert!(cache.needs_pre_wire_flush().await);
+        backend.gating_enabled.store(false, Ordering::Release);
+        cache.flush(&backend).await.unwrap();
+        assert!(!cache.needs_pre_wire_flush().await);
+        assert!(
+            backend
+                .inner
+                .get_session(address.as_str())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_later_prekey_on_the_same_address_waits_for_its_own_snapshot() {
+        let (entered_tx, entered_rx) = async_channel::bounded(1);
+        let (release_tx, release_rx) = async_channel::bounded(1);
+        let backend = ContentionGatedBackend::new(entered_tx, release_rx);
+        let cache = SignalStoreCache::new();
+        let address = signal_address("19995551028");
+        backend
+            .inner
+            .store_prekey(9101, b"first", false)
+            .await
+            .unwrap();
+        backend
+            .inner
+            .store_prekey(9102, b"second", false)
+            .await
+            .unwrap();
+        cache.put_session(&address, session_at_index(20)).await;
+        cache.remove_prekey(9101, address.as_str()).await;
+        backend.enable_gating();
+        let mut flush = Box::pin(cache.flush(&backend));
+        assert!(futures::poll!(flush.as_mut()).is_pending());
+        entered_rx.try_recv().unwrap();
+        assert!(
+            cache
+                .try_put_session(&address, session_at_index(21))
+                .is_ok()
+        );
+        cache.remove_prekey(9102, address.as_str()).await;
+        release_tx.try_send(()).unwrap();
+        flush.await.unwrap();
+        assert!(backend.inner.load_prekey(9101).await.unwrap().is_some());
+        assert!(backend.inner.load_prekey(9102).await.unwrap().is_some());
+        backend.gating_enabled.store(false, Ordering::Release);
+        cache.flush(&backend).await.unwrap();
+        assert!(backend.inner.load_prekey(9101).await.unwrap().is_none());
+        assert!(backend.inner.load_prekey(9102).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_reconsumed_prekey_survives_until_the_new_session_is_durable() {
+        let (entered_tx, entered_rx) = async_channel::bounded(1);
+        let (release_tx, release_rx) = async_channel::bounded(1);
+        let backend = ContentionGatedBackend::new(entered_tx, release_rx);
+        let cache = SignalStoreCache::new();
+        let address = signal_address("19995551033");
+        backend
+            .inner
+            .store_prekey(9201, b"key", false)
+            .await
+            .unwrap();
+        cache.put_session(&address, session_at_index(20)).await;
+        cache.remove_prekey(9201, address.as_str()).await;
+        backend.enable_gating();
+        let mut flush = Box::pin(cache.flush(&backend));
+        assert!(futures::poll!(flush.as_mut()).is_pending());
+        entered_rx.try_recv().unwrap();
+        assert!(
+            cache
+                .try_put_session(&address, session_at_index(21))
+                .is_ok()
+        );
+        cache.remove_prekey(9201, address.as_str()).await;
+        release_tx.try_send(()).unwrap();
+        flush.await.unwrap();
+        assert!(
+            backend.inner.load_prekey(9201).await.unwrap().is_some(),
+            "old flush destroyed a reconsumed private key"
+        );
+        backend.gating_enabled.store(false, Ordering::Release);
+        cache.flush(&backend).await.unwrap();
+        assert!(backend.inner.load_prekey(9201).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn private_prekey_deletion_excludes_new_session_checkouts() {
+        let (entered_tx, entered_rx) = async_channel::bounded(1);
+        let (release_tx, release_rx) = async_channel::bounded(1);
+        let mut backend = ContentionGatedBackend::new(entered_tx, release_rx);
+        backend.target = FlushTarget::Prekeys;
+        let cache = SignalStoreCache::new();
+        let address = signal_address("19995551034");
+        backend
+            .inner
+            .store_prekey(9203, b"key", false)
+            .await
+            .unwrap();
+        cache.put_session(&address, session_at_index(20)).await;
+        cache.remove_prekey(9203, address.as_str()).await;
+        backend.enable_gating();
+        let mut flush = Box::pin(cache.flush(&backend));
+        assert!(futures::poll!(flush.as_mut()).is_pending());
+        entered_rx.try_recv().unwrap();
+        assert!(
+            cache.try_checkout_session(&address).is_none(),
+            "checkout raced irreversible private-key deletion"
+        );
+        release_tx.try_send(()).unwrap();
+        flush.await.unwrap();
+        let (record, token) = cache.try_checkout_session(&address).unwrap().unwrap();
+        cache.restore_session_from_checkout(&address, record.unwrap(), token, true);
+    }
+
+    #[tokio::test]
+    async fn concurrent_flushes_cannot_overtake_each_other() {
+        let (entered_tx, entered_rx) = async_channel::bounded(1);
+        let (release_tx, release_rx) = async_channel::bounded(1);
+        let backend = ContentionGatedBackend::new(entered_tx, release_rx);
+        let cache = SignalStoreCache::new();
+        let address = signal_address("19995551029");
+        cache.put_session(&address, session_at_index(20)).await;
+        backend.enable_gating();
+        let mut first = Box::pin(cache.flush(&backend));
+        assert!(futures::poll!(first.as_mut()).is_pending());
+        entered_rx.try_recv().unwrap();
+        assert!(
+            cache
+                .try_put_session(&address, session_at_index(21))
+                .is_ok()
+        );
+        let mut second = Box::pin(cache.flush(&backend));
+        assert!(futures::poll!(second.as_mut()).is_pending());
+        assert!(entered_rx.try_recv().is_err());
+        backend.gating_enabled.store(false, Ordering::Release);
+        release_tx.try_send(()).unwrap();
+        first.await.unwrap();
+        second.await.unwrap();
+        cache.clear_after_flush().await;
+        let (record, token) = cache.checkout_session(&address, &backend).await.unwrap();
+        assert_eq!(chain_index_of(record.as_ref().unwrap()), 21);
+        cache.restore_session_from_checkout(&address, record.unwrap(), token, true);
+    }
+
+    #[tokio::test]
+    async fn a_durable_sender_key_delete_waits_out_an_older_put_snapshot() {
+        let (entered_tx, entered_rx) = async_channel::bounded(1);
+        let (release_tx, release_rx) = async_channel::bounded(1);
+        let mut backend = ContentionGatedBackend::new(entered_tx, release_rx);
+        backend.target = FlushTarget::SenderKeys;
+        let cache = SignalStoreCache::new();
+        let name =
+            SenderKeyName::from_parts("120363000000000030@g.us", "19995551030@s.whatsapp.net:0");
+        cache
+            .put_sender_key(&name, SenderKeyRecord::new_empty())
+            .await;
+        backend.enable_gating();
+        let mut flush = Box::pin(cache.flush(&backend));
+        assert!(futures::poll!(flush.as_mut()).is_pending());
+        entered_rx.try_recv().unwrap();
+        let mut delete = Box::pin(cache.delete_sender_key_durable(&name, &backend));
+        assert!(futures::poll!(delete.as_mut()).is_pending());
+        backend.gating_enabled.store(false, Ordering::Release);
+        release_tx.try_send(()).unwrap();
+        flush.await.unwrap();
+        delete.await.unwrap();
+        assert!(
+            backend
+                .inner
+                .get_sender_key(name.cache_key())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(!cache.needs_pre_wire_flush().await);
+    }
+
+    #[tokio::test]
+    async fn a_lossy_clear_waits_for_snapshot_io_and_preserves_recovery_burn() {
+        let (entered_tx, entered_rx) = async_channel::bounded(1);
+        let (release_tx, release_rx) = async_channel::bounded(1);
+        let backend = ContentionGatedBackend::new(entered_tx, release_rx);
+        let cache = SignalStoreCache::new();
+        let address = signal_address("19995551031");
+        let mut record = session_at_index(20);
+        record.reserve_sender_chain_counters(20);
+        let ceiling = record.reserved_sender_chain_index();
+        cache.put_session(&address, record).await;
+        backend.enable_gating();
+        let mut flush = Box::pin(cache.flush(&backend));
+        assert!(futures::poll!(flush.as_mut()).is_pending());
+        entered_rx.try_recv().unwrap();
+        let mut clear = Box::pin(cache.clear());
+        assert!(futures::poll!(clear.as_mut()).is_pending());
+        assert_eq!(cache.session_recovery_generation.load(Ordering::Acquire), 1);
+        release_tx.try_send(()).unwrap();
+        flush.await.unwrap();
+        clear.await;
+        let (record, token) = cache.checkout_session(&address, &backend).await.unwrap();
+        assert_eq!(chain_index_of(record.as_ref().unwrap()), ceiling);
+        cache.restore_session_from_checkout(&address, record.unwrap(), token, true);
+    }
+
+    #[tokio::test]
+    async fn independent_session_progresses_while_another_flush_is_in_io() {
+        let (entered_tx, entered_rx) = async_channel::bounded(1);
+        let (release_tx, release_rx) = async_channel::bounded(1);
+        let backend = ContentionGatedBackend::new(entered_tx, release_rx);
+        let cache = SignalStoreCache::new();
+        let a = signal_address("19995551021");
+        let b = signal_address("19995551022");
+        cache.put_session(&b, session_at_index(10)).await;
+        cache.flush(&backend).await.unwrap();
+        cache.put_session(&a, session_at_index(20)).await;
+        backend.enable_gating();
+        let mut flush = Box::pin(cache.flush(&backend));
+        assert!(futures::poll!(flush.as_mut()).is_pending());
+        entered_rx.try_recv().unwrap();
+
+        let (record, token) = cache
+            .try_checkout_session(&b)
+            .expect("independent checkout blocked")
+            .unwrap();
+        assert_eq!(chain_index_of(record.as_ref().unwrap()), 10);
+        assert!(matches!(
+            cache.restore_session_from_checkout(&b, record.unwrap(), token, true),
+            SessionCheckoutStoreResult::Stored
+        ));
+        assert!(cache.try_put_session(&b, session_at_index(11)).is_ok());
+        release_tx.try_send(()).unwrap();
+        flush.await.unwrap();
+        assert!(cache.lock_sessions().await.dirty.contains(b.as_str()));
+        backend.gating_enabled.store(false, Ordering::Release);
+        cache.flush(&backend).await.unwrap();
+        cache.clear_after_flush().await;
+        let (record, token) = cache.checkout_session(&b, &backend).await.unwrap();
+        assert_eq!(chain_index_of(record.as_ref().unwrap()), 11);
+        cache.restore_session_from_checkout(&b, record.unwrap(), token, true);
+    }
+
+    #[tokio::test]
+    async fn an_older_session_flush_cannot_clear_a_newer_write_or_lease() {
+        let (entered_tx, entered_rx) = async_channel::bounded(1);
+        let (release_tx, release_rx) = async_channel::bounded(1);
+        let backend = ContentionGatedBackend::new(entered_tx, release_rx);
+        let cache = SignalStoreCache::new();
+        let a = signal_address("19995551023");
+        cache.put_session(&a, session_at_index(20)).await;
+        backend.enable_gating();
+        let mut flush = Box::pin(cache.flush(&backend));
+        assert!(futures::poll!(flush.as_mut()).is_pending());
+        entered_rx.try_recv().unwrap();
+        let mut newer = session_at_index(64);
+        newer.reserve_sender_chain_counters(64);
+        assert!(
+            cache.try_put_session(&a, newer).is_ok(),
+            "update blocked by backend I/O"
+        );
+        release_tx.try_send(()).unwrap();
+        flush.await.unwrap();
+        assert!(cache.needs_pre_wire_flush().await);
+        assert!(cache.lock_sessions().await.dirty.contains(a.as_str()));
+        backend.gating_enabled.store(false, Ordering::Release);
+        cache.flush(&backend).await.unwrap();
+        assert!(!cache.needs_pre_wire_flush().await);
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_backend_commit_preserves_dirty_state_for_retry() {
+        let (entered_tx, entered_rx) = async_channel::bounded(1);
+        let (release_tx, release_rx) = async_channel::bounded(1);
+        let backend = ContentionGatedBackend::new(entered_tx, release_rx);
+        let cache = SignalStoreCache::new();
+        let address = signal_address("19995551024");
+        let mut record = session_at_index(20);
+        record.reserve_sender_chain_counters(20);
+        cache.put_session(&address, record).await;
+        backend.enable_gating();
+        let mut flush = Box::pin(cache.flush(&backend));
+        assert!(futures::poll!(flush.as_mut()).is_pending());
+        entered_rx.try_recv().unwrap();
+        let state = cache.sessions.lock().await;
+        release_tx.try_send(()).unwrap();
+        assert!(futures::poll!(flush.as_mut()).is_pending());
+        assert!(
+            backend
+                .inner
+                .get_session(address.as_str())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        drop(flush);
+        assert!(state.dirty.contains(address.as_str()));
+        assert!(state.reservation_pending.contains(address.as_str()));
+        drop(state);
+        cache.put_session(&address, session_at_index(21)).await;
+        backend.gating_enabled.store(false, Ordering::Release);
+        cache.flush(&backend).await.unwrap();
+        assert!(!cache.needs_pre_wire_flush().await);
+        cache.clear_after_flush().await;
+        let (record, token) = cache.checkout_session(&address, &backend).await.unwrap();
+        assert_eq!(chain_index_of(record.as_ref().unwrap()), 21);
+        cache.restore_session_from_checkout(&address, record.unwrap(), token, true);
+    }
+
+    #[tokio::test]
+    async fn control_without_flush_independent_session_progresses_without_pending() {
+        let (entered_tx, _entered_rx) = async_channel::bounded(1);
+        let (_release_tx, release_rx) = async_channel::bounded(1);
+        let backend = Arc::new(ContentionGatedBackend::new(entered_tx, release_rx));
+        let cache = Arc::new(SignalStoreCache::new());
+
+        let addr_b = signal_address("19995551003");
+
+        // Warm up B.
+        cache.put_session(&addr_b, session_at_index(10)).await;
+        cache.flush(backend.as_ref()).await.expect("warmup flush");
+
+        // Without flush running, try_checkout_session succeeds immediately.
+        let checkout_opt = cache.try_checkout_session(&addr_b);
+        assert!(
+            checkout_opt.is_some(),
+            "try_checkout must succeed without flush"
+        );
+        let (record, checkout_key) = checkout_opt.unwrap().expect("checkout ok");
+        assert_eq!(chain_index_of(&record.expect("record present")), 10);
+        cache.cancel_session_checkout(&addr_b, checkout_key);
+
+        // try_put_session succeeds immediately.
+        let put_res = cache.try_put_session(&addr_b, session_at_index(11));
+        assert!(put_res.is_ok(), "try_put must succeed without flush");
+
+        // Async checkout is Ready on first poll.
+        let mut checkout_fut = pin!(cache.checkout_session(&addr_b, backend.as_ref()));
+        let is_ready = poll_fn(|cx| Poll::Ready(checkout_fut.as_mut().poll(cx).is_ready())).await;
+        assert!(
+            is_ready,
+            "checkout must be ready on first poll when warm and uncontented"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cold_read_reaches_the_backend_while_an_independent_flush_is_in_io() {
+        let (entered_tx, entered_rx) = async_channel::bounded(1);
+        let (release_tx, release_rx) = async_channel::bounded(1);
+        let backend = ContentionGatedBackend::new(entered_tx, release_rx);
+        let cache = SignalStoreCache::new();
+        let a = signal_address("19995551004");
+        let c = signal_address("19995551005");
+        let mut raw = Vec::new();
+        session_at_index(50).serialize_into_for_store(&mut raw, &[0xAA; 16]);
+        backend.inner.put_session(c.as_str(), &raw).await.unwrap();
+        cache.put_session(&a, session_at_index(20)).await;
+        backend.enable_gating();
+        let mut flush = Box::pin(cache.flush(&backend));
+        assert!(futures::poll!(flush.as_mut()).is_pending());
+        entered_rx.try_recv().unwrap();
+        let mut cold = Box::pin(cache.checkout_session(&c, &backend));
+        let Poll::Ready(Ok((record, token))) = futures::poll!(cold.as_mut()) else {
+            panic!("cold read blocked before reaching an independent backend read");
+        };
+        assert_eq!(chain_index_of(record.as_ref().unwrap()), 50);
+        cache.restore_session_from_checkout(&c, record.unwrap(), token, true);
+        release_tx.try_send(()).unwrap();
+        flush.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_checkouts_remain_exclusive_during_a_flush() {
+        let (entered_tx, entered_rx) = async_channel::bounded(1);
+        let (release_tx, release_rx) = async_channel::bounded(1);
+        let backend = ContentionGatedBackend::new(entered_tx, release_rx);
+        let cache = SignalStoreCache::new();
+        let a = signal_address("19995551006");
+        cache.put_session(&a, session_at_index(30)).await;
+        backend.enable_gating();
+        let mut flush = Box::pin(cache.flush(&backend));
+        assert!(futures::poll!(flush.as_mut()).is_pending());
+        entered_rx.try_recv().unwrap();
+        {
+            let state = cache.sessions.lock().await;
+            let SessionEntry::Present(record) = state.cache.get(a.as_str()).unwrap() else {
+                panic!("session is not present");
+            };
+            assert_eq!(
+                Arc::strong_count(record),
+                1,
+                "flush must not force ordinary checkouts to clone"
+            );
+            assert!(Arc::weak_count(record) > 0);
+        }
+        let (record, token) = cache.try_checkout_session(&a).unwrap().unwrap();
+        assert!(cache.try_checkout_session(&a).unwrap().is_err());
+        release_tx.try_send(()).unwrap();
+        flush.await.unwrap();
+        assert!(cache.try_checkout_session(&a).unwrap().is_err());
+        cache.restore_session_from_checkout(&a, record.unwrap(), token, true);
+    }
+}
+
+#[cfg(test)]
 #[path = "signal_cache_durability_chaos.rs"]
 mod durability_chaos_tests;
+
+#[cfg(test)]
+mod identity_continuity_tests {
+    use super::*;
+
+    #[test]
+    fn overlapping_changes_and_cancelled_snapshots_fail_closed() {
+        let continuity = IdentityContinuity::default();
+        let original = continuity.snapshot();
+        let first = continuity.changing(["first"]);
+        let during = continuity.snapshot();
+        let second = continuity.changing(["second"]);
+        assert!(!continuity.unchanged_for(original, ["first"]));
+        assert!(!continuity.unchanged_for(during, ["first"]));
+        assert!(continuity.unchanged_for(during, ["unrelated"]));
+        drop(first);
+        assert_eq!(continuity.snapshot(), original);
+        drop(second);
+        assert!(!continuity.unchanged_for(original, ["first"]));
+        assert!(!continuity.unchanged_for(during, ["second"]));
+        assert!(continuity.unchanged_for(continuity.snapshot(), ["first", "second"]));
+    }
+
+    #[test]
+    fn identity_revision_saturation_never_restores_trust() {
+        let continuity = IdentityContinuity {
+            state: SyncMutex::new(IdentityChanges {
+                generation: u64::MAX - 1,
+                ..Default::default()
+            }),
+        };
+        let original = continuity.snapshot();
+        drop(continuity.changing(["first"]));
+        assert!(!continuity.unchanged_for(original, ["unrelated"]));
+        assert_eq!(continuity.snapshot(), None);
+        drop(continuity.changing(["second"]));
+        assert_eq!(continuity.snapshot(), None);
+    }
+
+    #[tokio::test]
+    async fn identity_history_survives_clean_clear_but_not_lossy_reset() {
+        let cache = SignalStoreCache::new();
+        let backend = crate::store::in_memory::InMemoryBackend::new();
+        let address = ProtocolAddress::new("15550000001", 0.into());
+        cache.get_identity(&address, &backend).await.unwrap();
+        cache.put_identity(&address, &[1; 32]).await;
+        let original = cache.identity_continuity.snapshot();
+        cache.flush(&backend).await.unwrap();
+        cache.clear_after_flush().await;
+        assert!(
+            cache
+                .identity_continuity
+                .unchanged_for(original, ["15550000001"])
+        );
+        cache.get_identity(&address, &backend).await.unwrap();
+        cache.put_identity(&address, &[2; 32]).await;
+        cache.flush(&backend).await.unwrap();
+        cache.clear_after_flush().await;
+        cache.get_identity(&address, &backend).await.unwrap();
+        cache.put_identity(&address, &[1; 32]).await;
+        assert!(
+            !cache
+                .identity_continuity
+                .unchanged_for(original, ["15550000001"])
+        );
+        let current = cache.identity_continuity.snapshot();
+        cache.clear().await;
+        assert!(
+            !cache
+                .identity_continuity
+                .unchanged_for(current, ["unrelated"])
+        );
+    }
+
+    #[tokio::test]
+    async fn uncached_identity_write_and_delete_cannot_erase_history() {
+        let cache = SignalStoreCache::new();
+        let address = ProtocolAddress::new("15550000001", 0.into());
+        let original = cache.identity_continuity.snapshot();
+        assert!(cache.try_put_identity(&address, &[1; 32]));
+        assert!(
+            !cache
+                .identity_continuity
+                .unchanged_for(original, ["15550000001"])
+        );
+        let original = cache.identity_continuity.snapshot();
+        cache.delete_identity(&address).await;
+        cache.put_identity(&address, &[1; 32]).await;
+        assert!(
+            !cache
+                .identity_continuity
+                .unchanged_for(original, ["15550000001"])
+        );
+    }
+
+    #[test]
+    fn bounded_identity_history_fails_closed_after_pruning() {
+        let continuity = IdentityContinuity::default();
+        let original = continuity.snapshot();
+        for _ in 0..IDENTITY_CHANGE_CAPACITY {
+            drop(continuity.changing(["changed"]));
+        }
+        assert!(continuity.unchanged_for(original, ["unrelated"]));
+        drop(continuity.changing(["changed"]));
+        assert!(!continuity.unchanged_for(original, ["unrelated"]));
+        assert_eq!(
+            continuity.state.lock().unwrap().users.len(),
+            IDENTITY_CHANGE_CAPACITY
+        );
+        assert!(continuity.unchanged_for(continuity.snapshot(), ["unrelated"]));
+    }
+
+    #[test]
+    fn evicted_generation_snapshots_cannot_authorize_replacement() {
+        let continuity = IdentityContinuity::default();
+        drop(continuity.changing(["replaced"]));
+        let stamped = continuity.snapshot();
+        assert_eq!(stamped, Some(1));
+        for _ in 0..IDENTITY_CHANGE_CAPACITY {
+            drop(continuity.changing(["other"]));
+        }
+        // The mutation that replaced the account is gone from the journal;
+        // the stale snapshot must not clear that account or anything else.
+        assert!(!continuity.unchanged_for(stamped, ["replaced"]));
+        assert!(!continuity.unchanged_for(stamped, ["other"]));
+        assert!(continuity.unchanged_for(continuity.snapshot(), ["other"]));
+    }
+
+    #[test]
+    fn pruning_an_active_change_never_authorizes_an_in_progress_snapshot() {
+        let continuity = IdentityContinuity::default();
+        let active = continuity.changing(["first"]);
+        for _ in 0..IDENTITY_CHANGE_CAPACITY {
+            drop(continuity.changing(["other"]));
+        }
+        let during = continuity.snapshot();
+        assert!(!continuity.unchanged_for(during, ["first"]));
+        assert!(!continuity.unchanged_for(during, ["unrelated"]));
+        drop(active);
+        assert!(!continuity.unchanged_for(during, ["first"]));
+        assert!(continuity.unchanged_for(continuity.snapshot(), ["first"]));
+    }
+
+    #[tokio::test]
+    async fn identity_journal_normalizes_protocol_accounts_and_skips_unchanged_saves() {
+        let cache = SignalStoreCache::new();
+        let backend = crate::store::in_memory::InMemoryBackend::new();
+        for name in ["15550000001@c.us", "15550000001:2@c.us", "15550000001@lid"] {
+            let address = ProtocolAddress::new(name, 0.into());
+            cache.get_identity(&address, &backend).await.unwrap();
+            let original = cache.identity_continuity.snapshot();
+            cache.put_identity(&address, &[1; 32]).await;
+            let bytes = cache.identity_continuity.estimated_heap_bytes();
+            assert!(cache.try_put_identity(&address, &[1; 32]));
+            assert_eq!(cache.identity_continuity.snapshot(), original);
+            assert_eq!(cache.identity_continuity.estimated_heap_bytes(), bytes);
+            assert!(cache.try_put_identity(&address, &[2; 32]));
+            assert!(
+                !cache
+                    .identity_continuity
+                    .unchanged_for(original, ["15550000001"])
+            );
+            assert!(
+                cache
+                    .identity_continuity
+                    .unchanged_for(original, ["15550000002"])
+            );
+        }
+    }
+}

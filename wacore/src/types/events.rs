@@ -8,6 +8,7 @@ use portable_atomic::{AtomicU64, Ordering};
 use serde::Serialize;
 use std::borrow::Cow;
 use std::fmt;
+use std::mem::size_of;
 use std::sync::{Arc, OnceLock, RwLock};
 use wacore_binary::Node;
 use wacore_binary::OwnedNodeRef;
@@ -290,6 +291,8 @@ pub enum EventKind {
     CallLogSync,
     ReceivedTcToken,
     ClientExpirationChanged,
+    OfflineSyncInterrupted,
+    LockChatUpdate,
     // When adding a variant, mind the 128-kind ceiling below (EventInterest packs
     // each discriminant as a bit in a u128) and keep the guard pointing at the
     // last variant.
@@ -303,7 +306,7 @@ impl EventKind {
 
 // Build-time tripwire: a new variant that would overflow EventInterest's bitmask
 // fails compilation instead of silently corrupting the mask at runtime.
-const _: () = assert!((EventKind::ClientExpirationChanged as u8) < EventKind::CAPACITY);
+const _: () = assert!((EventKind::LockChatUpdate as u8) < EventKind::CAPACITY);
 
 /// A set of [`EventKind`]s a handler wants delivered. Producers can query the
 /// aggregate interest before building expensive payloads, and dispatch avoids
@@ -376,18 +379,76 @@ pub trait EventHandler: crate::sync_marker::MaybeSendSync {
 /// ```
 pub struct ChannelEventHandler {
     tx: async_channel::Sender<Arc<Event>>,
+    enqueued: AtomicU64,
+    dropped_full: AtomicU64,
+    closed: AtomicU64,
+}
+
+/// Delivery results observed by a [`ChannelEventHandler`].
+///
+/// This is an approximate concurrent snapshot of `try_send` outcomes. The
+/// channel can make an enqueued event visible before its counter increment is
+/// observed, and the fields are read independently. It does not confirm that
+/// a receiver has processed any event.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ChannelEventStats {
+    /// Events accepted by the channel. This is enqueue acceptance, not
+    /// confirmation that a receiver has processed the event.
+    pub enqueued: u64,
+    /// Events rejected because a bounded channel had no capacity.
+    pub dropped_full: u64,
+    /// Events rejected because the receiver was closed.
+    pub closed: u64,
 }
 
 impl ChannelEventHandler {
     pub fn new() -> (Arc<Self>, async_channel::Receiver<Arc<Event>>) {
         let (tx, rx) = async_channel::unbounded();
-        (Arc::new(Self { tx }), rx)
+        (Arc::new(Self::from_sender(tx)), rx)
+    }
+
+    /// Create a channel-backed handler with a bounded mailbox. A zero capacity
+    /// request is clamped to one because dispatch must retain one event without
+    /// introducing a rendezvous that could wait. Dispatch stays synchronous
+    /// and never waits; overload is reported by [`Self::stats`].
+    pub fn with_capacity(capacity: usize) -> (Arc<Self>, async_channel::Receiver<Arc<Event>>) {
+        let (tx, rx) = async_channel::bounded(capacity.max(1));
+        (Arc::new(Self::from_sender(tx)), rx)
+    }
+
+    fn from_sender(tx: async_channel::Sender<Arc<Event>>) -> Self {
+        Self {
+            tx,
+            enqueued: AtomicU64::new(0),
+            dropped_full: AtomicU64::new(0),
+            closed: AtomicU64::new(0),
+        }
+    }
+
+    /// Snapshot delivery outcomes without touching the channel.
+    pub fn stats(&self) -> ChannelEventStats {
+        ChannelEventStats {
+            enqueued: self.enqueued.load(Ordering::Relaxed),
+            dropped_full: self.dropped_full.load(Ordering::Relaxed),
+            closed: self.closed.load(Ordering::Relaxed),
+        }
     }
 }
 
 impl EventHandler for ChannelEventHandler {
     fn handle_event(&self, event: Arc<Event>) {
-        let _ = self.tx.try_send(event);
+        match self.tx.try_send(event) {
+            Ok(()) => {
+                self.enqueued.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(async_channel::TrySendError::Full(_)) => {
+                self.dropped_full.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(async_channel::TrySendError::Closed(_)) => {
+                self.closed.fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 }
 
@@ -614,6 +675,16 @@ impl CoreEventBus {
         !self.snapshot().handlers.is_empty()
     }
 
+    /// Retained handler-table slots. Closure captures and retired snapshots held by an in-flight
+    /// dispatch are intentionally outside this estimate.
+    pub fn memory_stats(&self) -> crate::stats::CollectionStats {
+        let snapshot = self.snapshot();
+        crate::stats::CollectionStats::new(
+            snapshot.handlers.len() as u64,
+            (snapshot.handlers.capacity() * size_of::<HandlerEntry>()) as u64,
+        )
+    }
+
     /// Whether any registered handler is interested in `kind`. Lets callers
     /// skip producing an event nobody would receive (e.g. retaining a large
     /// `HistorySync` blob when only message-only handlers are registered).
@@ -633,6 +704,32 @@ impl CoreEventBus {
                 entry.handler.handle_event(Arc::clone(&event));
             }
         }
+    }
+
+    /// Dispatch an event that is only built when somebody is listening for
+    /// `kind`.
+    ///
+    /// [`Self::dispatch`] already costs nothing once it is called with no
+    /// interested handler — but the payload has been built by then, and for a
+    /// producer whose payload is a `Vec` (a group notification's participants,
+    /// a device list) or a set of owned strings that construction *is* the
+    /// whole cost of the notification for a consumer that does not want it.
+    /// Callers whose payload is a couple of `Jid` clones should keep using
+    /// `dispatch`: the closure buys nothing there and reads worse.
+    ///
+    /// `kind` must be the kind `build` returns; a mismatch would gate on one
+    /// kind and deliver another, so it is checked in debug builds.
+    pub fn dispatch_with(&self, kind: EventKind, build: impl FnOnce() -> Event) {
+        if !self.has_handler_for(kind) {
+            return;
+        }
+        let event = build();
+        debug_assert_eq!(
+            event.kind(),
+            kind,
+            "dispatch_with gated on a different kind than it built"
+        );
+        self.dispatch(event);
     }
 }
 
@@ -875,7 +972,14 @@ pub enum Event {
     Disconnected(Disconnected),
     PairSuccess(PairSuccess),
     PairError(PairError),
-    LoggedOut(LoggedOut),
+    /// The device was logged out: unlinked, locked, or refused at connect.
+    /// Terminal for the session, so it fires at most once per connection.
+    ///
+    /// Boxed for the same reason as [`Event::IncomingCall`]: at 328 bytes it
+    /// was the variant setting the size of every `Event`, and every
+    /// dispatched event is one `Arc` allocation of that size whatever its
+    /// payload. A `<presence>` is not obliged to pay for a logout stanza.
+    LoggedOut(Box<LoggedOut>),
     PairingQrCode(PairingQrCode),
     PairingCode(PairingCode),
     PairingCodeRefresh(PairingCodeRefresh),
@@ -935,7 +1039,12 @@ pub enum Event {
 
     /// Incoming `<call>` stanza from the server (offer, preaccept, accept,
     /// reject, terminate). Mirror of WA Web's inbound call signaling.
-    IncomingCall(IncomingCall),
+    ///
+    /// Boxed for the same reason as [`Event::HistorySync`]: at 432 bytes it was
+    /// one of the two variants setting the size of every `Event`, and every
+    /// dispatched event is one `Arc` allocation of that size whatever its
+    /// payload. A `<presence>` is not obliged to pay for a call offer.
+    IncomingCall(Box<IncomingCall>),
 
     /// A call that must not ring (e.g. an offer replayed from the offline queue on reconnect).
     /// Surfaced separately from [`IncomingCall`] so a consumer cannot accidentally auto-accept a
@@ -987,7 +1096,10 @@ pub enum Event {
     BusinessStatusUpdate(BusinessStatusUpdate),
 
     StreamReplaced(StreamReplaced),
-    TemporaryBan(TemporaryBan),
+    /// The server temporarily banned the account. Like [`Event::LoggedOut`]
+    /// it fires at most once per connection, and carries the whole
+    /// `<failure>` stanza, so it is boxed for the same reason.
+    TemporaryBan(Box<TemporaryBan>),
     ConnectFailure(ConnectFailure),
     StreamError(StreamError),
 
@@ -1097,6 +1209,19 @@ pub enum Event {
 
     /// The server pushed (or withdrew) a retirement deadline for this build.
     ClientExpirationChanged(ClientExpirationChanged),
+
+    /// An offline backlog drain ended without its `<ib><offline>` end marker.
+    ///
+    /// Last, next to its sibling rather than next to
+    /// [`Event::OfflineSyncCompleted`], for the index reason above.
+    OfflineSyncInterrupted(OfflineSyncInterrupted),
+
+    /// A chat was locked or unlocked on a linked device (`lock` syncd
+    /// mutation, `LockChatAction.locked`).
+    ///
+    /// Last, like every new variant: a binary `Serialize` format writes the
+    /// variant index, so inserting in the middle renumbers everything after it.
+    LockChatUpdate(LockChatUpdate),
 }
 
 /// A trusted-contact privacy token received for a peer.
@@ -1210,6 +1335,8 @@ impl Event {
             Event::EncDecryptFailed(_) => EventKind::EncDecryptFailed,
             Event::CallLogSync(_) => EventKind::CallLogSync,
             Event::ClientExpirationChanged(_) => EventKind::ClientExpirationChanged,
+            Event::OfflineSyncInterrupted(_) => EventKind::OfflineSyncInterrupted,
+            Event::LockChatUpdate(_) => EventKind::LockChatUpdate,
             Event::HistorySync(_) => EventKind::HistorySync,
             Event::OfflineSyncPreview(_) => EventKind::OfflineSyncPreview,
             Event::OfflineSyncCompleted(_) => EventKind::OfflineSyncCompleted,
@@ -1270,6 +1397,18 @@ impl fmt::Debug for Event {
 pub struct InboundMessage {
     pub message: Arc<wa::Message>,
     pub info: Arc<MessageInfo>,
+    /// Ephemeral duration in seconds, from the decrypted message's
+    /// `contextInfo.expiration`. Lives here rather than on `info` because it
+    /// is only known after decryption, and `info` is shared with every
+    /// `<enc>` of the stanza by then: writing it there cost a deep copy of
+    /// the whole `MessageInfo` on every disappearing-chat message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ephemeral_expiration: Option<u32>,
+    /// Parent post key when `message` is a decrypted CAG channel comment
+    /// (`enc_comment_message`). The inner `Message` proto has no slot for the
+    /// threading link, so it surfaces here. Boxed: rare.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comment_target: Option<Box<wa::MessageKey>>,
 }
 
 /// How a [`MessageBatch`] was delivered. This describes the delivery shape,
@@ -1529,7 +1668,47 @@ pub struct ClientOutdated {
 /// believing never opened.
 #[derive(Debug, Clone, Serialize, bon::Builder)]
 #[non_exhaustive]
-pub struct Connected {}
+pub struct Connected {
+    /// Present when version resolution could not reach its source and the
+    /// session connected on the version the device already held. Absent on
+    /// every normal connect, so `Some` is the whole signal: a consumer that
+    /// cares can warn, refuse, or pin a version of its own.
+    pub app_version_fallback: Option<AppVersionFallback>,
+}
+
+/// Why, and with what, a session connected without a freshly resolved version.
+///
+/// Only the browser version source falls back this way; see the source
+/// constants in the client crate's `version` module for the reason.
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct AppVersionFallback {
+    /// The version the session actually connected with.
+    pub version: (u32, u32, u32),
+    /// True when that version is the one compiled into this library, so its
+    /// staleness is the release's age. False when the device already carried a
+    /// different one, whose provenance this does not claim to know: it may have
+    /// been resolved earlier or supplied by the caller.
+    pub compiled_default: bool,
+    /// What stopped the resolution. Worth distinguishing, because one is
+    /// routine and the other is news.
+    pub reason: AppVersionFallbackReason,
+}
+
+/// Why a version could not be resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub enum AppVersionFallbackReason {
+    /// The source could not be reached, or answered with an error status. The
+    /// routine case: the browser source is on the common tracker blocklists, so
+    /// this is what a content blocker or a DNS sinkhole looks like, and it says
+    /// nothing about the source itself.
+    SourceUnreachable,
+    /// The source answered, but the version was not where it should be. This is
+    /// the source having changed shape, which is worth acting on rather than
+    /// waiting out: it will not fix itself on the next connect.
+    SourceUnparsable,
+}
 
 /// Localized text the server wants shown when it forces a logout, from
 /// `logout_message_header` / `logout_message_subtext` on `<failure>`.
@@ -1725,6 +1904,31 @@ pub struct OfflineSyncPreview {
 #[non_exhaustive]
 pub struct OfflineSyncCompleted {
     pub count: i32,
+}
+
+/// An offline backlog drain ended without its `<ib><offline>` end marker,
+/// because the connection went away first.
+///
+/// This is the counterpart of [`OfflineSyncCompleted`], not a variant of it:
+/// the drain did not finish, the client is not caught up, and the remainder of
+/// the backlog is still queued server-side. Nothing was lost — an offline
+/// message is only acked through the aggregate receipt flush that a *completed*
+/// drain performs, so everything undelivered (and the last open batch) is
+/// redelivered on the next connection, where a fresh
+/// [`OfflineSyncPreview`] announces it.
+///
+/// A consumer that gates "caught up" UI or startup work on
+/// [`OfflineSyncCompleted`] should treat this as "not caught up, wait for the
+/// next preview" rather than as completion.
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct OfflineSyncInterrupted {
+    /// What the preview announced for this drain.
+    pub total: i32,
+    /// Offline stanzas processed before the connection ended. Never larger
+    /// than `total` in practice, but the server owns both numbers, so treat
+    /// the pair as a progress report rather than an invariant.
+    pub delivered: i32,
 }
 
 /// A valid `<ib><dirty>` marker received from the server.
@@ -2284,8 +2488,13 @@ pub struct GroupUpdate {
     /// Whether participant identity information was incomplete in the source stanza.
     #[builder(default)]
     pub has_incomplete_participant_information: bool,
-    /// The specific action
-    pub action: crate::stanza::groups::GroupNotificationAction,
+    /// The specific action.
+    ///
+    /// Boxed, like the `action` of every sync-action payload in this file
+    /// (`ContactUpdate`, `PinUpdate`, `MuteUpdate`, …): at 288 bytes it made
+    /// `GroupUpdate` the largest variant of `Event`, and `Event` is what sizes
+    /// the single `Arc` allocation every dispatch makes, group update or not.
+    pub action: Box<crate::stanza::groups::GroupNotificationAction>,
 }
 
 #[derive(Debug, Clone, Serialize, bon::Builder)]
@@ -2315,6 +2524,17 @@ pub struct MuteUpdate {
     pub jid: Jid,
     pub timestamp: DateTime<Utc>,
     pub action: Box<wa::sync_action_value::MuteAction>,
+    pub from_full_sync: bool,
+}
+
+#[derive(Debug, Clone, Serialize, bon::Builder)]
+#[non_exhaustive]
+pub struct LockChatUpdate {
+    /// The chat being locked or unlocked (chat lock, the hidden
+    /// "locked chats" folder on the primary device).
+    pub jid: Jid,
+    pub timestamp: DateTime<Utc>,
+    pub action: Box<wa::sync_action_value::LockChatAction>,
     pub from_full_sync: bool,
 }
 
@@ -2564,7 +2784,9 @@ mod tests {
         assert_eq!(EventKind::AppStateSyncFailed as u8, 60);
         assert_eq!(EventKind::EncDecryptFailed as u8, 67);
         assert_eq!(EventKind::CallLogSync as u8, 68);
-        assert_eq!(EventKind::ReceivedTcToken as u8, 69);
+        assert_eq!(EventKind::ClientExpirationChanged as u8, 69);
+        assert_eq!(EventKind::OfflineSyncInterrupted as u8, 70);
+        assert_eq!(EventKind::LockChatUpdate as u8, 71);
     }
 
     /// Every rejection a consumer can be handed must survive being persisted
@@ -2598,13 +2820,35 @@ mod tests {
         assert_eq!(R::from_server(429, "something-else"), None);
     }
 
+    /// `size_of::<Event>()` sizes every dispatched event (see the boxed
+    /// variants' docs for why). The ceiling is set by `ConnectFailure` (272);
+    /// `LoggedOut` and `TemporaryBan` used to set it at 328 before their
+    /// payloads were boxed.
+    ///
+    /// The number is not sacred; the order of magnitude is. Raising it means a
+    /// new variant just made every event bigger, and the fix is almost always
+    /// to box that variant's payload rather than to edit this line.
+    /// Budget: rebaseline per [layout asserts](../../../agent_docs/layout_asserts.md).
+    #[test]
+    fn event_stays_under_its_size_ceiling() {
+        const CEILING: usize = 272;
+        let size = size_of::<Event>();
+        assert!(
+            size <= CEILING,
+            "size_of::<Event>() is {size}, over the {CEILING}-byte ceiling: some \
+             variant's payload grew and now every dispatched event pays for it"
+        );
+    }
+
     #[test]
     fn group_update_builder_defaults_additive_scalar_fields() {
         let update = GroupUpdate::builder()
             .group_jid("120363000000000001@g.us".parse().unwrap())
             .timestamp(DateTime::<Utc>::UNIX_EPOCH)
             .is_lid_addressing_mode(false)
-            .action(crate::stanza::groups::GroupNotificationAction::Unlocked)
+            .action(Box::new(
+                crate::stanza::groups::GroupNotificationAction::Unlocked,
+            ))
             .build();
 
         assert_eq!(update.action_index, 0);
@@ -2683,7 +2927,7 @@ mod tests {
     #[test]
     fn lazy_history_sync_get_decodes() {
         let lazy = lazy_from(vec![wa::Conversation {
-            id: "chat@s.whatsapp.net".to_string(),
+            id: "chat@s.whatsapp.net".into(),
             ..Default::default()
         }]);
 
@@ -2695,7 +2939,7 @@ mod tests {
     #[test]
     fn lazy_history_sync_caches_decode() {
         let lazy = lazy_from(vec![wa::Conversation {
-            id: "test@g.us".to_string(),
+            id: "test@g.us".into(),
             ..Default::default()
         }]);
 
@@ -2736,7 +2980,7 @@ mod tests {
     #[test]
     fn lazy_history_sync_decompress_yields_raw_proto() {
         let lazy = lazy_from(vec![wa::Conversation {
-            id: "raw@s.whatsapp.net".to_string(),
+            id: "raw@s.whatsapp.net".into(),
             ..Default::default()
         }]);
 
@@ -2753,7 +2997,7 @@ mod tests {
     #[test]
     fn lazy_history_sync_everything_keeps_working_after_get() {
         let lazy = lazy_from(vec![wa::Conversation {
-            id: "kept@s.whatsapp.net".to_string(),
+            id: "kept@s.whatsapp.net".into(),
             ..Default::default()
         }]);
 
@@ -2778,11 +3022,11 @@ mod tests {
     fn lazy_history_sync_stream_iterates_conversations() {
         let lazy = lazy_from(vec![
             wa::Conversation {
-                id: "first@s.whatsapp.net".to_string(),
+                id: "first@s.whatsapp.net".into(),
                 ..Default::default()
             },
             wa::Conversation {
-                id: "second@s.whatsapp.net".to_string(),
+                id: "second@s.whatsapp.net".into(),
                 ..Default::default()
             },
         ]);
@@ -2808,7 +3052,7 @@ mod tests {
     #[test]
     fn lazy_history_sync_clone_is_cheap_and_redecodes() {
         let lazy = lazy_from(vec![wa::Conversation {
-            id: "cloned@s.whatsapp.net".to_string(),
+            id: "cloned@s.whatsapp.net".into(),
             ..Default::default()
         }]);
 
@@ -2853,7 +3097,7 @@ mod tests {
         // A decompressed_size below the real inflated size trips the inflate
         // cap instead of silently over-allocating past the producer's count.
         let (compressed, raw_len) = make_compressed_history_sync(vec![wa::Conversation {
-            id: "capped@s.whatsapp.net".to_string(),
+            id: "capped@s.whatsapp.net".into(),
             ..Default::default()
         }]);
         let lazy = LazyHistorySync::new(compressed, raw_len - 1, 0, None, None);
@@ -2864,7 +3108,7 @@ mod tests {
     #[test]
     fn lazy_history_sync_preserves_messages() {
         let conv = wa::Conversation {
-            id: "chat@s.whatsapp.net".to_string(),
+            id: "chat@s.whatsapp.net".into(),
             messages: vec![wa::HistorySyncMsg {
                 message: wa::WebMessageInfo {
                     key: wa::MessageKey {
@@ -3229,5 +3473,87 @@ mod tests {
 
         bus.dispatch(Event::Connected(Connected::builder().build()));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn channel_handler_reports_delivery_and_closed_receiver_separately() {
+        let (handler, receiver) = ChannelEventHandler::new();
+        handler.handle_event(Arc::new(Event::Connected(Connected::builder().build())));
+        assert_eq!(
+            handler.stats(),
+            ChannelEventStats {
+                enqueued: 1,
+                dropped_full: 0,
+                closed: 0,
+            }
+        );
+        drop(receiver);
+        handler.handle_event(Arc::new(Event::Connected(Connected::builder().build())));
+        assert_eq!(handler.stats().closed, 1);
+        assert_eq!(handler.stats().dropped_full, 0);
+    }
+
+    #[test]
+    fn bounded_channel_handler_reports_overload_without_waiting() {
+        let (handler, receiver) = ChannelEventHandler::with_capacity(1);
+        let event = |code: &str| {
+            Arc::new(Event::PairingCode(
+                PairingCode::builder()
+                    .code(code.to_string())
+                    .timeout(std::time::Duration::from_secs(1))
+                    .build(),
+            ))
+        };
+        handler.handle_event(event("first"));
+        handler.handle_event(event("dropped"));
+        assert_eq!(handler.stats().enqueued, 1);
+        assert_eq!(handler.stats().dropped_full, 1);
+        assert_eq!(handler.stats().closed, 0);
+        assert!(matches!(
+            &*receiver.try_recv().expect("first event remains queued"),
+            Event::PairingCode(code) if code.code == "first"
+        ));
+        handler.handle_event(event("recovered"));
+        assert!(matches!(
+            &*receiver.try_recv().expect("queue accepts after drain"),
+            Event::PairingCode(code) if code.code == "recovered"
+        ));
+    }
+
+    #[test]
+    fn a_full_channel_does_not_block_other_subscribers_or_future_dispatches() {
+        use std::sync::atomic::AtomicUsize;
+
+        let bus = CoreEventBus::new();
+        let (channel, receiver) = ChannelEventHandler::with_capacity(1);
+        let seen = Arc::new(AtomicUsize::new(0));
+        struct Counter(Arc<AtomicUsize>);
+        impl EventHandler for Counter {
+            fn handle_event(&self, _: Arc<Event>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let channel_subscription = bus.subscribe_handler(channel.clone());
+        let _counter_subscription = bus.subscribe_handler(Arc::new(Counter(Arc::clone(&seen))));
+        let event = || {
+            Event::PairingCode(
+                PairingCode::builder()
+                    .code("code".to_string())
+                    .timeout(std::time::Duration::from_secs(1))
+                    .build(),
+            )
+        };
+        bus.dispatch(event());
+        bus.dispatch(event());
+        assert_eq!(seen.load(Ordering::Relaxed), 2);
+        assert_eq!(channel.stats().dropped_full, 1);
+        drop(channel_subscription);
+        bus.dispatch(event());
+        assert_eq!(seen.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            receiver.len(),
+            1,
+            "the removed subscription receives no future event"
+        );
     }
 }

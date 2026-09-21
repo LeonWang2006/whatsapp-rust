@@ -38,11 +38,50 @@ fn push_enc_payload(bucket: &mut Vec<EncPayload>, stanza_enc_count: usize, paylo
     bucket.push(payload);
 }
 
+/// A `StdRng` that seeds itself on first draw.
+///
+/// The decrypt loop needs a CSPRNG only on the DH-ratchet step, which most
+/// stanzas never take; an eagerly seeded `StdRng` pulled 32 bytes of entropy
+/// and ran a ChaCha key schedule per stanza for a generator that was then
+/// dropped unused. `ThreadRng` would avoid the seeding but is `!Send`, and
+/// this lives across the awaits of a spawned lane worker.
+#[derive(Default)]
+struct LazyStdRng(Option<rand::rngs::StdRng>);
+
+impl LazyStdRng {
+    #[inline]
+    fn get(&mut self) -> &mut rand::rngs::StdRng {
+        self.0
+            .get_or_insert_with(rand::make_rng::<rand::rngs::StdRng>)
+    }
+}
+
+impl rand::TryRng for LazyStdRng {
+    type Error = std::convert::Infallible;
+
+    #[inline]
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        self.get().try_next_u32()
+    }
+
+    #[inline]
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        self.get().try_next_u64()
+    }
+
+    #[inline]
+    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
+        self.get().try_fill_bytes(dst)
+    }
+}
+
+impl rand::TryCryptoRng for LazyStdRng {}
+
 async fn decrypt_session_message(
     message: &mut ParsedSessionMessage,
     signal_address: &wacore::libsignal::protocol::ProtocolAddress,
     adapter: &mut crate::store::signal_adapter::SignalProtocolStoreAdapter,
-    rng: &mut rand::rngs::StdRng,
+    rng: &mut LazyStdRng,
 ) -> Result<DecryptionResult, SignalProtocolError> {
     match message {
         ParsedSessionMessage::Retained(message) => {
@@ -75,10 +114,10 @@ async fn decrypt_session_message(
 }
 
 impl Client {
-    /// Test convenience: scope to the current generation. Production inbound
-    /// traffic always goes through the chat-lane worker, which passes its own
-    /// spawn generation.
-    #[cfg(test)]
+    /// Test and bench convenience: scope to the current generation. Production
+    /// inbound traffic always goes through the chat-lane worker, which passes
+    /// its own spawn generation.
+    #[cfg(any(test, feature = "bench-harness"))]
     pub(crate) async fn handle_incoming_message(self: Arc<Self>, node: Arc<OwnedNodeRef>) {
         let generation = self.connection_generation.load(Ordering::Acquire);
         self.handle_incoming_message_scoped(node, generation).await
@@ -331,7 +370,7 @@ impl Client {
             // `had_unknown_enc` means "produced no usable payload": either the
             // type is unrecognized or it's known but the body is empty.
             // Either way the stanza needs the fallback ack or the server replays.
-            if EncType::from_wire(enc_type.as_ref()).is_none() {
+            let Some(parsed_enc_type) = EncType::from_wire(enc_type.as_ref()) else {
                 log::warn!("Enc node has unknown type: {enc_type}");
                 self.report_raw_enc_decrypt_failure(
                     &info,
@@ -341,22 +380,23 @@ impl Client {
                 );
                 had_unknown_enc = true;
                 continue;
-            }
-
-            let payload = match EncPayload::from_owned_node(node, enc_node, enc_index) {
-                Some(p) => p,
-                None => {
-                    log::warn!("Enc node {enc_type} has no content");
-                    self.report_raw_enc_decrypt_failure(
-                        &info,
-                        enc_index,
-                        Some(enc_type.as_ref()),
-                        EncDecryptFailureReason::MalformedNode,
-                    );
-                    had_unknown_enc = true;
-                    continue;
-                }
             };
+
+            let payload =
+                match EncPayload::from_owned_node(node, enc_node, enc_index, parsed_enc_type) {
+                    Some(p) => p,
+                    None => {
+                        log::warn!("Enc node {enc_type} has no content");
+                        self.report_raw_enc_decrypt_failure(
+                            &info,
+                            enc_index,
+                            Some(enc_type.as_ref()),
+                            EncDecryptFailureReason::MalformedNode,
+                        );
+                        had_unknown_enc = true;
+                        continue;
+                    }
+                };
 
             let bucket = if payload.enc_type.is_bot_secret() {
                 &mut bot_payloads
@@ -730,7 +770,7 @@ impl Client {
         let _t = wacore::telemetry::timer(wacore::telemetry::DECRYPT_DURATION);
 
         let mut adapter = self.signal_adapter();
-        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let mut rng = LazyStdRng::default();
         let mut outcome = SessionBatchOutcome::default();
         // Buffer plaintexts to handle after the ratchet lock drops (see the drain
         // below for why that's safe).
@@ -1480,7 +1520,6 @@ impl Client {
             .await;
 
         for payload in payloads {
-            let ciphertext = &payload.ciphertext[..];
             let padding_version = payload.padding_version;
             let enc_index = payload.enc_index;
             let enc_type = payload.enc_type.as_wire_str();
@@ -1494,7 +1533,14 @@ impl Client {
 
             let decrypt_result = {
                 let _chain_guard = chain_lock.lock().await;
-                group_decrypt(ciphertext, &mut adapter.sender_key_store, &sender_key_name).await
+                // A refcount bump: the skmsg stays a slice of the frame buffer
+                // through parsing rather than being copied per message.
+                group_decrypt_shared(
+                    payload.ciphertext.clone(),
+                    &mut adapter.sender_key_store,
+                    &sender_key_name,
+                )
+                .await
             };
 
             match decrypt_result {
@@ -1670,6 +1716,12 @@ impl Client {
     /// pending/in-flight), then offline → batch for `doPendingDeviceSync`, online
     /// → invalidate + usync immediately. WA Web: online `syncDeviceListJob`,
     /// offline `OfflinePendingDeviceCache`.
+    ///
+    /// The online path releases its dedup entry when the refresh finishes.
+    /// Left in place, the entry outlived the refresh by the whole connection:
+    /// a user who added a second new device weeks later never got another
+    /// refresh, and every such user was retained until teardown. WA Web's
+    /// `syncDeviceListJob` is likewise keyed only while the job runs.
     pub(crate) async fn schedule_unknown_device_sync(
         self: &Arc<Self>,
         user_jid: Jid,
@@ -1691,8 +1743,18 @@ impl Client {
                 user_jid.observe()
             );
             let client = Arc::clone(self);
+            // A guard, not a trailing call, and built before the spawn rather
+            // than inside the task: the refresh can fail, be cancelled with the
+            // runtime, or be dropped before its first poll, and in every case
+            // the dedup must not outlive the work it was deduplicating.
+            let released = Arc::clone(self);
+            let release_jid = user_jid.clone();
+            let release = scopeguard::guard((), move |()| {
+                released.pending_device_sync.remove(&release_jid);
+            });
             self.runtime
                 .spawn(Box::pin(async move {
+                    let _release = release;
                     client.invalidate_device_cache(&user_jid.user).await;
                     if let Err(e) = client.get_user_devices(&[user_jid]).await {
                         log::warn!("Immediate device sync failed: {e:?}");
@@ -1770,6 +1832,41 @@ impl Client {
         // is nested inside device_sent_message.message and must be
         // extracted before protocol checks or dispatch.
         let mut msg = wacore::messages::unwrap_device_sent(original_msg);
+
+        if info.source.chat.is_group()
+            && let Some(protocol) = msg.protocol_message.as_option()
+            && protocol.r#type == Some(wa::message::protocol_message::Type::REVOKE)
+            && let Some(key) = protocol.key.as_option()
+            && let Some(id) = key.id.as_deref().filter(|id| !id.is_empty())
+            && key
+                .remote_jid
+                .as_deref()
+                .and_then(|jid| jid.parse::<Jid>().ok())
+                .is_some_and(|chat| chat == info.source.chat)
+        {
+            let snapshot = self.persistence_manager.get_device_snapshot();
+            let participant = key
+                .participant
+                .as_deref()
+                .and_then(|jid| jid.parse::<Jid>().ok());
+            let targets_self = participant.as_ref().is_some_and(|participant| {
+                snapshot
+                    .pn
+                    .iter()
+                    .chain(snapshot.lid.iter())
+                    .any(|own| own.is_same_user_as(participant))
+            });
+            // Sender revokes use the authenticated sender's perspective of fromMe.
+            // Admin revokes name the original author explicitly.
+            let own_revoke = info.source.is_from_me
+                && key.from_me == Some(true)
+                && (key.participant.is_none() || targets_self);
+            let admin_revoke =
+                info.edit == wacore::types::message::EditAttribute::AdminRevoke && targets_self;
+            if own_revoke || admin_revoke {
+                self.cancel_group_message_repair(&info.source.chat, id);
+            }
+        }
 
         // Post-decryption logic (SKDM, sync keys, etc.)
         if let Some(skdm) = msg.sender_key_distribution_message.as_option()
@@ -1849,7 +1946,7 @@ impl Client {
         // `WAWebHandleHistorySyncNotification` gates on `isMePrimaryNonLid`.
         if let Some(history_sync) = history_sync_taken {
             if info.source.is_from_me {
-                self.handle_history_sync(info.id.clone(), history_sync)
+                self.handle_history_sync(info.id.to_string(), history_sync)
                     .await;
             } else {
                 warn!(
@@ -1873,48 +1970,60 @@ impl Client {
                 skdm_only: true,
                 ..Default::default()
             })
-        } else if self.message_already_dispatched(info).await {
-            // The event is a duplicate; the message secret it carries may not
-            // be. Capture is write-behind and can drop an entry when its
-            // backend is down, and this branch skips `dispatch_parsed_message`,
-            // which is the only other caller: without this the resend is the
-            // second chance we would have thrown away, and every later
-            // encrypted edit, reaction or comment on that parent stays
-            // unopenable. It is a no-op for a message carrying no secret.
-            self.maybe_capture_inbound_msg_secret(&msg, info).await;
-            // The sender resent a message we already handed to consumers. Ack
-            // it the way the ratchet-level duplicate is acked, so a registered
-            // durability hook still gets its replay instead of a bare ack.
-            // status is acked by the should_ack gate. A hook whose buffered copy
-            // survived replays instead of being acked, which dispatches the
-            // message again: that is the documented at-least-once shape, not a
-            // suppression, so it is not counted as one.
-            let replayed =
-                !info.source.chat.is_status_broadcast() && self.ack_or_replay_to_hook(info).await;
-            if !replayed {
-                self.duplicate_dispatch_suppressed
-                    .fetch_add(1, Ordering::Relaxed);
-                wacore::telemetry::recv("duplicate_resend");
-                log::debug!(
-                    "[msg:{}] already dispatched for this sender; suppressing the resend's event",
-                    info.id
-                );
-            }
-            // The event is a duplicate; the key share is not. Our phone asking
-            // again is what it does when it did not get the keys, so the first
-            // delivery's send having been scheduled is no reason to skip this
-            // one. Sending them twice costs a stanza; not sending them leaves
-            // the requester without app-state keys until it changes request id.
-            if let Some((requester, request)) = app_state_key_share_job {
-                self.schedule_app_state_sync_key_share(requester, request, None);
-            }
-            Ok(PlaintextHandleOutcome {
-                dispatched: true,
-                ..Default::default()
-            })
         } else {
+            // The probe may have already materialized a secret envelope while
+            // fingerprinting; hand it to dispatch instead of resolving the
+            // parent secret a second time.
+            let pre_decrypted = match self.probe_message_dispatch(info, &msg).await {
+                ProbeOutcome::Suppress => {
+                    // The event is a duplicate; the message secret it carries may not
+                    // be. Capture is write-behind and can drop an entry when its
+                    // backend is down, and this branch skips `dispatch_parsed_message`,
+                    // which is the only other caller: without this the resend is the
+                    // second chance we would have thrown away, and every later
+                    // encrypted edit, reaction or comment on that parent stays
+                    // unopenable. It is a no-op for a message carrying no secret.
+                    self.maybe_capture_inbound_msg_secret(&msg, info).await;
+                    // The sender resent a message we already handed to consumers. Ack
+                    // it the way the ratchet-level duplicate is acked, so a registered
+                    // durability hook still gets its replay instead of a bare ack.
+                    // status is acked by the should_ack gate. A hook whose buffered copy
+                    // survived replays instead of being acked, which dispatches the
+                    // message again: that is the documented at-least-once shape, not a
+                    // suppression, so it is not counted as one.
+                    let replayed = !info.source.chat.is_status_broadcast()
+                        && self.ack_or_replay_to_hook(info).await;
+                    if !replayed {
+                        self.duplicate_dispatch_suppressed
+                            .fetch_add(1, Ordering::Relaxed);
+                        wacore::telemetry::recv("duplicate_resend");
+                        log::debug!(
+                            "[msg:{}] already dispatched for this sender; suppressing the resend's event",
+                            info.id
+                        );
+                    }
+                    // The event is a duplicate; the key share is not. Our phone asking
+                    // again is what it does when it did not get the keys, so the first
+                    // delivery's send having been scheduled is no reason to skip this
+                    // one. Sending them twice costs a stanza; not sending them leaves
+                    // the requester without app-state keys until it changes request id.
+                    if let Some((requester, request)) = app_state_key_share_job {
+                        self.schedule_app_state_sync_key_share(requester, request, None);
+                    }
+                    return Ok(PlaintextHandleOutcome {
+                        dispatched: true,
+                        ..Default::default()
+                    });
+                }
+                ProbeOutcome::Proceed { decrypted } => decrypted.map(|boxed| *boxed),
+            };
             let commit_state = self
-                .dispatch_parsed_message(msg, info, app_state_key_share_job.is_some())
+                .dispatch_parsed_message_with_decrypted(
+                    msg,
+                    info,
+                    app_state_key_share_job.is_some(),
+                    pre_decrypted,
+                )
                 .await;
             if let Some((requester, request)) = app_state_key_share_job {
                 match commit_state {
@@ -1957,7 +2066,7 @@ impl Client {
         signal_address: &wacore::libsignal::protocol::ProtocolAddress,
         parsed_message: &mut ParsedSessionMessage,
         adapter: &mut crate::store::signal_adapter::SignalProtocolStoreAdapter,
-        rng: &mut rand::rngs::StdRng,
+        rng: &mut LazyStdRng,
         enc_type: &'static str,
         padding_version: u8,
         enc_index: usize,

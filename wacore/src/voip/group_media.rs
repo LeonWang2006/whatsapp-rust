@@ -4,10 +4,10 @@
 //! keygen-v2 epoch is then derived with the authenticated sender's device id;
 //! keys are never tried across participants.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 use subtle::ConstantTimeEq;
-use wacore_binary::{Jid, JidExt};
+use wacore_binary::Jid;
 use zeroize::Zeroize;
 
 use crate::types::group_call::{
@@ -21,8 +21,8 @@ use crate::voip::session::{
     MediaPipeline, MediaPipelineParams, VideoPipeline, VideoPipelineParams,
 };
 use crate::voip::ssrc::{
-    APP_DATA_SSRC_SLOT_WORD, VIDEO_SSRC_SLOT_WORD, derive_video_participant_ssrc,
-    derive_wasm_participant_ssrc, format_e2e_srtp_participant_id,
+    APP_DATA_SSRC_SLOT_WORD, derive_video_participant_ssrc, derive_wasm_participant_ssrc,
+    format_e2e_srtp_participant_id,
 };
 
 const MAX_BUFFERED_EPOCHS: usize = 8;
@@ -102,7 +102,8 @@ pub struct ParticipantVideo {
     pub device_jid: Jid,
     pub pid: Option<u32>,
     pub header: RtpHeader,
-    pub access_units: Vec<Vec<u8>>,
+    pub access_units: Vec<(u32, Vec<u8>)>,
+    pub(crate) orientations: Vec<Option<u8>>,
 }
 
 struct ParticipantReceiver {
@@ -123,6 +124,20 @@ struct ParticipantReceiver {
 pub(crate) enum GroupMediaStream {
     Audio,
     Video,
+}
+
+/// Why an inbound group audio packet produced nothing.
+///
+/// Two different things, and only one of them is a fault: a packet whose SSRC is not in the roster
+/// never reaches SRTP at all, so calling it an authentication failure reports a key problem for a
+/// packet no key was tried on. A straggler from a participant an authoritative update just removed
+/// is the ordinary way that happens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupAudioReject {
+    /// No route for this SSRC: not addressed to anyone this call still knows.
+    Unroutable,
+    /// Routed, and the tag did not authenticate.
+    Unprotect,
 }
 
 /// Per-call participant receiver registry with transaction-ordered shared epochs.
@@ -414,12 +429,26 @@ impl GroupMediaRegistry {
         Ok(GroupEpochApply::Installed)
     }
 
-    pub fn unprotect_audio(&mut self, packet: &[u8]) -> Option<ParticipantMedia> {
-        let ssrc = parse_rtp_header(packet)?.ssrc;
-        let participant_id = self.audio_routes.get(&ssrc)?.clone();
-        let receiver = self.receivers.get_mut(&participant_id)?;
-        let (header, payload) = receiver.audio.as_mut()?.unprotect_audio(packet)?;
-        Some(ParticipantMedia {
+    pub fn unprotect_audio(&mut self, packet: &[u8]) -> Result<ParticipantMedia, GroupAudioReject> {
+        let ssrc = parse_rtp_header(packet)
+            .ok_or(GroupAudioReject::Unroutable)?
+            .ssrc;
+        let participant_id = self
+            .audio_routes
+            .get(&ssrc)
+            .ok_or(GroupAudioReject::Unroutable)?
+            .clone();
+        let receiver = self
+            .receivers
+            .get_mut(&participant_id)
+            .ok_or(GroupAudioReject::Unroutable)?;
+        let (header, payload) = receiver
+            .audio
+            .as_mut()
+            .ok_or(GroupAudioReject::Unroutable)?
+            .unprotect_audio(packet)
+            .ok_or(GroupAudioReject::Unprotect)?;
+        Ok(ParticipantMedia {
             participant_id,
             user_jid: receiver.user_jid.clone(),
             device_jid: receiver.device_jid.clone(),
@@ -437,6 +466,10 @@ impl GroupMediaRegistry {
             return None;
         }
         let (header, access_units) = receiver.video.as_mut()?.unprotect_video_packet(packet)?;
+        let (access_units, orientations) = access_units
+            .into_iter()
+            .map(|(timestamp, data, orientation)| ((timestamp, data), orientation))
+            .unzip();
         Some(ParticipantVideo {
             participant_id,
             user_jid: receiver.user_jid.clone(),
@@ -444,6 +477,7 @@ impl GroupMediaRegistry {
             pid: receiver.pid,
             header,
             access_units,
+            orientations,
         })
     }
 
@@ -730,63 +764,13 @@ fn pid_migrated(existing: Option<u32>, incoming: Option<u32>) -> bool {
 pub(crate) fn validate_group_media_snapshot(
     update: &GroupCallUpdate,
 ) -> Result<(), GroupMediaError> {
-    let mut pids = HashSet::new();
-    let mut devices = HashSet::new();
-    let mut audio = HashSet::new();
-    let mut video = HashSet::new();
-    let mut app_data = HashSet::new();
-    let mut rtcp = HashSet::new();
-    for device in update
-        .participants
-        .iter()
-        .filter(|participant| participant.state.as_deref() == Some("connected"))
-        .flat_map(|participant| &participant.devices)
-    {
-        let Some(pid) = device.pid else {
-            continue;
-        };
-        let participant_id = format_e2e_srtp_participant_id(&device.jid.to_string());
-        if pid == 0 || !pids.insert(pid) || !devices.insert(participant_id.clone()) {
-            return Err(GroupMediaError::InvalidSnapshot);
-        }
-        let audio_ssrc = derive_wasm_participant_ssrc(&update.call_id, &participant_id, 0);
-        let video_ssrc =
-            derive_wasm_participant_ssrc(&update.call_id, &participant_id, VIDEO_SSRC_SLOT_WORD);
-        let app_data_ssrc =
-            derive_wasm_participant_ssrc(&update.call_id, &participant_id, APP_DATA_SSRC_SLOT_WORD);
-        if !audio.insert(audio_ssrc) || !video.insert(video_ssrc) || !app_data.insert(app_data_ssrc)
-        {
-            return Err(GroupMediaError::InvalidSnapshot);
-        }
-        for slot_word in 0..RELAY_STREAM_SLOT_COUNT {
-            let rtcp_ssrc =
-                derive_wasm_participant_ssrc(&update.call_id, &participant_id, slot_word);
-            if !rtcp.insert(rtcp_ssrc) {
-                return Err(GroupMediaError::InvalidSnapshot);
-            }
-        }
-    }
-    Ok(())
+    // The SSRC-uniqueness check is pure and lives on the control plane now; this module keeps the
+    // `GroupMediaError` spelling its callers match on.
+    crate::voip_control::group::validate_group_snapshot_for_media(update)
+        .map_err(|()| GroupMediaError::InvalidSnapshot)
 }
 
-pub(crate) fn group_device_is_local(
-    participant: &GroupCallParticipant,
-    device: &GroupCallDevice,
-    local_device: &Jid,
-) -> bool {
-    let owns_local_user = participant.jid.is_same_user_as(local_device)
-        || participant
-            .pn
-            .as_ref()
-            .is_some_and(|pn| pn.is_same_user_as(local_device));
-    owns_local_user
-        && device.jid.device == local_device.device
-        && (device.jid.is_same_user_as(&participant.jid)
-            || participant
-                .pn
-                .as_ref()
-                .is_some_and(|pn| device.jid.is_same_user_as(pn)))
-}
+pub(crate) use crate::voip_control::group::group_device_is_local;
 
 fn active_devices<'a>(
     update: &'a GroupCallUpdate,
@@ -811,6 +795,7 @@ fn active_devices<'a>(
 mod tests {
     use super::*;
     use crate::voip::rtp::VIDEO_TS_STRIDE_15FPS;
+    use crate::voip::ssrc::VIDEO_SSRC_SLOT_WORD;
     use crate::voip::warp::WARP_MI_TAG_LEN;
     use wacore_binary::Server;
 
@@ -920,7 +905,7 @@ mod tests {
         assert!(
             registry
                 .unprotect_audio(&unknown.protect_audio(&payload))
-                .is_none()
+                .is_err()
         );
     }
 
@@ -936,7 +921,7 @@ mod tests {
         assert!(
             registry
                 .unprotect_audio(&sender.protect_audio(&[0x50; 20]))
-                .is_some(),
+                .is_ok(),
             "the direct fallback is active before the first roster"
         );
 
@@ -947,7 +932,7 @@ mod tests {
         assert!(
             registry
                 .unprotect_audio(&sender.protect_audio(&[0x51; 20]))
-                .is_none(),
+                .is_err(),
             "the first authoritative roster must revoke a departed direct peer"
         );
     }
@@ -964,7 +949,7 @@ mod tests {
         assert!(
             registry
                 .unprotect_audio(&sender.protect_audio(&[0x50; 20]))
-                .is_some()
+                .is_ok()
         );
 
         registry
@@ -976,7 +961,7 @@ mod tests {
         assert!(
             registry
                 .unprotect_audio(&sender.protect_audio(&[0x51; 20]))
-                .is_some(),
+                .is_ok(),
             "None-to-Some PID adoption must retain the authenticated direct receiver"
         );
     }
@@ -1050,7 +1035,7 @@ mod tests {
             .unwrap();
         registry.apply_raw_epoch(2, &epoch).unwrap();
         let first = sender.protect_audio(&[0x50; 20]);
-        assert!(registry.unprotect_audio(&first).is_some());
+        assert!(registry.unprotect_audio(&first).is_ok());
 
         registry
             .apply_group_update(&update(
@@ -1063,7 +1048,7 @@ mod tests {
             ))
             .unwrap();
         let second = sender.protect_audio(&[0x51; 20]);
-        assert!(registry.unprotect_audio(&second).is_some());
+        assert!(registry.unprotect_audio(&second).is_ok());
 
         registry
             .apply_group_update(&update(4, vec![device("100001", 1, 1)]))
@@ -1071,7 +1056,7 @@ mod tests {
         assert!(
             registry
                 .unprotect_audio(&sender.protect_audio(&[0x52; 20]))
-                .is_none()
+                .is_err()
         );
     }
 
@@ -1090,7 +1075,7 @@ mod tests {
         assert!(
             registry
                 .unprotect_audio(&first_session.protect_audio(&[0x50; 20]))
-                .is_some()
+                .is_ok()
         );
 
         let mut migrated = participants;
@@ -1103,7 +1088,7 @@ mod tests {
         assert!(
             registry
                 .unprotect_audio(&replacement_session.protect_audio(&[0x51; 20]))
-                .is_some(),
+                .is_ok(),
             "a new PID must start with fresh ROC, replay, and depacketization state"
         );
     }
@@ -1280,7 +1265,9 @@ mod tests {
                 .find_map(|packet| registry.unprotect_video(packet))
                 .expect("participant video packet");
             assert_eq!(decoded.device_jid, *peer);
-            assert_eq!(decoded.access_units, [access_unit.to_vec()]);
+            assert_eq!(decoded.access_units.len(), 1);
+            assert_eq!(decoded.access_units[0].0, decoded.header.timestamp);
+            assert_eq!(decoded.access_units[0].1, access_unit);
         }
     }
 

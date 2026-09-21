@@ -91,27 +91,136 @@ Asked often enough to write down: the runtime-free VoIP core already exists, and
 it is not what `voip-runtime` gates.
 
 `wacore::voip` is sans-IO. Its feature is `["dep:aes-gcm", "dep:zerocopy"]`,
-`tokio` appears only under wacore's `[dev-dependencies]`, and the four mentions
-of tokio or webrtc under `wacore/src/voip/` are doc comments describing what the
-native side injects. The executor is the `wacore::runtime::Runtime` trait, with
-a `Send` native shape and a non-`Send` wasm one; the socket is the
+`tokio` appears only under wacore's `[dev-dependencies]`, and the mentions of
+tokio or webrtc under `wacore/src/voip/` are doc comments describing what a
+platform injects. The executor is the `wacore::runtime::Runtime` trait, with a
+`Send` native shape and a non-`Send` wasm one; the socket is the
 `RelayTransport` seam. CI builds it for `wasm32-unknown-unknown` with
 `--no-default-features --features "voip,js"` on every PR, which is what keeps
 that true.
 
-What `voip-runtime` gates in this crate is the native media plane: the webrtc-rs
-DTLS/SCTP DataChannel, the libopus FFI and the task orchestration around them.
-That is runtime-bound by construction, and `src/voip/mod.rs` has a
-`compile_error!` pointing wasm32 and espidf builds at `wacore/voip` instead.
-Making it runtime-agnostic would not be a refactor of this code, it would be
-replacing webrtc-rs, and there is no consumer waiting for it: the one a split
-was supposed to free is already served by `wacore::voip`.
+What `voip-runtime` gates in this crate is no longer the native media plane. It
+used to, and the split that changed it is worth stating plainly, because this
+section previously said the opposite and a boundary decision made from the old
+text would be made backwards:
+
+- **`voip-runtime`** is the portable half — signaling, the facade, `CallHandle`,
+  and the orchestration around `wacore`'s engine. It owns no socket and reads no
+  clock (every timeout goes through `wacore::runtime`, and the driver runs on the
+  client's own `Arc<dyn Runtime>`), so it builds wherever `wacore` does. CI
+  builds it for `wasm32-unknown-unknown` with `--features voip-mlow`.
+- **`voip-relay-native`** is the half that cannot: one UDP endpoint per call with
+  the webrtc-rs DTLS/SCTP DataChannel over it. It carries the `compile_error!`
+  for wasm32 and espidf, and it is the only VoIP feature that does.
+- **`voip-libopus`** is the other native-only one, and for the other reason: it
+  is C. MLow (`voip-mlow`) is pure Rust and is what a portable build uses.
+
+So "make it runtime-agnostic" is no longer a question about replacing webrtc-rs.
+A target without a UDP socket keeps the whole call flow and supplies its own way
+onto the wire through `Client::set_relay_transport_provider`; in a browser that
+is an `RTCPeerConnection`, which is the same DTLS/SCTP/DataChannel stack with the
+browser assembling it. The consumer that was said not to exist is the web front
+end, and it is the reason the split was made.
 
 `voip-runtime` is one test away from cuttable, and the three sites that keep it
 coupled are all the same shape: a `pub(crate)` helper whose only caller is VoIP.
 Moving them under `src/voip/` would pass test 3 by separating each from the
 Signal-session, response-waiter and tc-token code it belongs with. Worse code
 for a better number, so they stay, and this row is the record of that choice.
+
+### The media seam: `voip-control` and the engine behind it
+
+A media engine ships inside the call flow today, and every consumer of VoIP pays
+for it. The way out is a **neutral contract** carried by a byte cut: the
+boundary a media engine implements, with no engine type in its API, with the
+call flow compiling engine-free on the other side of it.
+
+`wacore::voip_control` is that contract, gated on `voip-control`. It declares
+`VoipMediaBackend` and `VoipMediaSession` plus the flat data they carry
+(`MediaSessionSpec`, `MediaCommand`, `MediaEvent`, `MediaStats`, and the structs
+and enums they need). Nothing in it names a `wacore::voip` type, so a build can
+enable it and not `voip`; the compiler names the leak if a draft reaches for one.
+`MediaSessionSpec`'s `Debug` redacts the callKey, relay token, auth token and
+integrity key, the same material `CallConfig`'s redaction protects.
+
+In `whatsapp-rust`, `voip-control` re-exports that contract and `voip-engine-wacore`
+adds the resident backend (`voip_control::wacore_backend`) that builds a
+`wacore::voip::CallEngine` from the neutral spec and publishes stats through the
+session. Events need no translation: `MediaEvent` is `CallEvent` under its seam
+name, so the drive loop publishes it directly. `voip-runtime` composes both, so
+**what it delivers is unchanged**:
+signaling, the facade, and the engine, exactly as before. No observable behavior
+moved; the only new thing is that the engine now sits behind a trait the call
+registry stores.
+
+**What the registry stores, and why the engine is `!Sync`.** `CallEntry` used to
+hold six driver fields (`media_task`, `media_stats`, `rekey_tx`, `event_tx`,
+`video_ctl_tx`, `group_ctl_tx`). Swapping the engine constructor alone does not
+decouple anything while those stay typed by `PeerAnswer`, `VideoControl`,
+`GroupControl` and `CallEvent`. They are gone: the entry stores
+`Arc<dyn VoipMediaSession>`, and the media command mailboxes live on the resident
+session behind it. What stays on the entry is control-plane data the registry
+owns: the signaling session, the close reason, the generation token, the video
+negotiation state and retained peer rotations, the group warp width, and the
+teardown hook. The consumer-facing event queue, the counters cell, and the
+media-task abort handle it used to hold moved onto the session: the `CallHandle`
+reads them through `subscribe()`/`stats()`, and `close()` ends the drive task.
+
+The engine is `Send` but not `Sync`: `CallEngine` holds
+`Box<dyn ForeignAudioCodec>`, whose trait is bounded `MaybeSend` and deliberately
+not `Sync`, because libopus's decoder is `Send` but not `Sync`. The seam trait is
+`MaybeSendSync`, so a shared session object cannot hold the engine directly. Two
+ways out exist: a `Mutex<CallEngine>` inside the session, or exclusive ownership
+by the drive task with a command handle. This tree takes the second, which is what
+the architecture already was: `run_call` owns the engine on one task, and the
+session is a handle over its bounded mailboxes. That keeps the seam `Sync` without
+putting a lock on the media path, and it is why `media_session.rs` carries no
+`Mutex<CallEngine>`.
+
+**Engine-specific public openings were kept minimal.** The public engine-specific
+additions are the video upgrade token accessors (`VideoUpgradeToken::epoch()`
+and `from_parts`: the epoch distinguishes two upgrade requests in one
+generation) and the `voip-control` feature boundary itself, on `wacore` and
+`whatsapp-rust`. Conversion from the neutral session spec into the resident
+`CallConfig` is internal adapter machinery (`engine_bridge`, `#[doc(hidden)]`)
+and is not part of the foreign-backend API: `AudioFormat::from_neutral` /
+`AudioConfig::from_neutral` are `pub(crate)`, their `to_neutral` inverses are
+gone, and `MediaVideoPorts` is test-only.
+
+**The byte cut is done.** `src/voip` (the facade, the registry, the signaling
+call state) now lives on the neutral contract and compiles under `voip-control`
+alone, with the resident engine off. The signaling types that used to live in
+`wacore::voip` -- `CallSession`, `CallPhase`, `CallEvent` and its payloads,
+`CallRegistry`, `GroupCallState`, `relay_parse`, the transport seam, the audio
+format types, the group control vocabulary -- were moved into
+`wacore::voip_control`, and `wacore::voip` re-exports them, so the historical
+paths keep resolving. The public event and command surface
+(`CallHandle::events()`, `CallHandle::media_stats()`) reads the session through
+`subscribe()`/`stats()`, not an engine-owned enum or cell.
+
+`voip-control` carries the contract **and** the call flow: `src/voip` is gated on
+it in `src/lib.rs`, and `src/client/voip.rs` (which owns `CallError`,
+`call_registry()`, `PendingCallLinkJoins`, `LocalTeardown`) is gated on it too.
+`voip-engine-wacore` adds the resident `WacoreVoipMediaBackend` on top, and
+`voip-runtime` composes both, so what it delivers is unchanged. A build with
+`voip-control` alone and no injected backend returns the typed
+`MediaSetupError::NoBackend` when media starts, never a panic or a silent no-op.
+
+The proof: a `wasm32-unknown-unknown` build of `--features voip-control`
+compiles and its artifact contains `MediaSessionSpec`, `MediaCommand` and
+`VoipMediaSession` but none of `CallEngine`, `MlowEncoder`, `MlowDecoder`,
+`SframeSession`, `run_call`, `CallConfig` or `MediaPipeline` (a byte scan finds
+only the doc-comment mentions, no code). The facade's own media startup goes
+only through `VoipMediaBackend::open`, so the control plane never names an
+engine type in production.
+
+The gate count moves down. `voip-runtime` names only four sites outside the
+subsystem's own files, all test scaffolding (two `create_test_client*` helpers
+and two `should_issue_tc_token` tests); no production code outside `src/voip`,
+`src/client/voip.rs` and `src/handlers/call.rs` names it. A second guard caps
+`voip-control` at 16: the two `mod` declarations, the `subsystems!` entry, the 7
+builder lines of the backend injection point, 3 control-plane-driven core hooks,
+and 3 test gates. The budgets record those final numbers, 4 and 16.
 
 ### Not a subsystem: WAM
 
@@ -355,7 +464,7 @@ after this batch:
 
 ## What the guard proves, and what it does not
 
-`tests/subsystem_boundary.rs` holds two guards, one per verdict.
+`tests/subsystem_boundary.rs` holds three guards: one cuttable, two disciplined.
 
 **Cuttable.** The core may not name the subsystem outside the files it owns and
 its two allowed mentions. It scans text, so it sees a mention in a comment too,
@@ -369,9 +478,10 @@ and the gate arm requires the line to *end* as an attribute, or a one-line
 `#[cfg(feature = "x")] pub use crate::x::Thing;` would open like a gate and pass.
 
 **Coupled but disciplined.** A subsystem that cannot leave still has gates in the
-core, so the guard caps how many. VoIP's is 9 outside the files it owns, and
-raising it is meant to be a decision with a line in this document behind it. The
-cap counts production and test gates together, because telling them apart needs
+core, so each guard caps how many. `voip-runtime` allows 4 outside the files it
+owns, `voip-control` 16, and raising either is meant to be a decision with a
+line in this document behind it. The cap counts production and test gates
+together, because telling them apart needs
 a parser the guard does not have and a new gate is worth a look either way.
 
 It counts the `feature = "..."` term rather than a whole `cfg(feature = "...")`,

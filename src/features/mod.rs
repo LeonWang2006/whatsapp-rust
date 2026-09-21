@@ -62,20 +62,22 @@ pub use chatstate::{ChatStateError, ChatStateType, Chatstate};
 pub use comments::Comments;
 
 pub use contacts::{
-    ContactError, Contacts, IsOnWhatsAppResult, ProfilePicture, UserInfo, UsyncSubprotocolError,
-    VerifiedName,
+    ContactError, Contacts, IsOnWhatsAppResult, ProfilePicture, ProfilePictureLookup,
+    ProfilePictureLookupOptions, USERNAME_MAX_LENGTH, USERNAME_MIN_LENGTH, UserInfo,
+    UsernameLookup, UsernameLookupError, UsernameLookupUser, UsyncSubprotocolError, VerifiedName,
 };
 
 pub use events::{EventCreationParams, EventResponseType, Events};
 
 pub use groups::{
-    BatchGroupResult, CreateGroupResult, GroupAppealStatus, GroupCreateOptions, GroupDescription,
-    GroupEphemeralSettings, GroupError, GroupJoinError, GroupMessageReporter, GroupMetadata,
-    GroupParticipant, GroupParticipantDetails, GroupParticipantOptions, GroupProfilePicture,
-    GroupSubject, Groups, GrowthLockInfo, InviteInfoError, JoinGroupResult, MemberAddMode,
-    MemberLinkMode, MemberShareHistoryMode, MembershipApprovalMode, MembershipRequest,
-    ParticipantChangeResponse, ParticipantType, PictureType, PreviousDescription,
-    ReportedGroupMessage, ReportedGroupMessages,
+    CreateGroupResult, GroupAppealStatus, GroupCreateOptions, GroupDescription,
+    GroupEphemeralSettings, GroupError, GroupHierarchy, GroupJoinError, GroupMessageReporter,
+    GroupMetadata, GroupMetadataResult, GroupOverview, GroupOverviewResult, GroupParticipant,
+    GroupParticipantDetails, GroupParticipantOptions, GroupPictureEntry, GroupProfilePicture,
+    GroupProfilePictureOutcome, GroupSubject, Groups, GrowthLockInfo, InviteInfoError,
+    JoinGroupResult, MemberAddMode, MemberLinkMode, MemberShareHistoryMode, MembershipApprovalMode,
+    MembershipRequest, ParticipantChangeResponse, ParticipantType, PictureType,
+    PreviousDescription, ReportedGroupMessage, ReportedGroupMessages, SubgroupKind,
 };
 
 pub use labels::Labels;
@@ -88,7 +90,8 @@ pub use message_edit::{EncryptedEdit, MessageEditError, SecretEncKind, SecretEnc
 
 pub use mex::{
     CappingMvStatus, CappingOteStatus, CappingStatus, Mex, MexError, MexErrorExtensions,
-    MexGraphQLError, MexRequest, MexResponse, NewChatMessageCapping, ReachoutTimelock,
+    MexFatalError, MexGraphQLError, MexRequest, MexResponse, NewChatMessageCapping, OwnUsername,
+    ReachoutTimelock,
 };
 
 pub use newsletter::{
@@ -99,7 +102,7 @@ pub use newsletter::{
 
 pub use polls::{PollError, PollOptionResult, PollVoteCiphertext, Polls};
 
-pub use presence::{Presence, PresenceError, PresenceStatus};
+pub use presence::{Presence, PresenceError, PresencePolicy, PresenceStatus};
 
 pub use profile::{Profile, ProfileError, SetProfilePictureResponse};
 

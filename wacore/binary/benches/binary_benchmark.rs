@@ -1,11 +1,13 @@
 use divan::black_box;
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
+use std::collections::HashSet;
 use std::io::Write;
+use wacore_binary::NodeStream;
 use wacore_binary::builder::NodeBuilder;
 use wacore_binary::marshal::{
     marshal, marshal_auto, marshal_exact, marshal_ref, marshal_ref_auto, marshal_ref_exact,
-    marshal_to, unmarshal_ref,
+    marshal_shallow, marshal_to, unmarshal_ref,
 };
 use wacore_binary::node::Node;
 use wacore_binary::util::{FORMAT_COMPRESSED, unpack};
@@ -228,14 +230,24 @@ fn bench_marshal_auto_many_children(bencher: divan::Bencher) {
         .bench_refs(|node| black_box(marshal_auto(black_box(node)).unwrap()));
 }
 
-// The exact (plan + hint replay) strategy is the production send path for
-// message plaintext, so its worst case — many children, JID-heavy — gets its
-// own pin.
+// The shallow (estimate + single pass) strategy is the production send path
+// for message plaintext, so its worst case — many children, JID-heavy — gets
+// its own pin, against the exact (plan + hint replay) strategy it replaced on
+// the same shape. The sampled estimate is what the pair measures: many
+// children is where sampling has the most room to be wrong, and a reserve that
+// undershoots shows up here as the `Vec` growth it costs.
 #[divan::bench]
 fn bench_marshal_exact_many_children(bencher: divan::Bencher) {
     bencher
         .with_inputs(create_many_children_node)
         .bench_refs(|node| black_box(marshal_exact(black_box(node)).unwrap()));
+}
+
+#[divan::bench]
+fn bench_marshal_shallow_many_children(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(create_many_children_node)
+        .bench_refs(|node| black_box(marshal_shallow(black_box(node)).expect("marshal_shallow")));
 }
 
 // Strategy comparison on one shape.
@@ -251,6 +263,13 @@ fn bench_marshal_exact_large(bencher: divan::Bencher) {
     bencher
         .with_inputs(create_large_node)
         .bench_refs(|node| black_box(marshal_exact(black_box(node)).unwrap()));
+}
+
+#[divan::bench]
+fn bench_marshal_shallow_large(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(create_large_node)
+        .bench_refs(|node| black_box(marshal_shallow(black_box(node)).expect("marshal_shallow")));
 }
 
 #[divan::bench]
@@ -498,5 +517,133 @@ fn bench_jid_to_owned_access(bencher: divan::Bencher) {
             black_box(parser.optional_string("id"));
             black_box(parser.optional_string("type"));
             node
+        });
+}
+
+// The A/B props catalog: thousands of small `<prop>` children under one
+// `<props>` child of the result, of which a client keeps a few dozen. It is
+// the largest frame of a login and the reason `NodeStream` exists, so both
+// readings of it are tracked: the tree decode every other IQ gets, and the
+// streamed walk that keeps only the watched codes.
+const PROPS_CATALOG_CODES: u32 = 2_600;
+
+fn create_props_catalog_node() -> Node {
+    let props: Vec<Node> = (0..PROPS_CATALOG_CODES)
+        .map(|i| {
+            let value = match i % 4 {
+                0 => "true".to_string(),
+                1 => "false".to_string(),
+                2 => (i * 7).to_string(),
+                _ => format!(
+                    "{:016x}{:016x}",
+                    u64::from(i) * 0x9E37,
+                    u64::from(i) * 0x79B9
+                ),
+            };
+            NodeBuilder::new("prop")
+                .attr("config_code", (1000 + i).to_string())
+                .attr("config_value", value)
+                .build()
+        })
+        .collect();
+    NodeBuilder::new("iq")
+        .attr("from", "s.whatsapp.net")
+        .attr("type", "result")
+        .attr("id", "1234-5")
+        .children(vec![
+            NodeBuilder::new("props")
+                .attr("ab_key", "abcdef0123456789")
+                .attr("hash", "1a2b3c4d")
+                .attr("refresh", "86400")
+                .children(props)
+                .build(),
+        ])
+        .build()
+}
+
+fn setup_props_catalog_payload() -> Vec<u8> {
+    let body = node_bytes(&create_props_catalog_node());
+    let mut payload = vec![FORMAT_COMPRESSED];
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&body).unwrap();
+    payload.extend_from_slice(&encoder.finish().unwrap());
+    payload
+}
+
+/// The codes a client watches: a few dozen spread over the catalog.
+fn watched_codes() -> HashSet<u32> {
+    (0..PROPS_CATALOG_CODES)
+        .step_by(97)
+        .map(|i| 1000 + i)
+        .collect()
+}
+
+/// The tree reading: inflate, decode the whole tree, then walk it for the
+/// watched codes, the way `PropsSpec::parse_response` reads a response.
+#[divan::bench]
+fn bench_props_catalog_tree(bencher: divan::Bencher) {
+    let watched = watched_codes();
+    bencher
+        .with_inputs(setup_props_catalog_payload)
+        .bench_refs(|payload| {
+            let bytes = unpack(black_box(payload)).unwrap();
+            let root = unmarshal_ref(&bytes).unwrap();
+            let props = root.get_optional_child("props").unwrap();
+            let mut kept = 0usize;
+            for child in props.children().unwrap_or(&[]) {
+                if child.tag != "prop" {
+                    continue;
+                }
+                let Some(code) = child.get_attr("config_code") else {
+                    continue;
+                };
+                if let Ok(code) = code.as_str().parse::<u32>()
+                    && watched.contains(&code)
+                    && child.get_attr("config_value").is_some()
+                {
+                    kept += 1;
+                }
+            }
+            black_box(kept)
+        });
+}
+
+/// The streamed reading: the same selection, one child at a time out of the
+/// inflate window, the way `PropsSpec::consume_response` reads a response.
+#[divan::bench]
+fn bench_props_catalog_stream(bencher: divan::Bencher) {
+    let watched = watched_codes();
+    bencher
+        .with_inputs(setup_props_catalog_payload)
+        .bench_refs(|payload| {
+            let mut stream = NodeStream::from_packed(black_box(payload)).unwrap();
+            stream.open().unwrap().unwrap();
+            let mut kept = 0usize;
+            loop {
+                let Some(head) = stream.open().unwrap() else {
+                    break;
+                };
+                if head.tag != "props" {
+                    stream.close().unwrap();
+                    continue;
+                }
+                while let Some(child) = stream.next_child().unwrap() {
+                    if child.tag != "prop" {
+                        continue;
+                    }
+                    let Some(code) = child.get_attr("config_code") else {
+                        continue;
+                    };
+                    if let Ok(code) = code.as_str().parse::<u32>()
+                        && watched.contains(&code)
+                        && child.get_attr("config_value").is_some()
+                    {
+                        kept += 1;
+                    }
+                }
+                stream.close().unwrap();
+            }
+            stream.finish().unwrap();
+            black_box(kept)
         });
 }

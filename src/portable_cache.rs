@@ -9,10 +9,11 @@
 //! same missing key run the initializer once.
 
 use async_lock::{Mutex as AsyncMutex, RwLock};
+use hashbrown::HashTable;
 use std::borrow::Borrow;
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{BuildHasher, Hash, RandomState};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use wacore::runtime::BoxFuture;
 use wacore::sync_marker::MaybeSend;
@@ -30,14 +31,232 @@ use wacore::time::Instant;
 /// behind a writer.
 const TTI_RENEWAL_DIVISOR: u32 = 16;
 
-struct CacheEntry<V> {
+/// Coordination entries may all be pinned. Bound each insertion's scan work
+/// rather than repeatedly walking the growing map without finding a victim.
+const GUARDED_EVICTION_PROBES: usize = 64;
+
+/// One table slot: the key, its hash, and the entry fields inline.
+///
+/// Flattened from a `Slot { key, hash, entry: CacheEntry }` nest so a narrow
+/// key reuses the entry tail padding: `referenced` (1 byte) plus `key: u32`
+/// pack into one word ahead of `hash`. Field order matters; moving `key` or
+/// `hash` ahead of the 8-byte fields reopens the gap.
+///
+/// The hash is kept so the table can grow without re-hashing every key and so
+/// the FIFO side can address a slot by `(hash, seq)` instead of holding a
+/// second copy of the key. Before this, `order` was a `BTreeMap<u64, K>`: every
+/// entry carried its key twice, and for a `String`, `Jid` or `SenderMessageId`
+/// key that second copy was a second heap allocation held for the entry's
+/// whole lifetime, across every cache the client keeps.
+struct Slot<K, V> {
     value: V,
     // Monotonic instants (not wall-clock) so TTL/TTI are immune to clock jumps,
     // matching moka's timer semantics.
     inserted_at: Instant,
     last_accessed_at: Instant,
-    /// FIFO sequence number; the key for this entry in `CacheInner::order`.
+    /// Eviction sequence number; the key for this entry in `CacheInner::order`.
     seq: u64,
+    /// Set by every hit, cleared by the eviction scan: the second-chance bit
+    /// of CLOCK. A hit costs one relaxed store under the read lock; the
+    /// reordering it earns is paid by the eviction that would have dropped
+    /// the entry, which re-queues it at the back instead. Moving the entry
+    /// on the hit itself needed the write lock, and once every entry was
+    /// being moved on every pass a warm read cost three times what it had.
+    referenced: portable_atomic::AtomicBool,
+    key: K,
+    hash: u64,
+}
+
+/// One table slot for a cache that can neither evict nor expire: only the key,
+/// its hash, and the value. Chosen at construction (see `assemble`), never per
+/// entry, so the managed path pays nothing for it and this path stores no
+/// timestamps, sequence numbers, or CLOCK bits.
+///
+/// Field order follows the flattened [`Slot`]: payload first, then the key so a
+/// narrow key reuses the tail padding ahead of `hash`.
+struct PlainSlot<K, V> {
+    value: V,
+    key: K,
+    hash: u64,
+}
+
+struct PlainInner<K, V, S> {
+    hasher: S,
+    table: HashTable<PlainSlot<K, V>>,
+}
+
+impl<K, V, S> PlainInner<K, V, S> {
+    fn new(hasher: S) -> Self {
+        Self {
+            hasher,
+            table: HashTable::new(),
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.table.len()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
+        self.table.iter().map(|slot| (&slot.key, &slot.value))
+    }
+
+    fn structural_bytes(&self) -> usize {
+        wacore::stats::hash_table_bytes(self.table.capacity(), size_of::<PlainSlot<K, V>>())
+    }
+
+    fn clear(&mut self) {
+        self.table.clear();
+    }
+}
+
+impl<K, V, S> PlainInner<K, V, S>
+where
+    K: Hash + Eq,
+    S: BuildHasher,
+{
+    #[inline]
+    fn hash_of<Q: Hash + ?Sized>(&self, key: &Q) -> u64 {
+        self.hasher.hash_one(key)
+    }
+
+    /// Table probes below stay out of line: under fat LTO they would otherwise
+    /// inline into every [`PortableCache`] future that dispatches on [`Storage`]
+    /// (`get`, `insert`, `upsert_with_by_ref`, `insert_and_return`, `remove`),
+    /// stamping the hashbrown probe per caller instead of per table. Same
+    /// reason [`expiry_walk`] stays out of line.
+    #[inline(never)]
+    fn get<Q>(&self, key: &Q) -> Option<&V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let hash = self.hash_of(key);
+        self.table
+            .find(hash, |slot| slot.key.borrow() == key)
+            .map(|slot| &slot.value)
+    }
+
+    #[inline(never)]
+    fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let hash = self.hash_of(key);
+        self.table
+            .find_mut(hash, |slot| slot.key.borrow() == key)
+            .map(|slot| &mut slot.value)
+    }
+
+    #[inline(never)]
+    fn remove_key<Q>(&mut self, key: &Q) -> Option<V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let hash = self.hash_of(key);
+        let (slot, _) = self
+            .table
+            .find_entry(hash, |slot| slot.key.borrow() == key)
+            .ok()?
+            .remove();
+        Some(slot.value)
+    }
+
+    #[inline(never)]
+    fn insert_new(&mut self, key: K, value: V) {
+        let hash = self.hash_of(&key);
+        insert_slot(&mut self.table, hash, PlainSlot { value, key, hash });
+    }
+
+    /// Replace-or-insert shared by `insert` and `insert_and_return` so the
+    /// get-then-insert sequence compiles once per table, not per caller.
+    #[inline(never)]
+    fn insert_or_replace(&mut self, key: K, value: V) {
+        if let Some(slot) = self.get_mut(&key) {
+            *slot = value;
+        } else {
+            self.insert_new(key, value);
+        }
+    }
+}
+
+/// Container-level representation, fixed at construction. The unbounded,
+/// non-expiring, guard-free cache (the default LID/PN maps) holds plain
+/// key/value slots; every other configuration keeps the managed table with
+/// timestamps, order, and CLOCK bits.
+enum Storage<K, V, S> {
+    Plain(PlainInner<K, V, S>),
+    Managed(CacheInner<K, V, S>),
+}
+
+impl<K, V, S> Storage<K, V, S>
+where
+    K: Hash + Eq + Clone,
+    S: BuildHasher,
+{
+    /// Out of line so the discriminant check compiles once per table instead
+    /// of inlining into every diagnostic caller (`entry_count`,
+    /// `structural_stats`, `clear`, ...). Hot paths match on the variants
+    /// directly and never come through here.
+    #[inline(never)]
+    fn len(&self) -> usize {
+        match self {
+            Storage::Plain(inner) => inner.len(),
+            Storage::Managed(inner) => inner.len(),
+        }
+    }
+
+    #[inline(never)]
+    fn clear(&mut self) {
+        match self {
+            Storage::Plain(inner) => inner.clear(),
+            Storage::Managed(inner) => inner.clear(),
+        }
+    }
+
+    #[inline(never)]
+    fn structural_bytes(&self) -> usize {
+        match self {
+            Storage::Plain(inner) => inner.structural_bytes(),
+            Storage::Managed(inner) => inner.structural_bytes(),
+        }
+    }
+}
+
+/// The hash a table slot was inserted with, read back when its table grows so
+/// growth never re-hashes a key. Both slot kinds carry it; the shared
+/// [`insert_slot`] tail reads it through this trait so the two `insert_unique`
+/// call sites compile from one definition instead of one per insert path.
+trait StoredHash {
+    fn stored_hash(&self) -> u64;
+}
+
+impl<K, V> StoredHash for Slot<K, V> {
+    #[inline]
+    fn stored_hash(&self) -> u64 {
+        self.hash
+    }
+}
+
+impl<K, V> StoredHash for PlainSlot<K, V> {
+    #[inline]
+    fn stored_hash(&self) -> u64 {
+        self.hash
+    }
+}
+
+/// Growth tail shared by [`PlainInner::insert_new`] and
+/// [`CacheInner::insert_new`]: grow the table when needed and insert the slot.
+/// Out of line so each `<K, V>` table carries its hashbrown growth chain once,
+/// not once per insert entry point (`insert`, `upsert_with_by_ref`,
+/// `insert_and_return`); a new cache instantiates one copy for its slot type
+/// however many paths insert into it.
+#[inline(never)]
+fn insert_slot<T: StoredHash>(table: &mut HashTable<T>, hash: u64, slot: T) {
+    table.insert_unique(hash, slot, |existing| existing.stored_hash());
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -49,109 +268,565 @@ pub(crate) struct CapacityStats {
 
 /// Portable, runtime-agnostic in-process cache.
 ///
-/// - Max capacity with FIFO eviction
+/// - Max capacity with second-chance (CLOCK) eviction: least recently used
+///   leaves first, and a hit costs one atomic store
 /// - TTL (time-to-live) and TTI (time-to-idle)
-/// - Single-flight `get_with` / `get_with_by_ref`
-pub struct PortableCache<K, V> {
-    inner: Arc<RwLock<CacheInner<K, V>>>,
-    /// Per-key init locks for single-flight `get_with`.
-    init_locks: Arc<InitLocks>,
+/// - Single-flight `get_with`
+///
+/// Uses `async_lock::RwLock` (runtime-agnostic, works on wasm32), so this
+/// compiles and runs on every target.
+///
+/// Both lazy and best-effort: expired entries are only removed lazily on
+/// access or in `run_pending_tasks`. `entry_count` may include
+/// expired-but-not-yet-evicted entries.
+pub struct PortableCache<K, V, S = RandomState> {
+    inner: Arc<RwLock<Storage<K, V, S>>>,
+    /// Shared single-flight init-lock registry (see `InitLocks`), built on the
+    /// first [`get_with`](Self::get_with) rather than at construction: a client
+    /// builds ~20 of these caches and most of them are only ever `get`/`insert`ed,
+    /// so an eager registry was 20 allocations of pure structure per client for a
+    /// single-flight path they never take. [`Clone`] forces it, so clones of one
+    /// cache still share one registry — which is what makes the flight single.
+    init_locks: OnceLock<Arc<InitLocks>>,
     max_capacity: Option<u64>,
     ttl: Option<Duration>,
     tti: Option<Duration>,
-    /// Optional predicate gating capacity eviction: returns `true` if a value may
-    /// be evicted. Used by coordination-lock caches to protect an entry a live task
-    /// still holds (e.g. an `Arc<Mutex>` mid-lock), which would otherwise be
-    /// FIFO-evicted and re-minted, letting two writers race the guarded resource.
+    /// See [`PortableCacheBuilder::evict_guard`].
     evict_guard: Option<fn(&V) -> bool>,
-    /// Stores made by the TTI renewal path. Lets a test assert that a burst of
-    /// concurrent lookups renews once rather than once per queued writer.
     #[cfg(test)]
     tti_renewals: Arc<portable_atomic::AtomicU64>,
 }
 
-struct CacheInner<K, V> {
-    map: HashMap<K, CacheEntry<V>>,
-    /// FIFO eviction order keyed by monotonic sequence. `seq -> key`, so eviction
-    /// is `pop_first()` (O(log n)) and a targeted `remove_key` is O(log n) via the
-    /// entry's stored `seq` — instead of an O(n) scan over an insertion list.
-    order: BTreeMap<u64, K>,
+/// What the eviction walk asks the slot table, through one `dyn` hook so the
+/// walk itself is compiled once. The walk is the bulk of the eviction code
+/// and every `K`/`V` pair would otherwise carry its own copy; the table
+/// probes it wraps are small.
+enum ClockOp {
+    /// Is the entry held, hit since the last pass, or a victim?
+    Classify { seq: u64, hash: u64 },
+    /// Re-key the entry to `fresh`. Answers `Victim` when found, `Skip` when
+    /// the slot is gone.
+    Reseq { seq: u64, hash: u64, fresh: u64 },
+}
+
+enum ClockVerdict {
+    Skip,
+    SecondChance,
+    Victim,
+}
+
+enum ClockWalk {
+    Victim {
+        seq: u64,
+        hash: u64,
+    },
+    /// No victim, but at least one entry spent its second chance; the next
+    /// pass over the same entries finds them unreferenced.
+    Requeued,
+    /// No victim found within this pass's probe budget.
+    Blocked,
+}
+
+/// The `(seq, hash)` pairs in `order` whose entry `probe` reports expired.
+/// Same shape as [`clock_walk`], and for the same reason: the walk is
+/// compiled once, and each `<K, V>` cache contributes only the probe, which
+/// is the `find` its eviction hook already carries. A `retain` over the
+/// table and the order map would be a second full walk per instantiation.
+/// `inline(never)`: under fat LTO the optimizer would otherwise inline this
+/// into every instantiation of the caller, which is the duplication it exists
+/// to avoid.
+#[inline(never)]
+fn expiry_walk(
+    order: &BTreeMap<u64, u64>,
+    probe: &mut dyn FnMut(u64, u64) -> bool,
+) -> Vec<(u64, u64)> {
+    let mut expired = Vec::new();
+    for (&seq, &hash) in order.iter() {
+        if probe(seq, hash) {
+            expired.push((seq, hash));
+        }
+    }
+    expired
+}
+
+/// One resumable pass of the second-chance walk over `order`: the first
+/// unreferenced, unheld entry is the victim; entries hit since the last pass
+/// have their bit cleared (by `probe`) and re-queue behind everything
+/// inserted so far, so each can earn at most one more pass per hit and the
+/// scan cannot cycle. Coordination caches resume at the cursor when the
+/// insertion exhausts its budget; ordinary caches start at the oldest entry.
+fn guarded_clock_walk(
+    order: &mut BTreeMap<u64, u64>,
+    next_seq: &mut u64,
+    cursor: &mut u64,
+    remaining: &mut usize,
+    probe: &mut dyn FnMut(ClockOp) -> ClockVerdict,
+) -> ClockWalk {
+    let mut victim = None;
+    let mut second_chance = Vec::new();
+    let start = *cursor;
+    for (&seq, &hash) in order.range(start..) {
+        if *remaining == 0 {
+            break;
+        }
+        *remaining -= 1;
+        *cursor = seq.saturating_add(1);
+        match probe(ClockOp::Classify { seq, hash }) {
+            ClockVerdict::Skip => continue,
+            ClockVerdict::SecondChance => second_chance.push((seq, hash)),
+            ClockVerdict::Victim => {
+                victim = Some((seq, hash));
+                break;
+            }
+        }
+    }
+    if victim.is_none() && *remaining != 0 {
+        *cursor = 0;
+    }
+    finish_clock_walk(order, next_seq, probe, victim, second_chance)
+}
+
+// Ordinary data caches keep the linear iterator: seeking a resumable range
+// on every eviction penalizes the common single-victim case.
+fn clock_walk(
+    order: &mut BTreeMap<u64, u64>,
+    next_seq: &mut u64,
+    probe: &mut dyn FnMut(ClockOp) -> ClockVerdict,
+) -> ClockWalk {
+    let mut victim = None;
+    let mut second_chance = Vec::new();
+    for (&seq, &hash) in order.iter() {
+        match probe(ClockOp::Classify { seq, hash }) {
+            ClockVerdict::Skip => continue,
+            ClockVerdict::SecondChance => second_chance.push((seq, hash)),
+            ClockVerdict::Victim => {
+                victim = Some((seq, hash));
+                break;
+            }
+        }
+    }
+    finish_clock_walk(order, next_seq, probe, victim, second_chance)
+}
+
+fn finish_clock_walk(
+    order: &mut BTreeMap<u64, u64>,
+    next_seq: &mut u64,
+    probe: &mut dyn FnMut(ClockOp) -> ClockVerdict,
+    victim: Option<(u64, u64)>,
+    second_chance: Vec<(u64, u64)>,
+) -> ClockWalk {
+    let requeued = !second_chance.is_empty();
+    for (seq, hash) in second_chance {
+        let fresh = *next_seq;
+        *next_seq += 1;
+        order.remove(&seq);
+        if matches!(
+            probe(ClockOp::Reseq { seq, hash, fresh }),
+            ClockVerdict::Victim
+        ) {
+            order.insert(fresh, hash);
+        }
+    }
+    match victim {
+        Some((seq, hash)) => ClockWalk::Victim { seq, hash },
+        None if requeued => ClockWalk::Requeued,
+        None => ClockWalk::Blocked,
+    }
+}
+
+struct CacheInner<K, V, S> {
+    /// Hashes keys once at insert; lookups with a borrowed `Q` hash through
+    /// the same state, which the `Borrow` contract keeps consistent with `K`.
+    hasher: S,
+    table: HashTable<Slot<K, V>>,
+    /// Eviction order, `seq -> hash`, oldest first; an entry given a second
+    /// chance is re-keyed to the back. Eviction walks from the front (O(log n)
+    /// per step) and a targeted `remove_key` is O(log n) via the entry's
+    /// stored `seq`. The hash plus the seq find the slot in `table`, so no key
+    /// is stored here.
+    ///
+    /// Left empty for a cache that has neither a capacity bound nor a time
+    /// bound: nothing could ever pop or expire an entry, so maintaining it
+    /// would spend a `BTreeMap` node per entry on a structure that is never
+    /// read. The unbounded LID↔PN caches hold tens of thousands of entries
+    /// for the life of the process.
+    order: BTreeMap<u64, u64>,
+    track_order: bool,
     /// Next FIFO sequence to assign.
     next_seq: u64,
+    eviction_cursor: u64,
     capacity_evictions: u64,
     capacity_eviction_blocks: u64,
 }
 
-impl<K, V> CacheInner<K, V>
+/// Synchronous TTL admission for publication paths that cannot yield after commit.
+pub(crate) struct SyncTtlCache<K, V> {
+    inner: std::sync::Mutex<CacheInner<K, V, RandomState>>,
+    capacity: u64,
+    ttl: Option<Duration>,
+}
+
+pub(crate) struct SyncTtlGuard<'a, K, V> {
+    inner: std::sync::MutexGuard<'a, CacheInner<K, V, RandomState>>,
+    capacity: u64,
+    ttl: Option<Duration>,
+    now: Instant,
+}
+
+impl<K: Hash + Eq + Clone, V> SyncTtlGuard<'_, K, V> {
+    pub(crate) fn get(&mut self, key: &K) -> Option<&mut V> {
+        if self.inner.get(key).is_some_and(|entry| {
+            self.ttl
+                .is_some_and(|ttl| self.now.saturating_duration_since(entry.inserted_at) >= ttl)
+        }) {
+            self.inner.remove_key(key);
+            self.inner.shrink_if_empty();
+        }
+        self.inner.get_mut(key).map(|entry| {
+            entry
+                .referenced
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            &mut entry.value
+        })
+    }
+
+    pub(crate) fn insert(&mut self, key: K, value: V) {
+        if let Some(entry) = self.inner.get_mut(&key) {
+            entry.value = value;
+            entry.inserted_at = self.now;
+            entry.last_accessed_at = self.now;
+        } else if self.capacity != 0 {
+            self.inner
+                .insert_new(key, value, self.now, Some(self.capacity), None);
+        }
+    }
+
+    pub(crate) fn remove(&mut self, key: &K) {
+        self.inner.remove_key(key);
+        self.inner.shrink_if_empty();
+    }
+
+    pub(crate) fn find_unique_key(&self, matches: impl Fn(&K, &V) -> bool) -> Option<K> {
+        let mut found = self.inner.iter().filter_map(|(key, entry)| {
+            if self
+                .ttl
+                .is_some_and(|ttl| self.now.saturating_duration_since(entry.inserted_at) >= ttl)
+                || !matches(key, &entry.value)
+            {
+                None
+            } else {
+                Some((key, entry))
+            }
+        });
+        let first = found.next()?;
+        if found.next().is_some() {
+            return None;
+        }
+        first
+            .1
+            .referenced
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        Some(first.0.clone())
+    }
+}
+
+impl<K: Hash + Eq + Clone, V: Clone> SyncTtlCache<K, V> {
+    pub(crate) fn new(capacity: u64, ttl: Option<Duration>) -> Self {
+        Self {
+            inner: std::sync::Mutex::new(CacheInner::new(true, RandomState::new())),
+            capacity,
+            ttl,
+        }
+    }
+
+    pub(crate) fn configured_capacity(&self) -> Option<u64> {
+        Some(self.capacity)
+    }
+
+    pub(crate) fn with<R>(&self, access: impl FnOnce(&mut SyncTtlGuard<'_, K, V>) -> R) -> R {
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        access(&mut SyncTtlGuard {
+            inner,
+            capacity: self.capacity,
+            ttl: self.ttl,
+            now: Instant::now(),
+        })
+    }
+
+    /// Entry count plus estimated retained bytes: the table the cache itself
+    /// holds, plus `per_entry` summed over the entries, under the single guard
+    /// so the pair is consistent. Mirrors [`Cache::memory_stats`] without the
+    /// async lock.
+    pub(crate) fn memory_stats(
+        &self,
+        mut per_entry: impl FnMut(&K, &V) -> usize,
+    ) -> wacore::stats::CollectionStats {
+        self.with(|cache| {
+            let bytes: usize = cache
+                .inner
+                .iter()
+                .map(|(key, entry)| per_entry(key, &entry.value))
+                .sum();
+            wacore::stats::CollectionStats::new(
+                cache.inner.len() as u64,
+                (bytes + cache.inner.structural_bytes()) as u64,
+            )
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn upsert(&self, key: &K, update: impl FnOnce(Option<&V>) -> Option<V>) {
+        self.with(|cache| {
+            if let Some(value) = update(cache.get(key).as_deref()) {
+                cache.insert(key.clone(), value);
+            }
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn get(&self, key: &K) -> Option<V> {
+        self.with(|cache| cache.get(key).cloned())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert(&self, key: K, value: V) {
+        self.upsert(&key, |_| Some(value));
+    }
+
+    pub(crate) fn run_pending_tasks(&self) {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let now = Instant::now();
+        let expired: Vec<_> = inner
+            .iter()
+            .filter(|(_, entry)| {
+                self.ttl
+                    .is_some_and(|ttl| now.saturating_duration_since(entry.inserted_at) >= ttl)
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in expired {
+            inner.remove_key(&key);
+        }
+        inner.shrink_if_empty();
+    }
+
+    pub(crate) fn entry_count(&self) -> u64 {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).len() as u64
+    }
+
+    /// Hash-table buckets currently allocated. Test-only: lets the
+    /// shrink-on-empty test observe the table itself, not just entry counts.
+    #[cfg(test)]
+    pub(crate) fn table_capacity(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .table
+            .capacity()
+    }
+}
+
+impl<K, V, S> CacheInner<K, V, S>
 where
     K: Hash + Eq + Clone,
+    S: BuildHasher,
 {
-    fn new() -> Self {
+    fn new(track_order: bool, hasher: S) -> Self {
         Self {
-            map: HashMap::new(),
+            hasher,
+            table: HashTable::new(),
             order: BTreeMap::new(),
+            track_order,
             next_seq: 0,
+            eviction_cursor: 0,
             capacity_evictions: 0,
             capacity_eviction_blocks: 0,
         }
     }
 
-    fn remove_key(&mut self, key: &K) -> Option<CacheEntry<V>> {
-        let entry = self.map.remove(key)?;
-        self.order.remove(&entry.seq);
-        Some(entry)
+    #[inline]
+    fn hash_of<Q: Hash + ?Sized>(&self, key: &Q) -> u64 {
+        self.hasher.hash_one(key)
     }
 
-    /// Evict entries until under `cap`. Outlined and never-inlined so the guarded
-    /// scan is compiled once per `<K, V>` (not duplicated into every `insert_new`
-    /// inline site), keeping the binary-size cost of the guard path small.
-    #[inline(never)]
+    #[inline]
+    fn len(&self) -> usize {
+        self.table.len()
+    }
+
+    fn get<Q>(&self, key: &Q) -> Option<&Slot<K, V>>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let hash = self.hash_of(key);
+        self.table.find(hash, |slot| slot.key.borrow() == key)
+    }
+
+    fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut Slot<K, V>>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let hash = self.hash_of(key);
+        self.table.find_mut(hash, |slot| slot.key.borrow() == key)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&K, &Slot<K, V>)> {
+        self.table.iter().map(|slot| (&slot.key, slot))
+    }
+
+    /// Bytes the table and the eviction order themselves hold, on top of the
+    /// entries: hashbrown's buckets (a slot plus a control byte each, at its
+    /// power-of-two capacity) and one B-tree node share per ordered entry.
+    fn structural_bytes(&self) -> usize {
+        // A `BTreeMap<u64, u64>` leaf holds up to 11 pairs and averages
+        // roughly two thirds full, so the per-entry share is a little over
+        // the pair itself; 8 bytes of overhead is the conservative round-up.
+        const ORDER_NODE_SHARE: usize = 2 * size_of::<u64>() + 8;
+        let order = if self.track_order {
+            self.order.len() * ORDER_NODE_SHARE
+        } else {
+            0
+        };
+        wacore::stats::hash_table_bytes(self.table.capacity(), size_of::<Slot<K, V>>()) + order
+    }
+
+    fn clear(&mut self) {
+        self.table.clear();
+        self.order.clear();
+    }
+
+    /// Release the slot table's buckets once it holds nothing.
+    ///
+    /// Called only from the synchronous TTL cache (the dispatch-once dedup
+    /// table): hashbrown never shrinks on remove, so a burst that grew the
+    /// table to thousands of buckets kept them with zero entries until the
+    /// next burst. The threshold is empty, not a low-water mark: any
+    /// non-empty table may regrow on the very next insert, paying a realloc
+    /// per dip, while an empty table serves no lookup and frees one
+    /// allocation with no entries to rehash.
+    fn shrink_if_empty(&mut self) {
+        if self.table.is_empty() {
+            self.table.shrink_to(0, |slot| slot.hash);
+        }
+    }
+
+    /// Borrowed removal: the `order` side is keyed by the entry's own `seq`,
+    /// so nothing here ever needs an owned `K`, and callers with a `&str` or
+    /// `&Jid` need not clone the key just to delete it.
+    fn remove_key<Q>(&mut self, key: &Q) -> Option<Slot<K, V>>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let hash = self.hash_of(key);
+        let (slot, _) = self
+            .table
+            .find_entry(hash, |slot| slot.key.borrow() == key)
+            .ok()?
+            .remove();
+        self.order.remove(&slot.seq);
+        Some(slot)
+    }
+
+    /// Remove the slot the FIFO side named by `(hash, seq)`.
+    fn remove_by_seq(&mut self, hash: u64, seq: u64) -> bool {
+        self.table
+            .find_entry(hash, |slot| slot.seq == seq)
+            .ok()
+            .map(|occupied| occupied.remove())
+            .is_some()
+    }
+
+    /// Evict until below `cap`: oldest first, except that an entry hit since
+    /// it was last considered gets a second chance (its bit is cleared and it
+    /// re-queues at the back), so what leaves is the least recently *used*
+    /// entry rather than the least recently inserted. With an `evict_guard`,
+    /// entries the guard reports as held are skipped so a later lookup cannot
+    /// mint a duplicate; if every entry is held, the cache runs over capacity
+    /// for a while rather than dropping a live one (see
+    /// [`PortableCacheBuilder::evict_guard`]).
     fn evict_to_capacity(&mut self, cap: u64, evict_guard: Option<fn(&V) -> bool>) {
-        while self.map.len() as u64 >= cap {
-            match evict_guard {
-                // Unguarded caches keep the single-pass pop_first() fast path.
-                None => match self.order.pop_first() {
-                    Some((_, oldest_key)) => {
-                        if self.map.remove(&oldest_key).is_some() {
-                            self.capacity_evictions = self.capacity_evictions.saturating_add(1);
-                        }
+        let mut remaining = if evict_guard.is_some() {
+            GUARDED_EVICTION_PROBES
+        } else {
+            usize::MAX
+        };
+        let mut cursor = if evict_guard.is_some() {
+            self.eviction_cursor
+        } else {
+            0
+        };
+        while self.table.len() as u64 >= cap && remaining != 0 {
+            let table = &mut self.table;
+            let mut probe = |op| match op {
+                ClockOp::Classify { seq, hash } => match table.find(hash, |slot| slot.seq == seq) {
+                    None => ClockVerdict::Skip,
+                    Some(slot)
+                        if evict_guard.is_some_and(|is_evictable| !is_evictable(&slot.value)) =>
+                    {
+                        ClockVerdict::Skip
                     }
-                    None => break,
+                    Some(slot)
+                        if slot
+                            .referenced
+                            .swap(false, std::sync::atomic::Ordering::Relaxed) =>
+                    {
+                        ClockVerdict::SecondChance
+                    }
+                    Some(_) => ClockVerdict::Victim,
                 },
-                // Guarded: skip entries a live task still holds so a later lookup
-                // can't mint a duplicate; if every entry is held, allow temporary
-                // over-capacity rather than dropping a live entry. Remove by seq so
-                // the key isn't cloned.
-                Some(is_evictable) => {
-                    let mut victim_seq = None;
-                    for (seq, k) in self.order.iter() {
-                        if self.map.get(k).is_some_and(|e| is_evictable(&e.value)) {
-                            victim_seq = Some(*seq);
-                            break;
+                ClockOp::Reseq { seq, hash, fresh } => {
+                    match table.find_mut(hash, |slot| slot.seq == seq) {
+                        Some(slot) => {
+                            slot.seq = fresh;
+                            ClockVerdict::Victim
                         }
-                    }
-                    match victim_seq {
-                        Some(seq) => {
-                            if let Some(oldest_key) = self.order.remove(&seq)
-                                && self.map.remove(&oldest_key).is_some()
-                            {
-                                self.capacity_evictions = self.capacity_evictions.saturating_add(1);
-                            }
-                        }
-                        None => {
-                            self.capacity_eviction_blocks =
-                                self.capacity_eviction_blocks.saturating_add(1);
-                            break;
-                        }
+                        None => ClockVerdict::Skip,
                     }
                 }
+            };
+            let walk = if evict_guard.is_some() {
+                guarded_clock_walk(
+                    &mut self.order,
+                    &mut self.next_seq,
+                    &mut cursor,
+                    &mut remaining,
+                    &mut probe,
+                )
+            } else {
+                clock_walk(&mut self.order, &mut self.next_seq, &mut probe)
+            };
+            match walk {
+                ClockWalk::Victim { seq, hash } => {
+                    self.order.remove(&seq);
+                    if self.remove_by_seq(hash, seq) {
+                        self.capacity_evictions = self.capacity_evictions.saturating_add(1);
+                    }
+                }
+                // Every candidate had a chance to spend; the next pass over
+                // the same entries finds them unreferenced.
+                ClockWalk::Requeued => continue,
+                ClockWalk::Blocked => break,
             }
         }
+        if self.table.len() as u64 >= cap {
+            self.capacity_eviction_blocks = self.capacity_eviction_blocks.saturating_add(1);
+        }
+        self.eviction_cursor = cursor;
     }
 
     /// Insert a brand-new entry (the caller has already confirmed the key is
     /// absent), evicting the oldest entries first if at capacity. Assigns and
     /// records the FIFO sequence.
+    ///
+    /// Stays out of line like [`PlainInner::insert_new`]: under fat LTO this
+    /// would otherwise inline into every managed insert path (`insert`,
+    /// `upsert_with_by_ref`, `insert_and_return`, plus the synchronous
+    /// [`SyncTtlGuard::insert`](SyncTtlGuard::insert)), stamping the eviction
+    /// prologue and the hashbrown growth call per caller instead of per table.
+    #[inline(never)]
     fn insert_new(
         &mut self,
         key: K,
@@ -166,16 +841,43 @@ where
 
         let seq = self.next_seq;
         self.next_seq += 1;
-        self.order.insert(seq, key.clone());
-        self.map.insert(
-            key,
-            CacheEntry {
+        let hash = self.hash_of(&key);
+        if self.track_order {
+            self.order.insert(seq, hash);
+        }
+        insert_slot(
+            &mut self.table,
+            hash,
+            Slot {
                 value,
                 inserted_at: now,
                 last_accessed_at: now,
                 seq,
+                referenced: portable_atomic::AtomicBool::new(false),
+                key,
+                hash,
             },
         );
+    }
+
+    /// Drop expired entries and the FIFO records that named them. Driven by
+    /// `order`, which every cache that expires by time maintains (see
+    /// `PortableCacheBuilder::build`), so the walk itself is [`expiry_walk`].
+    fn retain_unexpired(&mut self, mut is_expired: impl FnMut(&Slot<K, V>) -> bool) {
+        debug_assert!(
+            self.track_order,
+            "a cache that expires by time tracks order; the sweep walks it"
+        );
+        let table = &self.table;
+        let expired = expiry_walk(&self.order, &mut |seq, hash| {
+            table
+                .find(hash, |slot| slot.seq == seq)
+                .is_some_and(&mut is_expired)
+        });
+        for (seq, hash) in expired {
+            self.order.remove(&seq);
+            self.remove_by_seq(hash, seq);
+        }
     }
 }
 
@@ -272,19 +974,15 @@ impl Drop for InitLockCleanup<'_> {
 
 // -- Builder --
 
-pub struct PortableCacheBuilder<K, V> {
+pub struct PortableCacheBuilder<K, V, S = RandomState> {
     max_capacity: Option<u64>,
     ttl: Option<Duration>,
     tti: Option<Duration>,
     evict_guard: Option<fn(&V) -> bool>,
-    _marker: std::marker::PhantomData<fn(K, V)>,
+    _marker: std::marker::PhantomData<fn(K, V) -> S>,
 }
 
-impl<K, V> PortableCacheBuilder<K, V>
-where
-    K: Hash + Eq + Clone + Send + Sync + 'static,
-    V: Clone + Send + Sync + 'static,
-{
+impl<K, V> PortableCacheBuilder<K, V, RandomState> {
     fn new() -> Self {
         Self {
             max_capacity: None,
@@ -294,14 +992,51 @@ where
             _marker: std::marker::PhantomData,
         }
     }
+}
 
+impl<K, V, S> PortableCacheBuilder<K, V, S>
+where
+    K: Hash + Eq + Clone + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher,
+{
     /// Protect entries a live task still holds from capacity eviction: `guard`
     /// returns `true` when a value is safe to evict. For an `Arc<Mutex>` lock cache,
     /// pass `|v| Arc::strong_count(v) <= 1`, so an entry held elsewhere is never
     /// FIFO-evicted and re-minted (which would let two writers race the resource).
+    ///
+    /// Capacity is soft for these entries: insertion scans a bounded number of
+    /// candidates, resuming on the next insertion. After holders release their
+    /// entries, subsequent inserts reclaim the overflow incrementally.
     pub fn evict_guard(mut self, guard: fn(&V) -> bool) -> Self {
         self.evict_guard = Some(guard);
         self
+    }
+
+    /// Fix the slot table's hash seed instead of drawing a per-process one.
+    ///
+    /// Whether an evict-then-insert cycle spends or restores the table's
+    /// growth budget — and so whether a mid-run table growth fires inside a
+    /// measurement — follows the bucket layout, which follows this seed.
+    /// Benchmarks pin it so every process measures the same layout.
+    /// Everything else keeps the default: a process-wide fixed seed would
+    /// re-open HashDoS.
+    ///
+    /// Returns a [`SeededCacheBuilder`]: unlike [`PortableCacheBuilder::build`],
+    /// building it needs no `Default` from the hasher, so an explicitly
+    /// supplied hasher without one still builds.
+    pub fn hash_builder<H>(self, hash_builder: H) -> SeededCacheBuilder<K, V, H>
+    where
+        H: BuildHasher,
+    {
+        SeededCacheBuilder {
+            max_capacity: self.max_capacity,
+            ttl: self.ttl,
+            tti: self.tti,
+            evict_guard: self.evict_guard,
+            hash_builder,
+            _marker: std::marker::PhantomData,
+        }
     }
 
     pub fn max_capacity(mut self, cap: u64) -> Self {
@@ -326,39 +1061,153 @@ where
     /// # Panics
     ///
     /// If an [`evict_guard`](Self::evict_guard) is combined with a TTL or TTI.
-    pub fn build(self) -> PortableCache<K, V> {
-        // An evict_guard marks a cache of live coordination objects. Expiry
-        // does not consult the guard, so a timeout would drop an entry a task
-        // still holds and let the next lookup mint a duplicate of it.
-        assert!(
-            self.evict_guard.is_none() || (self.ttl.is_none() && self.tti.is_none()),
-            "a cache with an evict_guard holds live coordination objects and must not expire by time"
-        );
+    pub fn build(self) -> PortableCache<K, V, S>
+    where
+        S: Default,
+    {
+        // A builder that never pinned a seed hashes like every other
+        // cache: `RandomState::default()` draws per-process.
+        assemble(
+            self.max_capacity,
+            self.ttl,
+            self.tti,
+            self.evict_guard,
+            S::default(),
+        )
+    }
+}
 
-        PortableCache {
-            inner: Arc::new(RwLock::new(CacheInner::new())),
-            init_locks: Arc::new(InitLocks::new()),
-            max_capacity: self.max_capacity,
-            ttl: self.ttl,
-            tti: self.tti,
-            evict_guard: self.evict_guard,
-            #[cfg(test)]
-            tti_renewals: Arc::new(portable_atomic::AtomicU64::new(0)),
-        }
+/// A builder with an explicitly supplied hash seed (see
+/// [`PortableCacheBuilder::hash_builder`]). Building it needs nothing from
+/// the hasher beyond [`BuildHasher`], so a supplied hasher without `Default`
+/// builds exactly like one with it.
+pub struct SeededCacheBuilder<K, V, H> {
+    max_capacity: Option<u64>,
+    ttl: Option<Duration>,
+    tti: Option<Duration>,
+    evict_guard: Option<fn(&V) -> bool>,
+    hash_builder: H,
+    _marker: std::marker::PhantomData<fn(K, V)>,
+}
+
+impl<K, V, H> SeededCacheBuilder<K, V, H>
+where
+    K: Hash + Eq + Clone + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    H: BuildHasher,
+{
+    pub fn max_capacity(mut self, cap: u64) -> Self {
+        self.max_capacity = Some(cap);
+        self
+    }
+
+    pub fn time_to_live(mut self, ttl: Duration) -> Self {
+        self.ttl = Some(ttl);
+        self
+    }
+
+    pub fn time_to_idle(mut self, tti: Duration) -> Self {
+        self.tti = Some(tti);
+        self
+    }
+
+    pub fn evict_guard(mut self, guard: fn(&V) -> bool) -> Self {
+        self.evict_guard = Some(guard);
+        self
+    }
+
+    /// # Panics
+    ///
+    /// If an evict guard is combined with a TTL or TTI (same rule as
+    /// [`PortableCacheBuilder::build`]).
+    pub fn build(self) -> PortableCache<K, V, H> {
+        assemble(
+            self.max_capacity,
+            self.ttl,
+            self.tti,
+            self.evict_guard,
+            self.hash_builder,
+        )
+    }
+}
+
+/// Shared assembly for both builders: the evict-guard rule and the order
+/// tracking live once, so the two `build` paths cannot drift apart.
+fn assemble<K, V, S>(
+    max_capacity: Option<u64>,
+    ttl: Option<Duration>,
+    tti: Option<Duration>,
+    evict_guard: Option<fn(&V) -> bool>,
+    hash_builder: S,
+) -> PortableCache<K, V, S>
+where
+    K: Hash + Eq + Clone + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher,
+{
+    // An evict_guard marks a cache of live coordination objects. Expiry
+    // does not consult the guard, so a timeout would drop an entry a task
+    // still holds and let the next lookup mint a duplicate of it.
+    assert!(
+        evict_guard.is_none() || (ttl.is_none() && tti.is_none()),
+        "a cache with an evict_guard holds live coordination objects and must not expire by time"
+    );
+
+    // Order is what eviction pops and what the expiry sweep walks, so a
+    // cache with either a capacity bound or a time bound keeps it. A cache
+    // with neither (the default LID/PN maps) is never swept and skips the
+    // BTreeMap node per entry.
+    let track_order =
+        max_capacity.is_some_and(|cap| cap != u64::MAX) || ttl.is_some() || tti.is_some();
+    // Container-level choice: only a guard-free cache with no capacity bound
+    // (None or u64::MAX), no TTL/TTI, and no order to track drops its
+    // per-entry metadata. Every other configuration keeps the managed table.
+    let unbounded = (max_capacity.is_none() || max_capacity == Some(u64::MAX))
+        && ttl.is_none()
+        && tti.is_none();
+    let inner = if unbounded && evict_guard.is_none() {
+        Storage::Plain(PlainInner::new(hash_builder))
+    } else {
+        Storage::Managed(CacheInner::new(track_order, hash_builder))
+    };
+    PortableCache {
+        inner: Arc::new(RwLock::new(inner)),
+        init_locks: OnceLock::new(),
+        max_capacity,
+        ttl,
+        tti,
+        evict_guard,
+        #[cfg(test)]
+        tti_renewals: Arc::new(portable_atomic::AtomicU64::new(0)),
     }
 }
 
 // -- PortableCache impl --
 
-impl<K, V> PortableCache<K, V>
+impl<K, V, S> PortableCache<K, V, S> {
+    /// The single-flight registry, built on first use. Unbounded impl block so
+    /// [`Clone`] can force it too, keeping every clone on one registry.
+    fn init_locks(&self) -> &Arc<InitLocks> {
+        self.init_locks.get_or_init(|| Arc::new(InitLocks::new()))
+    }
+}
+
+impl<K, V> PortableCache<K, V, RandomState> {
+    /// Start a builder for a cache that draws its hash seed per process.
+    /// Unbounded impl block so existing `Cache::builder()` call sites keep
+    /// inferring the default hasher; pinning a seed is opt-in through
+    /// [`PortableCacheBuilder::hash_builder`].
+    pub fn builder() -> PortableCacheBuilder<K, V, RandomState> {
+        PortableCacheBuilder::new()
+    }
+}
+
+impl<K, V, S> PortableCache<K, V, S>
 where
     K: Hash + Eq + Clone + Send + Sync + 'static,
     V: Clone + Send + Sync + 'static,
+    S: BuildHasher,
 {
-    pub fn builder() -> PortableCacheBuilder<K, V> {
-        PortableCacheBuilder::new()
-    }
-
     /// Read the monotonic clock only for caches that can expire entries.
     /// Non-expiring caches use a stable sentinel because their timestamps are
     /// never observed, avoiding unnecessary clock reads on every operation.
@@ -371,7 +1220,7 @@ where
         }
     }
 
-    fn is_expired(&self, entry: &CacheEntry<V>, now: Instant) -> bool {
+    fn is_expired(&self, entry: &Slot<K, V>, now: Instant) -> bool {
         if let Some(ttl) = self.ttl
             && now.saturating_duration_since(entry.inserted_at) >= ttl
         {
@@ -385,18 +1234,10 @@ where
         false
     }
 
-    fn find_key<Q>(inner: &CacheInner<K, V>, key: &Q) -> Option<K>
-    where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
-    {
-        inner.map.get_key_value(key).map(|(k, _)| k.clone())
-    }
-
     /// Whether `entry`'s access stamp has aged past [`TTI_RENEWAL_DIVISOR`]'s
     /// tolerance and is worth pushing forward under the write lock. A cache
     /// without TTI never renews.
-    fn needs_tti_renewal(&self, entry: &CacheEntry<V>, now: Instant) -> bool {
+    fn needs_tti_renewal(&self, entry: &Slot<K, V>, now: Instant) -> bool {
         self.tti.is_some_and(|tti| {
             now.saturating_duration_since(entry.last_accessed_at) >= tti / TTI_RENEWAL_DIVISOR
         })
@@ -409,40 +1250,57 @@ where
     {
         let (value, renew_at) = {
             let guard = self.inner.read().await;
-            let entry = guard.map.get(key)?;
-            // Read the clock after the lookup: a miss has no timestamp to
-            // compare, and lookups that miss are a large share of the calls
-            // (every negative registry probe, every warm-up).
-            let now = self.entry_time();
-            if self.is_expired(entry, now) {
-                // Identity of the entry judged expired: `seq` moves if the slot
-                // was re-inserted, `inserted_at` if the value was rewritten in
-                // place. Removing without it could drop a replacement written
-                // while the guard was down and judge it by a stale `now`.
-                let observed = (entry.seq, entry.inserted_at);
-                let owned_key = Self::find_key(&guard, key)?;
-                drop(guard);
-                let mut wguard = self.inner.write().await;
-                if let Some(e) = wguard.map.get(key)
-                    && (e.seq, e.inserted_at) == observed
-                    && self.is_expired(e, now)
-                {
-                    wguard.remove_key(&owned_key);
+            match &*guard {
+                Storage::Plain(inner) => {
+                    return inner.get(key).cloned();
                 }
-                return None;
+                Storage::Managed(inner) => {
+                    let entry = inner.get(key)?;
+                    // Read the clock after the lookup: a miss has no timestamp to
+                    // compare, and lookups that miss are a large share of the calls
+                    // (every negative registry probe, every warm-up).
+                    let now = self.entry_time();
+                    if self.is_expired(entry, now) {
+                        // Identity of the entry judged expired: `seq` moves if the slot
+                        // was re-inserted, `inserted_at` if the value was rewritten in
+                        // place. Removing without it could drop a replacement written
+                        // while the guard was down and judge it by a stale `now`.
+                        let observed = (entry.seq, entry.inserted_at);
+                        drop(guard);
+                        let mut wguard = self.inner.write().await;
+                        let Storage::Managed(managed) = &mut *wguard else {
+                            return None;
+                        };
+                        if let Some(e) = managed.get(key)
+                            && (e.seq, e.inserted_at) == observed
+                            && self.is_expired(e, now)
+                        {
+                            managed.remove_key(key);
+                        }
+                        return None;
+                    }
+                    if inner.track_order {
+                        entry
+                            .referenced
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    (
+                        entry.value.clone(),
+                        self.needs_tti_renewal(entry, now).then_some(now),
+                    )
+                }
             }
-            (
-                entry.value.clone(),
-                self.needs_tti_renewal(entry, now).then_some(now),
-            )
         };
 
         if let Some(now) = renew_at {
             let mut guard = self.inner.write().await;
+            let Storage::Managed(managed) = &mut *guard else {
+                return Some(value);
+            };
             // Re-decide under the lock: the key may have been invalidated (the
             // miss leaves it that way) or already refreshed by a racing renewal
             // or insert, whose newer stamp this lookup must leave alone.
-            if let Some(entry) = guard.map.get_mut(key)
+            if let Some(entry) = managed.get_mut(key)
                 && self.needs_tti_renewal(entry, now)
             {
                 entry.last_accessed_at = now;
@@ -456,21 +1314,25 @@ where
     }
 
     pub async fn insert(&self, key: K, value: V) {
-        let now = self.entry_time();
-        let mut guard = self.inner.write().await;
-
-        if let Some(entry) = guard.map.get_mut(&key) {
-            entry.value = value;
-            entry.inserted_at = now;
-            entry.last_accessed_at = now;
-            return;
-        }
-
         if self.max_capacity == Some(0) {
             return;
         }
-
-        guard.insert_new(key, value, now, self.max_capacity, self.evict_guard);
+        let now = self.entry_time();
+        let mut guard = self.inner.write().await;
+        match &mut *guard {
+            Storage::Plain(inner) => {
+                inner.insert_or_replace(key, value);
+            }
+            Storage::Managed(inner) => {
+                if let Some(entry) = inner.get_mut(&key) {
+                    entry.value = value;
+                    entry.inserted_at = now;
+                    entry.last_accessed_at = now;
+                    return;
+                }
+                inner.insert_new(key, value, now, self.max_capacity, self.evict_guard);
+            }
+        }
     }
 
     /// Atomically derive and optionally store a value from the current entry.
@@ -490,58 +1352,78 @@ where
     {
         let now = self.entry_time();
         let mut guard = self.inner.write().await;
+        match &mut *guard {
+            Storage::Plain(inner) => {
+                let (next, result) = update(inner.get(key));
+                let Some(next) = next else {
+                    return result;
+                };
+                if let Some(slot) = inner.get_mut(key) {
+                    *slot = next;
+                } else if self.max_capacity != Some(0) {
+                    inner.insert_new(key.to_owned(), next);
+                }
+                result
+            }
+            Storage::Managed(inner) => {
+                if inner
+                    .get(key)
+                    .is_some_and(|entry| self.is_expired(entry, now))
+                {
+                    inner.remove_key(key);
+                }
 
-        if guard
-            .map
-            .get(key)
-            .is_some_and(|entry| self.is_expired(entry, now))
-            && let Some(owned_key) = Self::find_key(&guard, key)
-        {
-            guard.remove_key(&owned_key);
+                let (next, result) = update(inner.get(key).map(|entry| &entry.value));
+                let Some(next) = next else {
+                    return result;
+                };
+
+                if let Some(entry) = inner.get_mut(key) {
+                    entry.value = next;
+                    entry.inserted_at = now;
+                    entry.last_accessed_at = now;
+                } else if self.max_capacity != Some(0) {
+                    inner.insert_new(
+                        key.to_owned(),
+                        next,
+                        now,
+                        self.max_capacity,
+                        self.evict_guard,
+                    );
+                }
+
+                result
+            }
         }
-
-        let (next, result) = update(guard.map.get(key).map(|entry| &entry.value));
-        let Some(next) = next else {
-            return result;
-        };
-
-        if let Some(entry) = guard.map.get_mut(key) {
-            entry.value = next;
-            entry.inserted_at = now;
-            entry.last_accessed_at = now;
-        } else if self.max_capacity != Some(0) {
-            guard.insert_new(
-                key.to_owned(),
-                next,
-                now,
-                self.max_capacity,
-                self.evict_guard,
-            );
-        }
-
-        result
     }
 
     /// Insert and return a clone of the value in one write lock.
     async fn insert_and_return(&self, key: K, value: V) -> V {
-        let now = self.entry_time();
-        let mut guard = self.inner.write().await;
-
-        if let Some(entry) = guard.map.get_mut(&key) {
-            let ret = value.clone();
-            entry.value = value;
-            entry.inserted_at = now;
-            entry.last_accessed_at = now;
-            return ret;
-        }
-
         if self.max_capacity == Some(0) {
             return value;
         }
+        let now = self.entry_time();
+        let mut guard = self.inner.write().await;
+        match &mut *guard {
+            Storage::Plain(inner) => {
+                let ret = value.clone();
+                inner.insert_or_replace(key, value);
+                ret
+            }
+            Storage::Managed(inner) => {
+                if let Some(entry) = inner.get_mut(&key) {
+                    let ret = value.clone();
+                    entry.value = value;
+                    entry.inserted_at = now;
+                    entry.last_accessed_at = now;
+                    return ret;
+                }
 
-        let ret = value.clone();
-        guard.insert_new(key, value, now, self.max_capacity, self.evict_guard);
-        ret
+                let ret = value.clone();
+                inner.insert_new(key, value, now, self.max_capacity, self.evict_guard);
+                ret
+            }
+        }
     }
 
     pub async fn remove<Q>(&self, key: &Q) -> Option<V>
@@ -550,14 +1432,18 @@ where
         Q: Hash + Eq + ?Sized,
     {
         let mut guard = self.inner.write().await;
-        let owned_key = Self::find_key(&guard, key)?;
-        let entry = guard.remove_key(&owned_key)?;
-        // Nothing to date until an entry is actually in hand.
-        let now = self.entry_time();
-        if self.is_expired(&entry, now) {
-            None
-        } else {
-            Some(entry.value)
+        match &mut *guard {
+            Storage::Plain(inner) => inner.remove_key(key),
+            Storage::Managed(inner) => {
+                let entry = inner.remove_key(key)?;
+                // Nothing to date until an entry is actually in hand.
+                let now = self.entry_time();
+                if self.is_expired(&entry, now) {
+                    None
+                } else {
+                    Some(entry.value)
+                }
+            }
         }
     }
 
@@ -567,8 +1453,13 @@ where
         Q: Hash + Eq + ?Sized,
     {
         let mut guard = self.inner.write().await;
-        if let Some(owned_key) = Self::find_key(&guard, key) {
-            guard.remove_key(&owned_key);
+        match &mut *guard {
+            Storage::Plain(inner) => {
+                inner.remove_key(key);
+            }
+            Storage::Managed(inner) => {
+                inner.remove_key(key);
+            }
         }
     }
 
@@ -578,8 +1469,7 @@ where
     /// contention.
     pub async fn clear(&self) {
         let mut guard = self.inner.write().await;
-        guard.map.clear();
-        guard.order.clear();
+        guard.clear();
     }
 
     /// Sync invalidate. Spins briefly if the lock is held; kept for moka API
@@ -588,8 +1478,7 @@ where
     pub fn invalidate_all(&self) {
         for _ in 0..64 {
             if let Some(mut guard) = self.inner.try_write() {
-                guard.map.clear();
-                guard.order.clear();
+                guard.clear();
                 return;
             }
             std::hint::spin_loop();
@@ -604,19 +1493,33 @@ where
         self.max_capacity
     }
 
+    /// Best-effort entry count: a `try_read` that answers `0` while a writer
+    /// holds the lock. Fine on a hot path that only needs a hint; a report
+    /// wants [`entry_count_async`](Self::entry_count_async), which cannot
+    /// under-read a cache that is being written to.
     pub fn entry_count(&self) -> u64 {
-        self.inner
-            .try_read()
-            .map(|g| g.map.len() as u64)
-            .unwrap_or(0)
+        self.inner.try_read().map(|g| g.len() as u64).unwrap_or(0)
+    }
+
+    /// Entry count under an awaited read guard. Includes expired entries not
+    /// yet swept, like [`entry_count`](Self::entry_count).
+    pub async fn entry_count_async(&self) -> u64 {
+        self.inner.read().await.len() as u64
     }
 
     pub(crate) async fn capacity_stats(&self) -> CapacityStats {
         let guard = self.inner.read().await;
-        CapacityStats {
-            entries: guard.map.len() as u64,
-            evictions: guard.capacity_evictions,
-            eviction_blocks: guard.capacity_eviction_blocks,
+        match &*guard {
+            Storage::Plain(inner) => CapacityStats {
+                entries: inner.len() as u64,
+                evictions: 0,
+                eviction_blocks: 0,
+            },
+            Storage::Managed(inner) => CapacityStats {
+                entries: inner.len() as u64,
+                evictions: inner.capacity_evictions,
+                eviction_blocks: inner.capacity_eviction_blocks,
+            },
         }
     }
 
@@ -635,22 +1538,47 @@ where
     /// degrade to an empty walk under write contention.
     pub async fn fold_entries<A>(&self, init: A, mut f: impl FnMut(A, &K, &V) -> A) -> A {
         let guard = self.inner.read().await;
-        guard
-            .map
-            .iter()
-            .fold(init, |acc, (k, e)| f(acc, k, &e.value))
+        match &*guard {
+            Storage::Plain(inner) => inner.iter().fold(init, |acc, (k, v)| f(acc, k, v)),
+            Storage::Managed(inner) => inner.iter().fold(init, |acc, (k, e)| f(acc, k, &e.value)),
+        }
     }
 
-    /// Entry count plus estimated retained bytes, summing `per_entry` under a
-    /// single awaited read guard so the pair is mutually consistent (and never
-    /// the empty best-effort snapshot [`iter`](Self::iter) can degrade to).
+    /// Entry count plus the bytes of the table and eviction order alone, for
+    /// a cache whose payload is already charged elsewhere. No per-entry walk,
+    /// so nothing is instantiated per `<K, V>` beyond the size arithmetic.
+    pub async fn structural_stats(&self) -> wacore::stats::CollectionStats {
+        let guard = self.inner.read().await;
+        wacore::stats::CollectionStats::new(guard.len() as u64, guard.structural_bytes() as u64)
+    }
+
+    /// Entry count plus estimated retained bytes: the table and eviction
+    /// order the cache itself holds, plus `per_entry` summed over the entries,
+    /// under a single awaited read guard so the pair is mutually consistent
+    /// (and never the empty best-effort snapshot [`iter`](Self::iter) can
+    /// degrade to). Callers charge only what their entries point at; the
+    /// slots and order nodes are charged here, once, for every cache.
     pub async fn memory_stats(
         &self,
         mut per_entry: impl FnMut(&K, &V) -> usize,
     ) -> wacore::stats::CollectionStats {
         let guard = self.inner.read().await;
-        let bytes: usize = guard.map.iter().map(|(k, e)| per_entry(k, &e.value)).sum();
-        wacore::stats::CollectionStats::new(guard.map.len() as u64, bytes as u64)
+        match &*guard {
+            Storage::Plain(inner) => {
+                let bytes: usize = inner.iter().map(|(k, v)| per_entry(k, v)).sum();
+                wacore::stats::CollectionStats::new(
+                    inner.len() as u64,
+                    (bytes + inner.structural_bytes()) as u64,
+                )
+            }
+            Storage::Managed(inner) => {
+                let bytes: usize = inner.iter().map(|(k, e)| per_entry(k, &e.value)).sum();
+                wacore::stats::CollectionStats::new(
+                    inner.len() as u64,
+                    (bytes + inner.structural_bytes()) as u64,
+                )
+            }
+        }
     }
 
     /// Eager snapshot iterator over `(Arc<K>, V)`: snapshot, not lazy. Includes
@@ -673,12 +1601,24 @@ where
         Vec::new().into_iter()
     }
 
-    fn snapshot(guard: &CacheInner<K, V>) -> Vec<(Arc<K>, V)> {
-        guard
-            .map
-            .iter()
-            .map(|(k, e)| (Arc::new(k.clone()), e.value.clone()))
-            .collect()
+    fn snapshot(guard: &Storage<K, V, S>) -> Vec<(Arc<K>, V)> {
+        match guard {
+            Storage::Plain(inner) => inner
+                .iter()
+                .map(|(k, v)| (Arc::new(k.clone()), v.clone()))
+                .collect(),
+            Storage::Managed(inner) => inner
+                .iter()
+                .map(|(k, e)| (Arc::new(k.clone()), e.value.clone()))
+                .collect(),
+        }
+    }
+
+    #[cfg(test)]
+    fn is_plain(&self) -> bool {
+        self.inner
+            .try_read()
+            .is_some_and(|guard| matches!(&*guard, Storage::Plain(_)))
     }
 
     /// Get or insert (single-flight). Takes key by value.
@@ -721,13 +1661,14 @@ where
     /// per-key lock, with a double-checked `get` so a collided or racing key
     /// still resolves to the first inserted value.
     async fn get_with_slow(&self, key: K, init: BoxFuture<'_, V>) -> V {
-        let hash = self.init_locks.hash_of(&key);
+        let registry = self.init_locks();
+        let hash = registry.hash_of(&key);
         // The cleanup guard holds the sole long-lived Arc so its Drop sees an
         // exact strong count if this future is cancelled at any await below.
         let mut cleanup = InitLockCleanup {
-            registry: &self.init_locks,
+            registry,
             hash,
-            lock: Some(self.init_locks.acquire(hash).await),
+            lock: Some(registry.acquire(hash).await),
         };
 
         let value = {
@@ -748,7 +1689,7 @@ where
 
         let init_mutex = cleanup.disarm();
         drop(cleanup);
-        self.init_locks.reclaim(hash, &init_mutex).await;
+        registry.reclaim(hash, &init_mutex).await;
         value
     }
 
@@ -758,30 +1699,85 @@ where
         self.tti_renewals.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    #[cfg(test)]
+    async fn debug_seq<Q>(&self, key: &Q) -> Option<u64>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let guard = self.inner.read().await;
+        let Storage::Managed(inner) = &*guard else {
+            return None;
+        };
+        inner.get(key).map(|e| e.seq)
+    }
+
+    #[cfg(test)]
+    async fn debug_stamps<Q>(&self, key: &Q) -> Option<(Instant, Instant)>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let guard = self.inner.read().await;
+        let Storage::Managed(inner) = &*guard else {
+            return None;
+        };
+        inner.get(key).map(|e| (e.inserted_at, e.last_accessed_at))
+    }
+
+    #[cfg(test)]
+    async fn debug_order_len(&self) -> usize {
+        let guard = self.inner.read().await;
+        match &*guard {
+            Storage::Plain(_) => 0,
+            Storage::Managed(inner) => inner.order.len(),
+        }
+    }
+
     /// Evict expired entries and clean up unused init locks.
+    /// Test-only read that leaves the second-chance bit alone, so a test can
+    /// observe eviction order without feeding it.
+    #[cfg(test)]
+    async fn get_no_touch<Q>(&self, key: &Q) -> Option<V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let guard = self.inner.read().await;
+        match &*guard {
+            Storage::Plain(inner) => inner.get(key).cloned(),
+            Storage::Managed(inner) => inner.get(key).map(|e| e.value.clone()),
+        }
+    }
+
     pub async fn run_pending_tasks(&self) {
-        let now = self.entry_time();
-        let mut guard = self.inner.write().await;
+        // Nothing can be expired without a TTL or TTI, so a cache configured
+        // with neither (the coordination caches, the default LID/PN maps)
+        // skips the write lock and the table walk; only the init-lock sweep
+        // below applies to it.
+        if self.ttl.is_some() || self.tti.is_some() {
+            let now = self.entry_time();
+            let mut guard = self.inner.write().await;
+            let Storage::Managed(managed) = &mut *guard else {
+                return;
+            };
+            managed.retain_unexpired(|entry| self.is_expired(entry, now));
+        }
 
-        guard.map.retain(|_, entry| !self.is_expired(entry, now));
-
-        // Drop order entries whose keys were just expired out of the map.
-        // Borrow fields separately to satisfy the borrow checker.
-        let CacheInner { map, order, .. } = &mut *guard;
-        order.retain(|_, k| map.contains_key(k));
-
-        drop(guard);
-
-        // Clean up init locks not actively held.
-        self.init_locks.retain_active().await;
+        // Clean up init locks not actively held. `get()`, not `init_locks()`: a
+        // cache that never single-flighted has no registry to sweep, and building
+        // one here would undo the lazy construction.
+        if let Some(registry) = self.init_locks.get() {
+            registry.retain_active().await;
+        }
     }
 }
 
-impl<K, V> Clone for PortableCache<K, V> {
+impl<K, V, S> Clone for PortableCache<K, V, S> {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
-            init_locks: Arc::clone(&self.init_locks),
+            init_locks: OnceLock::from(Arc::clone(self.init_locks())),
             max_capacity: self.max_capacity,
             ttl: self.ttl,
             tti: self.tti,
@@ -796,6 +1792,161 @@ impl<K, V> Clone for PortableCache<K, V> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[test]
+    fn sync_ttl_admission_is_atomic_and_bounded() {
+        let cache = Arc::new(SyncTtlCache::new(2, None));
+        let admitted = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    cache.upsert(&1, |entry| {
+                        if entry.is_none() {
+                            admitted.fetch_add(1, Ordering::Relaxed);
+                            Some(1)
+                        } else {
+                            None
+                        }
+                    })
+                });
+            }
+        });
+        assert_eq!(admitted.load(Ordering::Relaxed), 1);
+        for key in 2..10 {
+            cache.insert(key, key);
+            assert_eq!(cache.entry_count(), 2);
+            assert_eq!(cache.get(&key), Some(key));
+        }
+    }
+
+    #[test]
+    fn sync_ttl_expiry_and_disabled_capacity() {
+        let expired = SyncTtlCache::new(2, Some(Duration::ZERO));
+        expired.insert(1, 1);
+        assert_eq!(expired.get(&1), None);
+        expired.insert(2, 2);
+        expired.run_pending_tasks();
+        assert_eq!(expired.entry_count(), 0);
+
+        let disabled = SyncTtlCache::new(0, None);
+        disabled.insert(1, 1);
+        assert_eq!(disabled.get(&1), None);
+        assert_eq!(disabled.entry_count(), 0);
+    }
+
+    #[test]
+    fn empty_dedup_table_releases_its_buckets_and_serves_the_next_burst() {
+        const BURST: u32 = 4_000;
+        let cache = SyncTtlCache::new(u64::from(BURST) * 4, None);
+        let cold_start = Instant::now();
+        for key in 0..BURST {
+            cache.insert(key, key);
+        }
+        let cold_fill = cold_start.elapsed();
+        let grown = cache.table_capacity();
+        assert!(
+            grown >= 4096,
+            "churn must grow the table to production size, got {grown} buckets"
+        );
+        let grown_bytes = cache.memory_stats(|_, _| 0).bytes;
+
+        for key in 0..BURST {
+            cache.with(|guard| guard.remove(&key));
+        }
+        assert_eq!(cache.entry_count(), 0);
+        let shrunk = cache.table_capacity();
+        assert!(
+            shrunk < grown,
+            "empty table must release its buckets: {grown} -> {shrunk}"
+        );
+        assert_eq!(
+            shrunk, 0,
+            "empty table must release all buckets: {grown} -> {shrunk}"
+        );
+        let shrunk_bytes = cache.memory_stats(|_, _| 0).bytes;
+        assert_eq!(
+            shrunk_bytes, 0,
+            "empty table must retain no structural bytes"
+        );
+        eprintln!(
+            "dedup shrink: {grown} -> {shrunk} buckets, {grown_bytes} -> {shrunk_bytes} structural bytes (cold fill took {cold_fill:?})"
+        );
+
+        let start = Instant::now();
+        for key in 0..BURST {
+            cache.insert(key, key);
+        }
+        let regrow_fill = start.elapsed();
+        for key in 0..BURST {
+            assert_eq!(cache.get(&key), Some(key));
+        }
+        eprintln!(
+            "dedup regrow: {BURST} inserts in {regrow_fill:?} (cold fill took {cold_fill:?})"
+        );
+        assert_eq!(cache.entry_count(), u64::from(BURST));
+    }
+
+    #[tokio::test]
+    async fn pinned_eviction_has_bounded_probe_work() {
+        for count in [64usize, 128, 256, 4096] {
+            let probes = Arc::new(AtomicUsize::new(0));
+            let cache = PortableCache::builder()
+                .max_capacity(2)
+                .evict_guard(|value: &Arc<AtomicUsize>| {
+                    value.fetch_add(1, Ordering::Relaxed);
+                    Arc::strong_count(value) <= 1
+                })
+                .build();
+            for key in 0..count {
+                cache.insert(key, Arc::clone(&probes)).await;
+            }
+            let visits = probes.load(Ordering::Relaxed);
+            assert_eq!(cache.entry_count(), count as u64);
+            assert!(visits <= count * 64, "unbounded scan work: {visits}");
+            eprintln!("audit: {count} pinned entries, {visits} eviction probes");
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_eviction_eventually_reclaims_released_locks() {
+        let cache = PortableCache::builder()
+            .max_capacity(2)
+            .evict_guard(|value: &Arc<()>| Arc::strong_count(value) <= 1)
+            .build();
+        let mut held = Vec::new();
+        for key in 0..256usize {
+            let value = Arc::new(());
+            held.push(value.clone());
+            cache.insert(key, value).await;
+        }
+        for (key, value) in held.iter().enumerate() {
+            assert!(Arc::ptr_eq(&cache.get(&key).await.unwrap(), value));
+        }
+        drop(held);
+        for key in 256..288 {
+            cache.insert(key, Arc::new(())).await;
+        }
+        assert_eq!(cache.entry_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn bounded_second_chances_report_and_reclaim_deferred_capacity() {
+        let cache = PortableCache::builder()
+            .max_capacity(128)
+            .evict_guard(|_: &()| true)
+            .build();
+        for key in 0..128usize {
+            cache.insert(key, ()).await;
+            cache.get(&key).await.unwrap();
+        }
+        cache.insert(128, ()).await;
+        assert_eq!(cache.entry_count(), 129);
+        assert_eq!(cache.capacity_stats().await.eviction_blocks, 1);
+        for key in 129..133 {
+            cache.insert(key, ()).await;
+        }
+        assert_eq!(cache.entry_count(), 128);
+    }
 
     fn build_cache<K, V>() -> PortableCache<K, V>
     where
@@ -823,10 +1974,12 @@ mod tests {
         cache.insert("key".into(), "value".into()).await;
         assert_eq!(cache.get("key").await.as_deref(), Some("value"));
 
-        let guard = cache.inner.read().await;
-        let entry = guard.map.get("key").expect("inserted cache entry");
-        assert_eq!(entry.inserted_at, Instant::ZERO);
-        assert_eq!(entry.last_accessed_at, Instant::ZERO);
+        let stamps = cache
+            .debug_stamps("key")
+            .await
+            .expect("inserted cache entry");
+        assert_eq!(stamps.0, Instant::ZERO);
+        assert_eq!(stamps.1, Instant::ZERO);
     }
 
     #[tokio::test]
@@ -893,6 +2046,59 @@ mod tests {
                 eviction_blocks: 0,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn fixed_hash_seed_cache_evicts_like_default() {
+        type DetState = std::hash::BuildHasherDefault<std::hash::DefaultHasher>;
+        let cache: PortableCache<String, u32, DetState> = PortableCache::builder()
+            .max_capacity(2)
+            .hash_builder(DetState::default())
+            .build();
+
+        cache.insert("a".into(), 1).await;
+        cache.insert("b".into(), 2).await;
+        cache.insert("c".into(), 3).await;
+        assert_eq!(cache.entry_count(), 2);
+        assert!(cache.get("a").await.is_none());
+        assert_eq!(cache.get("c").await, Some(3));
+    }
+
+    /// A supplied hasher without `Default` still builds: only the
+    /// unseeded path draws a fresh seed, never the explicit one.
+    #[tokio::test]
+    async fn supplied_hasher_without_default_builds() {
+        use std::hash::{BuildHasher, Hasher};
+
+        #[derive(Clone, Copy)]
+        struct FixedSeed(u64);
+        struct FixedHasher(u64);
+        impl Hasher for FixedHasher {
+            fn write(&mut self, bytes: &[u8]) {
+                for b in bytes {
+                    self.0 = self.0.wrapping_mul(0x100000001b3).wrapping_add(*b as u64);
+                }
+            }
+            fn finish(&self) -> u64 {
+                self.0
+            }
+        }
+        impl BuildHasher for FixedSeed {
+            type Hasher = FixedHasher;
+            fn build_hasher(&self) -> FixedHasher {
+                FixedHasher(self.0)
+            }
+        }
+
+        let cache: PortableCache<String, u32, FixedSeed> = PortableCache::builder()
+            .max_capacity(2)
+            .hash_builder(FixedSeed(0x9E3779B97F4A7C15))
+            .build();
+
+        cache.insert("a".into(), 1).await;
+        cache.insert("b".into(), 2).await;
+        cache.insert("c".into(), 3).await;
+        assert_eq!(cache.entry_count(), 2);
     }
 
     #[tokio::test]
@@ -987,6 +2193,73 @@ mod tests {
         );
     }
 
+    /// A bounded cache is least-recently-used, not first-in-first-out: an
+    /// entry that keeps being read outlives everything inserted after it,
+    /// while an entry never read again is evicted in insertion order.
+    #[tokio::test]
+    async fn a_read_entry_outlives_entries_inserted_after_it() {
+        let cache: PortableCache<String, u32> = PortableCache::builder().max_capacity(8).build();
+        cache.insert("hot".to_string(), 1).await;
+        cache.insert("cold".to_string(), 2).await;
+        for i in 0..64u32 {
+            cache.insert(format!("filler-{i}"), i).await;
+            assert_eq!(
+                cache.get("hot").await,
+                Some(1),
+                "hot entry evicted after {i} inserts"
+            );
+        }
+        assert_eq!(
+            cache.get("cold").await,
+            None,
+            "an unread entry must age out"
+        );
+        assert_eq!(cache.entry_count(), 8);
+    }
+
+    /// A hit never takes the write lock or moves the entry: the second
+    /// chance is spent by the eviction that reaches it, which re-queues it
+    /// once and drops it the next time round if nothing read it again.
+    #[tokio::test]
+    async fn a_hit_is_spent_by_one_eviction_pass() {
+        let cache: PortableCache<String, u32> = PortableCache::builder().max_capacity(4).build();
+        cache.insert("a".to_string(), 1).await;
+        let seq_before = cache.debug_seq("a").await;
+        cache.get("a").await;
+        assert_eq!(
+            cache.debug_seq("a").await,
+            seq_before,
+            "a hit must not reorder under the read lock"
+        );
+        // Filling past capacity reaches `a` first; the hit re-queues it
+        // behind the fillers instead of evicting it.
+        for i in 0..4u32 {
+            cache.insert(format!("b{i}"), i).await;
+        }
+        assert_eq!(cache.get_no_touch("a").await, Some(1));
+        assert!(cache.debug_seq("a").await > seq_before);
+        // Not read since: the next pass over it evicts.
+        for i in 4..8u32 {
+            cache.insert(format!("b{i}"), i).await;
+        }
+        assert_eq!(cache.get_no_touch("a").await, None);
+    }
+
+    /// When every entry has been hit since the last pass, the pass that spends
+    /// their chances must not end the eviction: the cache stays at capacity.
+    #[tokio::test]
+    async fn an_all_referenced_pass_still_evicts() {
+        let cache: PortableCache<String, u32> = PortableCache::builder().max_capacity(1).build();
+        cache.insert("a".to_string(), 1).await;
+        cache.get("a").await;
+        cache.insert("b".to_string(), 2).await;
+        let stats = cache.capacity_stats().await;
+        assert_eq!(stats.entries, 1);
+        assert_eq!(stats.eviction_blocks, 0);
+        assert_eq!(cache.get_no_touch("a").await, None);
+        assert_eq!(cache.get_no_touch("b").await, Some(2));
+    }
+
     #[tokio::test]
     async fn test_remove_then_eviction_preserves_fifo_order() {
         // A removed key must leave the FIFO `order` consistent: eviction must skip
@@ -1033,11 +2306,14 @@ mod tests {
             .build();
 
         let inserted = Instant::ZERO + Duration::from_secs(1_000);
-        let entry = CacheEntry {
+        let entry = Slot {
             value: 1,
             inserted_at: inserted,
             last_accessed_at: inserted,
             seq: 0,
+            referenced: portable_atomic::AtomicBool::new(false),
+            key: String::new(),
+            hash: 0,
         };
 
         assert!(!cache.is_expired(&entry, inserted + tti - Duration::from_nanos(1)));
@@ -1066,11 +2342,14 @@ mod tests {
             .build();
 
         let stamped = Instant::ZERO + Duration::from_secs(1_000);
-        let entry = CacheEntry {
+        let entry = Slot {
             value: 1,
             inserted_at: stamped,
             last_accessed_at: stamped,
             seq: 0,
+            referenced: portable_atomic::AtomicBool::new(false),
+            key: String::new(),
+            hash: 0,
         };
 
         assert!(!cache.needs_tti_renewal(&entry, stamped));
@@ -1106,11 +2385,14 @@ mod tests {
         // elapsed, so the recorded stamp lags it by (almost) a full window.
         let stamped = Instant::ZERO + Duration::from_secs(1_000);
         let real_access = stamped + tolerance - Duration::from_nanos(1);
-        let entry = CacheEntry {
+        let entry = Slot {
             value: 1,
             inserted_at: stamped,
             last_accessed_at: stamped,
             seq: 0,
+            referenced: portable_atomic::AtomicBool::new(false),
+            key: String::new(),
+            hash: 0,
         };
 
         // Never late: gone by `real_access + tti` at the very latest.
@@ -1137,14 +2419,7 @@ mod tests {
         cache.insert("k".into(), 1).await;
 
         let stamp = |cache: PortableCache<String, u32>| async move {
-            cache
-                .inner
-                .read()
-                .await
-                .map
-                .get("k")
-                .unwrap()
-                .last_accessed_at
+            cache.debug_stamps("k").await.expect("entry").1
         };
         let before = stamp(cache.clone()).await;
 
@@ -1174,14 +2449,7 @@ mod tests {
         cache.insert("k".into(), 1).await;
 
         let stamp = |cache: PortableCache<String, u32>| async move {
-            cache
-                .inner
-                .read()
-                .await
-                .map
-                .get("k")
-                .unwrap()
-                .last_accessed_at
+            cache.debug_stamps("k").await.expect("entry").1
         };
         let before = stamp(cache.clone()).await;
 
@@ -1209,9 +2477,8 @@ mod tests {
             .build();
 
         let identity = |cache: PortableCache<String, u32>| async move {
-            let guard = cache.inner.read().await;
-            let e = guard.map.get("k").unwrap();
-            (e.seq, e.inserted_at)
+            let stamps = cache.debug_stamps("k").await.expect("entry");
+            (cache.debug_seq("k").await.expect("entry"), stamps.0)
         };
 
         cache.insert("k".into(), 1).await;
@@ -1266,14 +2533,7 @@ mod tests {
         cache.insert("k".into(), 1).await;
 
         let stamp = |cache: PortableCache<String, u32>| async move {
-            cache
-                .inner
-                .read()
-                .await
-                .map
-                .get("k")
-                .unwrap()
-                .last_accessed_at
+            cache.debug_stamps("k").await.expect("entry").1
         };
         let before = stamp(cache.clone()).await;
         assert_eq!(cache.tti_renewals(), 0);
@@ -1486,6 +2746,151 @@ mod tests {
                 "a hit reads once, to decide expiry"
             );
         }
+    }
+
+    /// A key wrapper that counts its clones. The cache used to clone every
+    /// key into its FIFO index, a second heap allocation per entry for the
+    /// life of the entry; the FIFO side now addresses slots by `(hash, seq)`.
+    #[derive(Debug)]
+    struct CountingKey(String, Arc<AtomicUsize>);
+
+    impl PartialEq for CountingKey {
+        fn eq(&self, other: &Self) -> bool {
+            self.0 == other.0
+        }
+    }
+    impl Eq for CountingKey {}
+    impl Hash for CountingKey {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            self.0.hash(state);
+        }
+    }
+
+    impl Clone for CountingKey {
+        fn clone(&self) -> Self {
+            self.1.fetch_add(1, Ordering::Relaxed);
+            Self(self.0.clone(), Arc::clone(&self.1))
+        }
+    }
+
+    #[tokio::test]
+    async fn an_insert_stores_the_key_once_and_never_clones_it() {
+        let clones = Arc::new(AtomicUsize::new(0));
+        let cache: PortableCache<CountingKey, u32> =
+            PortableCache::builder().max_capacity(8).build();
+        for i in 0..16u32 {
+            cache
+                .insert(CountingKey(format!("k{i}"), Arc::clone(&clones)), i)
+                .await;
+        }
+        assert_eq!(
+            cache.entry_count(),
+            8,
+            "FIFO eviction still bounds the cache"
+        );
+        assert_eq!(
+            clones.load(Ordering::Relaxed),
+            0,
+            "insert, eviction and the FIFO index must not clone the key"
+        );
+        cache
+            .remove(&CountingKey("k12".into(), Arc::clone(&clones)))
+            .await;
+        cache
+            .invalidate(&CountingKey("k13".into(), Arc::clone(&clones)))
+            .await;
+        assert_eq!(clones.load(Ordering::Relaxed), 0);
+        assert_eq!(cache.entry_count(), 6);
+    }
+
+    #[tokio::test]
+    async fn an_unbounded_cache_keeps_no_fifo_index() {
+        let unbounded: PortableCache<String, u32> = PortableCache::builder().build();
+        let effectively_unbounded: PortableCache<String, u32> =
+            PortableCache::builder().max_capacity(u64::MAX).build();
+        let bounded: PortableCache<String, u32> = PortableCache::builder().max_capacity(8).build();
+        for cache in [&unbounded, &effectively_unbounded, &bounded] {
+            for i in 0..4u32 {
+                cache.insert(format!("k{i}"), i).await;
+            }
+            assert_eq!(cache.get("k2").await, Some(2));
+        }
+        assert!(unbounded.is_plain());
+        assert!(effectively_unbounded.is_plain());
+        assert!(!bounded.is_plain());
+        assert_eq!(unbounded.debug_order_len().await, 0);
+        assert_eq!(effectively_unbounded.debug_order_len().await, 0);
+        assert_eq!(bounded.debug_order_len().await, 4);
+        // Removal on the unbounded caches still works without the index.
+        assert_eq!(unbounded.remove("k1").await, Some(1));
+        assert_eq!(unbounded.entry_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn an_unbounded_cache_stores_plain_slots_without_metadata() {
+        let plain: PortableCache<String, u32> = PortableCache::builder().build();
+        let managed: PortableCache<String, u32> = PortableCache::builder().max_capacity(8).build();
+        assert!(plain.is_plain());
+        assert!(!managed.is_plain());
+        for i in 0..8u32 {
+            plain.insert(format!("k{i}"), i).await;
+            managed.insert(format!("k{i}"), i).await;
+        }
+        for i in 0..8u32 {
+            assert_eq!(plain.get(&format!("k{i}")).await, Some(i));
+        }
+        plain.insert("k0".to_string(), 100).await;
+        assert_eq!(plain.get("k0").await, Some(100));
+        assert_eq!(plain.entry_count(), 8);
+        assert_eq!(
+            plain.remove("k0").await,
+            Some(100),
+            "plain removal returns the value with no expiry to consult"
+        );
+        plain.invalidate("k1").await;
+        assert!(plain.get("k1").await.is_none());
+        plain.clear().await;
+        assert_eq!(plain.entry_count(), 0);
+        // Budget: key + hash + value with no metadata tail. Smaller still
+        // satisfies that; larger means metadata crept in. Rebaseline per
+        // [layout asserts](../agent_docs/layout_asserts.md).
+        assert!(
+            size_of::<PlainSlot<String, u32>>() <= 40,
+            "plain slot grew to {} B (budget 40)",
+            size_of::<PlainSlot<String, u32>>()
+        );
+        assert!(
+            size_of::<Slot<String, u32>>() > size_of::<PlainSlot<String, u32>>(),
+            "managed slot must cost more than the plain slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unbounded_cache_supports_upsert_and_singleflight() {
+        let cache: PortableCache<String, u32> = PortableCache::builder().build();
+        let first = cache
+            .upsert_with_by_ref("counter", |current| {
+                let next = current.copied().unwrap_or_default() + 1;
+                (Some(next), next)
+            })
+            .await;
+        assert_eq!(first, 1);
+        let second = cache
+            .upsert_with_by_ref("counter", |current| {
+                let next = current.copied().unwrap_or_default() + 1;
+                (Some(next), next)
+            })
+            .await;
+        assert_eq!(second, 2);
+        assert_eq!(cache.get("counter").await, Some(2));
+        let single = cache.get_with("fresh".to_string(), async { 7 }).await;
+        assert_eq!(single, 7);
+        assert_eq!(cache.get("fresh").await, Some(7));
+        cache.run_pending_tasks().await;
+        assert_eq!(cache.entry_count(), 2);
+        let stats = cache.capacity_stats().await;
+        assert_eq!(stats.evictions, 0);
+        assert_eq!(stats.eviction_blocks, 0);
     }
 
     #[tokio::test]
@@ -1736,7 +3141,7 @@ mod tests {
         let _ = cache.get_with("key1".to_string(), async { 1 }).await;
         let _ = cache.get_with_by_ref("key2", async { 2 }).await;
 
-        let locks = cache.init_locks.map.lock().await;
+        let locks = cache.init_locks().map.lock().await;
         assert!(
             locks.is_empty(),
             "init locks must be reclaimed after get_with"
@@ -1760,7 +3165,7 @@ mod tests {
         // Poll (bounded) until the in-flight init registers its lock.
         let mut registered = false;
         for _ in 0..400 {
-            if !cache.init_locks.map.lock().await.is_empty() {
+            if !cache.init_locks().map.lock().await.is_empty() {
                 registered = true;
                 break;
             }
@@ -1775,7 +3180,7 @@ mod tests {
         // any run_pending_tasks call.
         let mut reclaimed = false;
         for _ in 0..400 {
-            if cache.init_locks.map.lock().await.is_empty() {
+            if cache.init_locks().map.lock().await.is_empty() {
                 reclaimed = true;
                 break;
             }
@@ -1829,8 +3234,8 @@ mod tests {
             PortableCache::builder().max_capacity(16).build();
         let (a, b) = (CollidingKey("a"), CollidingKey("b"));
         assert_eq!(
-            cache.init_locks.hash_of(&a),
-            cache.init_locks.hash_of(&b),
+            cache.init_locks().hash_of(&a),
+            cache.init_locks().hash_of(&b),
             "test premise: both keys must share one init-lock slot"
         );
 
@@ -1870,5 +3275,45 @@ mod tests {
         assert_eq!((a, b), (1, 2));
         assert_eq!(cache.get("a").await, Some(1));
         assert_eq!(cache.get("b").await, Some(2));
+    }
+
+    /// The flattened slot packs the 4-byte contact-hash key into the entry
+    /// tail padding, so `Slot<u32, Arc<str>>` is one word smaller than the
+    /// nested `Slot { key, hash, entry }` it replaces. Wide keys already
+    /// align, so the dispatched slot keeps its size. Budgets, not contracts:
+    /// a smaller slot is never a failure. Rebaseline per
+    /// [layout asserts](../agent_docs/layout_asserts.md).
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn flattened_slot_reuses_entry_tail_padding() {
+        assert!(
+            size_of::<Slot<u32, Arc<str>>>() <= 56,
+            "flat slot grew to {} B (budget 56)",
+            size_of::<Slot<u32, Arc<str>>>()
+        );
+        assert!(
+            size_of::<Slot<wacore::types::message::SenderMessageId, ()>>() <= 128,
+            "wide slot grew to {} B (budget 128)",
+            size_of::<Slot<wacore::types::message::SenderMessageId, ()>>()
+        );
+    }
+
+    /// The dispatch gate inserts one slot per message the client delivers and
+    /// keeps it for the whole TTL, so this slot is what the `client_receive`
+    /// memory rows read: a burst reports the peak of the growth allocation
+    /// that doubles this table, which scales with the slot. The bound is the
+    /// slot of the `SenderMessageId -> ()` marker this gate replaced: keying
+    /// by a digest instead of the spelled-out identity took it from 208 bytes
+    /// to under that, and it must not drift back. Relational: the comparison
+    /// type carries the budget, so widths and repacks do not matter.
+    /// Rebaseline per [layout asserts](../agent_docs/layout_asserts.md).
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn dispatch_gate_slot_stays_below_the_spelled_out_identity() {
+        let slot = size_of::<Slot<crate::message::DispatchKey, crate::message::DispatchClaim>>();
+        assert!(
+            slot <= size_of::<Slot<wacore::types::message::SenderMessageId, ()>>(),
+            "a dispatch-gate slot grew to {slot} bytes; the gate keeps one per delivered message"
+        );
     }
 }

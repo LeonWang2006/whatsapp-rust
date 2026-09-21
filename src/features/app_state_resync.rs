@@ -314,6 +314,159 @@ mod tests {
         (client, transport)
     }
 
+    /// A bootstrap that is deferred mid-run must not leave a record behind.
+    ///
+    /// Review of #1365: the sync writes the version it ends on whatever happened,
+    /// which is right for pages it applied and wrong for a run that applied
+    /// nothing. Writing version 0 for a collection that had no record tells the
+    /// next sync it has already bootstrapped, so it asks for patches -- and a
+    /// non-genesis first patch over an empty ltHash is refused, which is how a
+    /// collection strands itself.
+    ///
+    /// The connection is retired while the first response is in flight, so the
+    /// loop takes its `Deferred` exit *after* asking. An unreachable client
+    /// would not do: it fails in `await_connection` before any sync code runs,
+    /// and the assertion below would hold for reasons that have nothing to do
+    /// with the fix.
+    #[tokio::test]
+    async fn a_bootstrap_deferred_mid_run_leaves_no_record() {
+        let (client, transport) = create_reachable_client().await;
+
+        let resync = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                client
+                    .resync_app_state([WAPatchName::Regular], AppStateResyncMode::Incremental)
+                    .await
+            })
+        };
+
+        // Answer the first sync, then retire the socket it was admitted on, so
+        // the next iteration defers instead of applying.
+        let node = crate::test_utils::decode_sent_iq(&transport, 0).await;
+        let node = node.get().to_owned();
+        let id = node
+            .attrs()
+            .optional_string("id")
+            .expect("every IQ carries an id")
+            .into_owned();
+        client.connection_generation.fetch_add(1, Ordering::SeqCst);
+        crate::test_utils::answer_iq(&client, &id, &batch_result(&id, &[("regular", None)])).await;
+
+        let _ = tokio::time::timeout(Duration::from_secs(5), resync).await;
+
+        assert!(
+            client
+                .persistence_manager
+                .backend()
+                .get_version(WAPatchName::Regular.as_str())
+                .await
+                .expect("the version should be readable")
+                .is_none(),
+            "a bootstrap that applied nothing has no version to record"
+        );
+    }
+
+    /// A collection that synced and is legitimately empty asks for patches like
+    /// any other; collapsing it with "never synced" made every empty collection
+    /// re-request a snapshot forever.
+    ///
+    /// Presence cannot carry that on its own: version 0 with an empty ltHash is
+    /// byte-identical between the two, and a row written by an older build --
+    /// which persisted version 0 for an interrupted bootstrap too -- could be
+    /// either. `bootstrapped` is what separates them, and it decodes false on
+    /// every such row, so those bootstrap once more instead of asking for
+    /// patches their empty ltHash can never accept.
+    #[tokio::test]
+    async fn a_synced_but_empty_collection_asks_for_patches_not_a_snapshot() {
+        let (client, transport) = create_reachable_client().await;
+        // A record at version 0 that completed a bootstrap: synced, and empty.
+        client
+            .persistence_manager
+            .backend()
+            .set_version(
+                WAPatchName::Regular.as_str(),
+                HashState {
+                    bootstrapped: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the test backend should accept a version");
+
+        let (result, asked) = resync_against(
+            &client,
+            &transport,
+            vec![WAPatchName::Regular],
+            AppStateResyncMode::Incremental,
+            |_, id| batch_result(id, &[("regular", None)]),
+        )
+        .await;
+
+        result.expect("the server answered");
+        assert_eq!(asked.len(), 1);
+        assert_eq!(
+            attr(&asked[0], "return_snapshot").as_deref(),
+            Some("false"),
+            "a collection with a record has synced, however empty it is"
+        );
+        assert_eq!(attr(&asked[0], "version").as_deref(), Some("0"));
+    }
+
+    /// The upgrade hazard: a row written before `bootstrapped` existed decodes
+    /// with it false, and an interrupted bootstrap under the old code left
+    /// exactly such a row at version 0. Reading presence alone would call it
+    /// synced, ask for patches, and have every non-genesis one refused against
+    /// the empty ltHash -- with the row still there, forever.
+    #[tokio::test]
+    async fn a_legacy_zero_row_bootstraps_once_more_instead_of_asking_for_patches() {
+        let (client, transport) = create_reachable_client().await;
+        // What an older build persisted: version 0, empty ltHash, no flag.
+        client
+            .persistence_manager
+            .backend()
+            .set_version(WAPatchName::Regular.as_str(), HashState::default())
+            .await
+            .expect("the test backend should accept a version");
+
+        let (result, asked) = resync_against(
+            &client,
+            &transport,
+            vec![WAPatchName::Regular],
+            AppStateResyncMode::Incremental,
+            |_, id| batch_result(id, &[("regular", None)]),
+        )
+        .await;
+
+        result.expect("the server answered");
+        assert_eq!(asked.len(), 1);
+        assert_eq!(
+            attr(&asked[0], "return_snapshot").as_deref(),
+            Some("true"),
+            "a row that never recorded a completed bootstrap has to ask for one"
+        );
+    }
+    /// The other half: no record at all is bootstrap, and bootstrap asks for a
+    /// snapshot.
+    #[tokio::test]
+    async fn a_collection_with_no_record_asks_for_a_snapshot() {
+        let (client, transport) = create_reachable_client().await;
+
+        let (result, asked) = resync_against(
+            &client,
+            &transport,
+            vec![WAPatchName::Regular],
+            AppStateResyncMode::Incremental,
+            |_, id| batch_result(id, &[("regular", None)]),
+        )
+        .await;
+
+        result.expect("the server answered");
+        assert_eq!(asked.len(), 1);
+        assert_eq!(attr(&asked[0], "return_snapshot").as_deref(), Some("true"));
+        assert_eq!(attr(&asked[0], "version").as_deref(), Some("0"));
+    }
+
     /// Answer every IQ the resync sends, with `collections` describing the
     /// per-collection reply. Returns the resync's own result plus every
     /// `<collection>` node that reached the wire, in order.
@@ -555,6 +708,7 @@ mod tests {
                 .get_version(WAPatchName::Regular.as_str())
                 .await
                 .expect("the version should be readable")
+                .expect("the collection has a version record")
                 .version,
             42,
             "a rebuild that could not run must leave the collection alone"
@@ -673,17 +827,22 @@ mod tests {
         assert_eq!(report.synced, vec![WAPatchName::Regular]);
         assert_eq!(asked.len(), 1, "one collection, one round");
         assert_eq!(attr(&asked[0], "return_snapshot").as_deref(), Some("true"));
+        // WA Web emits `version` on every collection node, falling back to
+        // DEFAULT_COLLECTION_VERSION when it has none
+        // (`_buildCollectionNodes`: `version: INT(v ?? 0)`). A node with no
+        // `version` at all is a shape the official client never sends.
         assert_eq!(
-            attr(&asked[0], "version"),
-            None,
-            "a snapshot request carries no version"
+            attr(&asked[0], "version").as_deref(),
+            Some("0"),
+            "a snapshot request still names the version it is starting from"
         );
     }
 
-    /// A rebuild is expressed by standing the collection down, because a
-    /// snapshot is only ever sent for a request that carries no version. Both
-    /// halves matter: a version left behind stale MACs, or MACs left behind a
-    /// version, is a baseline nothing downstream is looking for.
+    /// A rebuild is expressed by standing the collection down: the request that
+    /// asks for a snapshot names version 0, so the state it is starting from has
+    /// to actually be zero. Both halves matter -- a version left behind stale
+    /// MACs, or MACs left behind a version, is a baseline nothing downstream is
+    /// looking for.
     #[tokio::test]
     async fn snapshot_mode_stands_the_collection_down_before_asking() {
         let (client, transport) = create_reachable_client().await;
@@ -714,14 +873,14 @@ mod tests {
         // The IQ is on the wire: whatever the rebuild stood down, it stood down
         // before asking, and it did so holding the collection's reservation.
         let sent = crate::test_utils::decode_sent_iq(&transport, 0).await;
-        assert_eq!(
+        assert!(
             backend
                 .get_version(WAPatchName::Regular.as_str())
                 .await
                 .expect("the version should be readable")
-                .version,
-            0,
-            "the collection must be asking as one that never synced"
+                .is_none(),
+            "a rebuild is expressed by having nothing: the record is gone, which is \
+             what makes the next sync bootstrap the collection"
         );
         assert_eq!(
             backend
@@ -742,9 +901,9 @@ mod tests {
             Some("true")
         );
         assert_eq!(
-            attr(&collection, "version"),
-            None,
-            "a request that carries a version is not answered with a snapshot"
+            attr(&collection, "version").as_deref(),
+            Some("0"),
+            "the collection was stood down first, so the snapshot request names zero"
         );
 
         let id = node
@@ -785,7 +944,8 @@ mod tests {
             .backend()
             .get_version(WAPatchName::Regular.as_str())
             .await
-            .expect("the version should be readable");
+            .expect("the version should be readable")
+            .expect("the collection has a version record");
         assert_eq!(
             persisted.version, 42,
             "an incremental resync must leave the persisted version alone"

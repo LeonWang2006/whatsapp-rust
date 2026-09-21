@@ -122,31 +122,251 @@ impl MsgSecretEntry {
 }
 
 /// Device information for registry tracking.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Packed into 8 bytes rather than the 16 the obvious three fields occupy: a
+/// `u32` device id, an `Option<u32>` key index and a `bool` carry 5 bytes of
+/// information and 11 bytes of alignment padding, and a device registry holds
+/// one of these per device per known contact. The device id is a `u16`
+/// because that is what it is on the wire — [`Jid::device`] has always been
+/// one — and the hosted flag and the key index's presence share one byte.
+///
+/// Serialized as the `{device_id, key_index, is_hosted}` object the previous
+/// layout wrote, so stored device-list blobs are unchanged in both directions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "DeviceInfoDe", into = "DeviceInfoDe")]
 pub struct DeviceInfo {
-    /// The device ID (0 = primary device, 1+ = companion devices)
-    pub device_id: u32,
-    /// The key index, if known
-    pub key_index: Option<u32>,
-    /// Whether the device uses the hosted PN/LID address space.
+    device_id: u16,
+    flags: u8,
+    /// Meaningful only when [`Self::HAS_KEY_INDEX`] is set.
+    key_index: u32,
+}
+
+/// Serialization shadow: the field-per-value shape the blobs carry.
+///
+/// `device_id` is a `u16` here too, so a corrupt blob claiming a device
+/// beyond the wire's range is rejected by serde with its own message instead
+/// of being silently truncated into a different device.
+#[derive(Serialize, Deserialize)]
+struct DeviceInfoDe {
+    device_id: u16,
+    key_index: Option<u32>,
     #[serde(default)]
-    pub is_hosted: bool,
+    is_hosted: bool,
+}
+
+impl From<DeviceInfoDe> for DeviceInfo {
+    fn from(d: DeviceInfoDe) -> Self {
+        Self::new(d.device_id, d.key_index).with_hosting(d.is_hosted)
+    }
+}
+
+impl From<DeviceInfo> for DeviceInfoDe {
+    fn from(d: DeviceInfo) -> Self {
+        Self {
+            device_id: d.device_id(),
+            key_index: d.key_index(),
+            is_hosted: d.is_hosted(),
+        }
+    }
 }
 
 impl DeviceInfo {
+    const IS_HOSTED: u8 = 1 << 0;
+    const HAS_KEY_INDEX: u8 = 1 << 1;
+
     /// Construct a regular device entry.
-    pub const fn new(device_id: u32, key_index: Option<u32>) -> Self {
+    pub const fn new(device_id: u16, key_index: Option<u32>) -> Self {
+        let (flags, key_index) = match key_index {
+            Some(index) => (Self::HAS_KEY_INDEX, index),
+            None => (0, 0),
+        };
         Self {
             device_id,
+            flags,
             key_index,
-            is_hosted: false,
         }
     }
 
     /// Apply the hosted bit reported by the device-list source.
     pub const fn with_hosting(mut self, is_hosted: bool) -> Self {
-        self.is_hosted = is_hosted;
+        if is_hosted {
+            self.flags |= Self::IS_HOSTED;
+        } else {
+            self.flags &= !Self::IS_HOSTED;
+        }
         self
+    }
+
+    /// The device ID (0 = primary device, 1+ = companion devices).
+    pub const fn device_id(&self) -> u16 {
+        self.device_id
+    }
+
+    /// The key index, if known.
+    pub const fn key_index(&self) -> Option<u32> {
+        if self.flags & Self::HAS_KEY_INDEX != 0 {
+            Some(self.key_index)
+        } else {
+            None
+        }
+    }
+
+    /// Whether the device uses the hosted PN/LID address space.
+    pub const fn is_hosted(&self) -> bool {
+        self.flags & Self::IS_HOSTED != 0
+    }
+}
+
+#[cfg(test)]
+mod device_info_tests {
+    use super::DeviceInfo;
+
+    /// The packed layout is the whole point; a field added carelessly would
+    /// undo it silently. Exact: the packing is the contract. Rebaseline per
+    /// [layout asserts](../../../agent_docs/layout_asserts.md).
+    #[test]
+    fn a_device_entry_is_eight_bytes() {
+        assert_eq!(size_of::<DeviceInfo>(), 8);
+    }
+
+    #[test]
+    fn accessors_round_trip_every_combination() {
+        for device_id in [0u16, 1, 7, u16::MAX] {
+            for key_index in [None, Some(0), Some(1), Some(u32::MAX)] {
+                for is_hosted in [false, true] {
+                    let info = DeviceInfo::new(device_id, key_index).with_hosting(is_hosted);
+                    assert_eq!(info.device_id(), device_id);
+                    assert_eq!(info.key_index(), key_index, "key_index {key_index:?}");
+                    assert_eq!(info.is_hosted(), is_hosted);
+                }
+            }
+        }
+    }
+
+    /// `key_index: Some(0)` and `None` share the same stored word, so only the
+    /// presence bit tells them apart — the case a sentinel value would break.
+    #[test]
+    fn a_zero_key_index_is_not_an_absent_one() {
+        assert_eq!(DeviceInfo::new(3, Some(0)).key_index(), Some(0));
+        assert_eq!(DeviceInfo::new(3, None).key_index(), None);
+    }
+
+    #[test]
+    fn hosted_flag_is_backward_compatible_with_persisted_json() {
+        let legacy: DeviceInfo = serde_json::from_str(r#"{"device_id":7,"key_index":3}"#).unwrap();
+        assert!(!legacy.is_hosted());
+
+        let hosted = DeviceInfo::new(7, Some(3)).with_hosting(true);
+        let roundtrip: DeviceInfo =
+            serde_json::from_str(&serde_json::to_string(&hosted).unwrap()).unwrap();
+        assert!(roundtrip.is_hosted());
+    }
+
+    /// Device-list blobs already on disk were written by the three-field
+    /// layout, and are read back by the packed one. Both directions have to
+    /// hold, including `is_hosted` absent from a blob predating that field.
+    #[test]
+    fn the_persisted_shape_is_unchanged() {
+        let info = DeviceInfo::new(3, Some(42)).with_hosting(true);
+        let json = serde_json::to_value(info).expect("serialize");
+        assert_eq!(
+            json,
+            serde_json::json!({ "device_id": 3, "key_index": 42, "is_hosted": true })
+        );
+
+        let stored: DeviceInfo = serde_json::from_value(serde_json::json!({
+            "device_id": 5,
+            "key_index": null,
+            "is_hosted": false
+        }))
+        .expect("deserialize");
+        assert_eq!(stored, DeviceInfo::new(5, None));
+
+        // Predates `is_hosted`, which has always been `#[serde(default)]`.
+        let legacy: DeviceInfo =
+            serde_json::from_value(serde_json::json!({ "device_id": 9, "key_index": 4 }))
+                .expect("deserialize legacy");
+        assert_eq!(legacy, DeviceInfo::new(9, Some(4)));
+        assert!(!legacy.is_hosted());
+    }
+
+    /// The record is held per known contact for the life of a cache entry, so
+    /// its inline size is part of the budget: `Arc<str>` + `Box<[_]>` +
+    /// `Option<Box<str>>` rather than `String` + `Vec` + `Option<String>` is
+    /// what keeps it within 64 bytes instead of 88. Budget, not contract:
+    /// a smaller record is never a failure. Rebaseline per
+    /// [layout asserts](../../../agent_docs/layout_asserts.md).
+    #[test]
+    fn a_device_list_record_fits_sixty_four_bytes() {
+        assert!(
+            size_of::<super::DeviceListRecord>() <= 64,
+            "DeviceListRecord grew to {} B (budget 64)",
+            size_of::<super::DeviceListRecord>()
+        );
+    }
+
+    /// The record now serializes through a shadow struct; the blob it writes
+    /// and reads has to stay exactly what the owned-field layout produced.
+    #[test]
+    fn a_device_list_record_keeps_its_persisted_shape() {
+        use super::DeviceListRecord;
+
+        let record = DeviceListRecord {
+            user: "5511999999999".into(),
+            devices: [DeviceInfo::new(0, None), DeviceInfo::new(2, Some(9))].into(),
+            timestamp: 1234,
+            phash: Some("2:abcdef".into()),
+            raw_id: Some(7),
+        };
+
+        let json = serde_json::to_value(record.clone()).expect("serialize");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "user": "5511999999999",
+                "devices": [
+                    { "device_id": 0, "key_index": null, "is_hosted": false },
+                    { "device_id": 2, "key_index": 9, "is_hosted": false },
+                ],
+                "timestamp": 1234,
+                "phash": "2:abcdef",
+                "raw_id": 7,
+            })
+        );
+
+        let round: DeviceListRecord = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(&*round.user, "5511999999999");
+        assert_eq!(round.devices, record.devices);
+        assert_eq!(round.phash.as_deref(), Some("2:abcdef"));
+        assert_eq!(round.raw_id, Some(7));
+
+        // `raw_id` has always been optional, and a record without a phash
+        // writes an explicit null the way it always did.
+        let legacy: DeviceListRecord = serde_json::from_value(serde_json::json!({
+            "user": "5511888888888",
+            "devices": [],
+            "timestamp": 0,
+            "phash": null,
+        }))
+        .expect("deserialize legacy");
+        assert!(legacy.devices.is_empty());
+        assert_eq!(legacy.raw_id, None);
+    }
+
+    /// A device id is a `u16` on the wire and in a `Jid`. A blob claiming a
+    /// wider one is corrupt, and has to be rejected rather than truncated into
+    /// a different device — which is what a plain `as u16` would have done.
+    #[test]
+    fn a_device_id_beyond_the_wire_range_is_rejected() {
+        let err = serde_json::from_value::<DeviceInfo>(serde_json::json!({
+            "device_id": u32::from(u16::MAX) + 1,
+            "key_index": null
+        }))
+        .expect_err("a device id past u16 must not decode");
+        assert!(
+            err.to_string().contains("u16"),
+            "the error should name the range it violated: {err}"
+        );
     }
 }
 
@@ -228,44 +448,96 @@ mod msg_secret_entry_tests {
     }
 }
 
-#[cfg(test)]
-mod device_info_tests {
-    use super::DeviceInfo;
-
-    #[test]
-    fn hosted_flag_is_backward_compatible_with_persisted_json() {
-        let legacy: DeviceInfo = serde_json::from_str(r#"{"device_id":7,"key_index":3}"#).unwrap();
-        assert!(!legacy.is_hosted);
-
-        let hosted = DeviceInfo::new(7, Some(3)).with_hosting(true);
-        let roundtrip: DeviceInfo =
-            serde_json::from_str(&serde_json::to_string(&hosted).unwrap()).unwrap();
-        assert!(roundtrip.is_hosted);
-    }
-}
-
 /// Device list record matching WhatsApp Web's DeviceListRecord structure.
+///
+/// Serialized through a private shadow struct whose fields are the `String`,
+/// `Vec` and `Option<String>` the previous layout used. Deriving serde on the
+/// compact fields directly would stamp a second set of `Box<[T]>` and
+/// `Option<Box<str>>` codecs into every crate that persists a record, for a
+/// blob that is byte-for-byte the same either way.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "DeviceListRecordDe", into = "DeviceListRecordDe")]
 pub struct DeviceListRecord {
     /// The user part of the JID (phone number or LID)
-    pub user: String,
-    /// List of known devices for this user
-    pub devices: Vec<DeviceInfo>,
+    /// `Arc<str>`, so the registry cache can key the record by exactly this
+    /// string instead of allocating a second copy of it: every write stores
+    /// the record under its own `user`, and the two used to be separate
+    /// `String` allocations of identical content.
+    pub user: Arc<str>,
+    /// List of known devices for this user.
+    ///
+    /// Boxed rather than a `Vec`: the list is built once and then read for the
+    /// life of the cache entry, so the capacity field is dead weight — and
+    /// worse, `retain_devices_by_key_index` shortens it without releasing the
+    /// capacity, leaving the dropped devices' slots resident. Mutations go
+    /// through [`DeviceListRecord::edit_devices`].
+    pub devices: Box<[DeviceInfo]>,
     /// Timestamp when this record was last updated
     pub timestamp: i64,
     /// Participant hash from usync, if available
-    pub phash: Option<String>,
+    pub phash: Option<Box<str>>,
     /// ADV raw_id from `ADVKeyIndexList` — used to detect identity changes.
     /// When this changes, all sessions and sender keys for the user must be cleared.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_id: Option<u32>,
 }
 
+/// Serialization shadow: the owned-collection shape the blobs carry.
+#[derive(Serialize, Deserialize)]
+struct DeviceListRecordDe {
+    user: String,
+    devices: Vec<DeviceInfo>,
+    timestamp: i64,
+    phash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    raw_id: Option<u32>,
+}
+
+impl From<DeviceListRecordDe> for DeviceListRecord {
+    fn from(d: DeviceListRecordDe) -> Self {
+        Self {
+            user: Arc::from(d.user),
+            devices: d.devices.into_boxed_slice(),
+            timestamp: d.timestamp,
+            phash: d.phash.map(String::into_boxed_str),
+            raw_id: d.raw_id,
+        }
+    }
+}
+
+impl From<DeviceListRecord> for DeviceListRecordDe {
+    fn from(d: DeviceListRecord) -> Self {
+        Self {
+            user: d.user.to_string(),
+            devices: d.devices.into_vec(),
+            timestamp: d.timestamp,
+            phash: d.phash.map(String::from),
+            raw_id: d.raw_id,
+        }
+    }
+}
+
+impl DeviceListRecord {
+    /// Mutate the device list in place.
+    ///
+    /// The field is a `Box<[_]>`, so an edit moves through a `Vec` and back.
+    /// Every caller is a notification path (a device added, removed or
+    /// key-index filtered), never a send, and the round trip is what keeps a
+    /// filtered list from retaining the slots it dropped.
+    pub fn edit_devices(&mut self, edit: impl FnOnce(&mut Vec<DeviceInfo>)) {
+        let mut devices = std::mem::take(&mut self.devices).into_vec();
+        edit(&mut devices);
+        self.devices = devices.into_boxed_slice();
+    }
+}
+
 impl crate::stats::HeapSize for DeviceListRecord {
+    /// The `user` string is shared with the registry cache's key, so the
+    /// report must not also count it there.
     fn heap_bytes(&self) -> usize {
-        self.user.capacity()
-            + self.devices.capacity() * size_of::<DeviceInfo>()
-            + self.phash.as_ref().map_or(0, |p| p.capacity())
+        self.user.len()
+            + self.devices.len() * size_of::<DeviceInfo>()
+            + self.phash.as_ref().map_or(0, |p| p.len())
     }
 }
 
@@ -298,6 +570,17 @@ pub trait SignalStore: Send + Sync {
     /// Delete an identity key.
     async fn delete_identity(&self, address: &str) -> Result<()>;
 
+    /// Delete several identity keys. The flush issues one call per address
+    /// it dropped, and an identity reset drops many at once, so a backend with
+    /// transactions should override this with a single one; the default is the
+    /// per-address loop.
+    async fn delete_identities_batch(&self, addresses: &[Arc<str>]) -> Result<()> {
+        for address in addresses {
+            self.delete_identity(address).await?;
+        }
+        Ok(())
+    }
+
     // --- Session Operations ---
 
     /// Get an encrypted session for an address.
@@ -315,8 +598,33 @@ pub trait SignalStore: Send + Sync {
         Ok(())
     }
 
+    /// Load multiple encrypted sessions in a single backend operation.
+    /// Returns only the addresses that exist, like [`Self::load_prekeys_batch`].
+    /// Default implementation falls back to individual `get_session` calls.
+    /// Addresses are `Arc<str>` so a caller holding the cache's keys passes
+    /// shared refs without allocating a `String` per entry.
+    async fn get_sessions_batch(&self, addresses: &[Arc<str>]) -> Result<Vec<(Arc<str>, Bytes)>> {
+        let mut result = Vec::with_capacity(addresses.len());
+        for address in addresses {
+            if let Some(session) = self.get_session(address).await? {
+                result.push((address.clone(), session));
+            }
+        }
+        Ok(result)
+    }
+
     /// Delete a session.
     async fn delete_session(&self, address: &str) -> Result<()>;
+
+    /// Delete several sessions in one backend operation. Same contract as
+    /// [`Self::delete_identities_batch`]: the default loops, a transactional
+    /// backend should not.
+    async fn delete_sessions_batch(&self, addresses: &[Arc<str>]) -> Result<()> {
+        for address in addresses {
+            self.delete_session(address).await?;
+        }
+        Ok(())
+    }
 
     /// Check if a session exists. Default implementation uses `get_session`.
     async fn has_session(&self, address: &str) -> Result<bool> {
@@ -371,6 +679,16 @@ pub trait SignalStore: Send + Sync {
     /// Remove a pre-key.
     async fn remove_prekey(&self, id: u32) -> Result<()>;
 
+    /// Remove several pre-keys in one backend operation: an offline drain
+    /// consumes one per `pkmsg`, and the flush deletes them together once
+    /// their sessions are durable. The default loops.
+    async fn remove_prekeys_batch(&self, ids: &[u32]) -> Result<()> {
+        for id in ids {
+            self.remove_prekey(*id).await?;
+        }
+        Ok(())
+    }
+
     /// Get the maximum pre-key ID currently stored, or 0 if none exist.
     /// Used for migration when `next_pre_key_id` counter is not yet initialized.
     async fn get_max_prekey_id(&self) -> Result<u32>;
@@ -408,6 +726,14 @@ pub trait SignalStore: Send + Sync {
 
     /// Delete a sender key.
     async fn delete_sender_key(&self, address: &str) -> Result<()>;
+
+    /// Delete several sender keys in one backend operation. The default loops.
+    async fn delete_sender_keys_batch(&self, addresses: &[Arc<str>]) -> Result<()> {
+        for address in addresses {
+            self.delete_sender_key(address).await?;
+        }
+        Ok(())
+    }
 }
 
 /// WhatsApp app state synchronization storage.
@@ -422,8 +748,21 @@ pub trait AppSyncStore: Send + Sync {
     /// Set an app state sync key.
     async fn set_sync_key(&self, key_id: &[u8], key: AppStateSyncKey) -> Result<()>;
 
-    /// Get the app state version for a collection.
-    async fn get_version(&self, name: &str) -> Result<HashState>;
+    /// Get the app state version for a collection, or `None` if it has never
+    /// synced.
+    ///
+    /// The absence is the point. WA Web treats "no record" as bootstrap
+    /// (`isBootstrap = version == null`) and asks for a snapshot; a collection
+    /// that synced and is legitimately empty sits at version 0 with a record and
+    /// asks for patches. Collapsing the two into `HashState::default()` made
+    /// every empty collection re-request a snapshot forever.
+    async fn get_version(&self, name: &str) -> Result<Option<HashState>>;
+
+    /// Forget a collection's version, returning it to the never-synced state.
+    ///
+    /// This is how a rebuild is expressed: the collection has nothing, so the
+    /// next sync bootstraps it from a snapshot.
+    async fn delete_version(&self, name: &str) -> Result<()>;
 
     /// Set the app state version for a collection.
     async fn set_version(&self, name: &str, state: HashState) -> Result<()>;
@@ -463,6 +802,33 @@ pub trait AppSyncStore: Send + Sync {
 
     /// Delete mutation MACs by their index MACs.
     async fn delete_mutation_macs(&self, name: &str, index_macs: &[Vec<u8>]) -> Result<()>;
+
+    /// Persist one applied patch as a unit: the collection's new version, the
+    /// index MACs the patch removed and the MACs it added.
+    ///
+    /// The default issues the three single-purpose writes in that order, so a
+    /// backend without transactions keeps its current behaviour. A backend
+    /// with them should override this with one: a paged incremental sync
+    /// commits hundreds of small patches, and on SQLite each write was its own
+    /// permit, `spawn_blocking` and WAL commit — two thirds of what a small
+    /// patch cost to persist.
+    async fn commit_patch(
+        &self,
+        name: &str,
+        state: HashState,
+        removed_index_macs: &[Vec<u8>],
+        added: &[AppStateMutationMAC],
+    ) -> Result<()> {
+        let version = state.version;
+        self.set_version(name, state).await?;
+        if !removed_index_macs.is_empty() {
+            self.delete_mutation_macs(name, removed_index_macs).await?;
+        }
+        if !added.is_empty() {
+            self.put_mutation_macs(name, version, added).await?;
+        }
+        Ok(())
+    }
 
     /// Delete every mutation MAC for a collection. Called on snapshot re-sync so the
     /// MAC store is rebuilt from the snapshot, matching the ltHash baseline; leftover
@@ -552,6 +918,16 @@ pub trait ProtocolStore: Send + Sync {
     /// Delete a base key entry.
     async fn delete_base_key(&self, address: &str, message_id: &str) -> Result<()>;
 
+    /// Delete base keys recorded before `cutoff_timestamp` (unix seconds).
+    /// Returns the count deleted.
+    ///
+    /// A benign `Ok(0)` default rather than an `unsupported` error, for the same
+    /// reason as [`delete_expired_pending_inbound`](Self::delete_expired_pending_inbound):
+    /// the keepalive sweep calls it unconditionally for every backend.
+    async fn delete_expired_base_keys(&self, _cutoff_timestamp: i64) -> Result<u32> {
+        Ok(0)
+    }
+
     // --- Device Registry ---
 
     /// Update the device list for a user (called after usync responses).
@@ -571,13 +947,29 @@ pub trait ProtocolStore: Send + Sync {
     /// Get all known devices for a user.
     async fn get_devices(&self, user: &str) -> Result<Option<DeviceListRecord>>;
 
+    /// Batched variant of `get_devices`: the records stored under any of
+    /// `users`, in no particular order, with absent users left out. Backends
+    /// should override with one query; the default loops for correctness.
+    /// Resolving a cold large group reads one record per member, and a
+    /// round trip per member through the write queue cost ~30x one
+    /// `IN (...)` query at 256 members on SQLite.
+    async fn get_devices_batch(&self, users: &[&str]) -> Result<Vec<DeviceListRecord>> {
+        let mut records = Vec::with_capacity(users.len());
+        for user in users {
+            if let Some(record) = self.get_devices(user).await? {
+                records.push(record);
+            }
+        }
+        Ok(records)
+    }
+
     /// Delete a device list record, forcing a network re-fetch on next query.
     async fn delete_devices(&self, user: &str) -> Result<()>;
 
     // --- Group Metadata Cache (WA Web participant-phash re-query skip) ---
 
     /// Get the persisted, opaque serialized group metadata blob for `group_jid`.
-    /// The blob is a caller-serialized GroupInfo snapshot; backends without group
+    /// The blob is a caller-serialized GroupRoutingInfo snapshot; backends without group
     /// persistence return `None` (the group is then re-queried in full).
     async fn get_group_metadata(&self, _group_jid: &str) -> Result<Option<Vec<u8>>> {
         Ok(None)
@@ -600,6 +992,21 @@ pub trait ProtocolStore: Send + Sync {
 
     /// Get a trusted contact token for a JID (stored under LID).
     async fn get_tc_token(&self, jid: &str) -> Result<Option<TcTokenEntry>>;
+
+    /// Get the trusted contact tokens for several JIDs at once, in the order
+    /// asked, `None` where the backend holds no row.
+    ///
+    /// The reconnect presence re-subscribe looks one of these up per tracked
+    /// contact, which is a query per contact against one store — the shape this
+    /// exists to collapse. The default is a loop for third-party backends; the
+    /// built-in stores override it with a single query.
+    async fn get_tc_tokens(&self, jids: &[String]) -> Result<Vec<Option<TcTokenEntry>>> {
+        let mut entries = Vec::with_capacity(jids.len());
+        for jid in jids {
+            entries.push(self.get_tc_token(jid).await?);
+        }
+        Ok(entries)
+    }
 
     /// Store or update a trusted contact token for a JID.
     async fn put_tc_token(&self, jid: &str, entry: &TcTokenEntry) -> Result<()>;
@@ -700,6 +1107,21 @@ pub trait ProtocolStore: Send + Sync {
         message_id: &str,
         payload: &[u8],
     ) -> Result<()>;
+
+    /// Read a sent payload without removing it or refreshing its expiry.
+    /// Cancellation, including detached backend I/O, must leave the row unchanged.
+    /// Backends without this read return an error rather than emulate it with
+    /// take + store, which can lose the payload on cancellation.
+    async fn get_sent_message(
+        &self,
+        _chat_jid: &str,
+        _message_id: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        Err(crate::store::error::StoreError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "backend does not support non-consuming sent-message reads",
+        )))
+    }
 
     /// Retrieve and delete a sent message (atomic take). Returns serialized payload.
     /// Called when a retry receipt arrives; consuming prevents double-retry.
@@ -834,6 +1256,22 @@ pub trait DeviceStore: Send + Sync {
     /// non-breaking, exactly like [`Self::snapshot_db`].
     async fn resource_report(&self) -> crate::stats::StorageResourceReport {
         crate::stats::StorageResourceReport::default()
+    }
+
+    /// Periodic engine upkeep the client calls on a coarse timer (roughly
+    /// hourly) while connected — statistics refresh, log truncation, whatever a
+    /// backend needs to stay in shape across a session measured in weeks rather
+    /// than minutes.
+    ///
+    /// Defaulted to a no-op and placed on `DeviceStore` for the same reason as
+    /// [`Self::resource_report`]: a default on an already-implemented sub-trait
+    /// composes through `Arc<dyn Backend>` without forcing every external
+    /// backend to add an impl. It must be cheap enough to run on a live
+    /// connection and safe to call when nothing has changed; anything that takes
+    /// an exclusive lock on the whole database (SQLite's `VACUUM`) belongs in an
+    /// explicit embedder call, not here.
+    async fn maintenance(&self) -> Result<()> {
+        Ok(())
     }
 }
 

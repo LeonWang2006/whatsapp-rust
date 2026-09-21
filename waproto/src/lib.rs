@@ -3,7 +3,7 @@
 //! The Rust source (`whatsapp.rs`) is produced by `build.rs` from the
 //! pre-compiled descriptor set `whatsapp.desc`, and written to `OUT_DIR` —
 //! not tracked in git. To regenerate the descriptor after editing
-//! `whatsapp.proto`, run `scripts/regenerate-proto-desc.sh` (wraps `protoc`).
+//! `whatsapp.proto`, run `cargo xt proto-desc` (wraps `protoc`).
 
 #![allow(clippy::large_enum_variant)]
 /// Re-exported because its types permeate the generated API; depending on it
@@ -321,6 +321,17 @@ pub mod codec {
     #[inline(never)]
     pub fn syncd_patch_decode(bytes: &[u8]) -> Result<whatsapp::SyncdPatch, buffa::DecodeError> {
         whatsapp::SyncdPatch::decode_from_slice(bytes)
+    }
+
+    /// The collection a primary device sends back when a companion cannot
+    /// validate a snapshot it was served. Pinned here with its siblings for the
+    /// same reason: it carries `SyncActionData` in the clear, so decoding it
+    /// instantiates the same wide `SyncActionValue` subtree.
+    #[inline(never)]
+    pub fn syncd_snapshot_recovery_decode(
+        bytes: &[u8],
+    ) -> Result<whatsapp::SyncdSnapshotRecovery, buffa::DecodeError> {
+        whatsapp::SyncdSnapshotRecovery::decode_from_slice(bytes)
     }
 
     #[inline(never)]

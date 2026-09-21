@@ -774,8 +774,8 @@ fn skip_field(wire_type: u32, buf: &[u8], pos: usize) -> Result<usize, HistorySy
 ///
 /// Parsing is left to `parse_jid_ref` rather than split by hand: it borrows
 /// (no allocation for the entries we discard) and it already knows the forms
-/// this field can take — the legacy `@c.us` spelling of the phone namespace,
-/// and both device suffixes, `user:3` and the legacy dotted `user.3`.
+/// this field can take, the legacy `@c.us` spelling included — it resolves that
+/// to the phone namespace, so nothing here has to name it.
 fn pushname_id_is(id: &str, own_user: &str) -> bool {
     if !id.contains('@') {
         // Pre-JID bare form, still accepted.
@@ -784,8 +784,7 @@ fn pushname_id_is(id: &str, own_user: &str) -> bool {
     let Some(jid) = wacore_binary::jid::parse_jid_ref(id) else {
         return false;
     };
-    (jid.server.is_pn_family() || jid.server == wacore_binary::jid::Server::Legacy)
-        && &*jid.user == own_user
+    jid.server.is_pn_family() && &*jid.user == own_user
 }
 
 /// History sync's placeholder for an entry that carries no push name. It is a
@@ -1015,16 +1014,16 @@ fn history_lid_mapping(
     lid_raw: &str,
     source: HistoryLidMappingSource,
 ) -> Option<HistoryLidMapping> {
-    use wacore_binary::{Jid, Server};
+    use wacore_binary::Jid;
 
     let pn: Jid = pn_raw.parse().ok()?;
     let lid: Jid = lid_raw.parse().ok()?;
     // Family predicates, not the exact-server ones: `@hosted` and `@hosted.lid`
     // are the PN and LID namespaces for hosted accounts, and the mapping and
-    // Signal-address code elsewhere already treats them as such. Legacy `@c.us`
-    // is the PN namespace under its old name (whatsmeow maps it to
-    // `@s.whatsapp.net` the same way); the user part is the phone either way.
-    if !(pn.server.is_pn_family() || pn.server == Server::Legacy) || !lid.server.is_lid_family() {
+    // Signal-address code elsewhere already treats them as such. The legacy
+    // `@c.us` spelling needs no arm of its own: it parses as the phone
+    // namespace.
+    if !pn.server.is_pn_family() || !lid.server.is_lid_family() {
         return None;
     }
     if pn.user_base().is_empty() || lid.user_base().is_empty() {
@@ -2079,9 +2078,7 @@ where
     let pn_jid = pn_jid.or_else(|| {
         chat_jid
             .as_ref()
-            .filter(|jid| {
-                jid.server.is_pn_family() || jid.server == wacore_binary::jid::Server::Legacy
-            })
+            .filter(|jid| jid.server.is_pn_family())
             .map(|_| chat_id)
     });
     let lid_jid = lid_jid.or_else(|| {
@@ -2441,12 +2438,12 @@ mod tests {
             sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
             conversations: vec![
                 wa::Conversation {
-                    id: "111222333444555@lid".to_string(),
+                    id: "111222333444555@lid".into(),
                     pn_jid: Some("12025550143@s.whatsapp.net".to_string()),
                     ..Default::default()
                 },
                 wa::Conversation {
-                    id: "12025550144@s.whatsapp.net".to_string(),
+                    id: "12025550144@s.whatsapp.net".into(),
                     lid_jid: Some("222333444555666@lid".to_string()),
                     ..Default::default()
                 },
@@ -2549,7 +2546,7 @@ mod tests {
         let hs = wa::HistorySync {
             sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
             conversations: vec![wa::Conversation {
-                id: "111222333444555@hosted.lid".to_string(),
+                id: "111222333444555@hosted.lid".into(),
                 pn_jid: Some("12025550143@hosted".to_string()),
                 ..Default::default()
             }],
@@ -2574,7 +2571,7 @@ mod tests {
         let hs = wa::HistorySync {
             sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
             conversations: vec![wa::Conversation {
-                id: "111222333444555@lid".to_string(),
+                id: "111222333444555@lid".into(),
                 pn_jid: Some("12025550143@s.whatsapp.net".to_string()),
                 ..Default::default()
             }],
@@ -2603,7 +2600,7 @@ mod tests {
         let hs = wa::HistorySync {
             sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
             conversations: vec![wa::Conversation {
-                id: "111222333444555@lid".to_string(),
+                id: "111222333444555@lid".into(),
                 pn_jid: Some("12025550143@s.whatsapp.net".to_string()),
                 ..Default::default()
             }],
@@ -2627,7 +2624,7 @@ mod tests {
         let hs = wa::HistorySync {
             sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
             conversations: vec![wa::Conversation {
-                id: "15550001111@c.us".to_string(),
+                id: "15550001111@c.us".into(),
                 lid_jid: Some("222333444555666@lid".to_string()),
                 ..Default::default()
             }],
@@ -2653,7 +2650,7 @@ mod tests {
         let hs = wa::HistorySync {
             sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
             conversations: vec![wa::Conversation {
-                id: "999888777666555@lid".to_string(),
+                id: "999888777666555@lid".into(),
                 pn_jid: Some("12025550143@s.whatsapp.net".to_string()),
                 ..Default::default()
             }],
@@ -2682,7 +2679,7 @@ mod tests {
         let hs = wa::HistorySync {
             sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
             conversations: vec![wa::Conversation {
-                id: "222333444555666@lid".to_string(),
+                id: "222333444555666@lid".into(),
                 pn_jid: Some("12025550144@s.whatsapp.net".to_string()),
                 ..Default::default()
             }],
@@ -3491,7 +3488,7 @@ mod tests {
         let hs = wa::HistorySync {
             sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
             conversations: vec![wa::Conversation {
-                id: chat.to_string(),
+                id: chat.into(),
                 messages: vec![wa::HistorySyncMsg {
                     message: buffa::MessageField::some(wa::WebMessageInfo {
                         key: buffa::MessageField::some(wa::MessageKey {
@@ -3695,7 +3692,7 @@ mod tests {
         let hs = wa::HistorySync {
             sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
             conversations: vec![wa::Conversation {
-                id: chat.to_string(),
+                id: chat.into(),
                 messages: vec![
                     wa::HistorySyncMsg {
                         message: buffa::MessageField::some(wa::WebMessageInfo {
@@ -3769,7 +3766,7 @@ mod tests {
         let hs = wa::HistorySync {
             sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
             conversations: vec![wa::Conversation {
-                id: chat.to_string(),
+                id: chat.into(),
                 messages: vec![
                     wa::HistorySyncMsg {
                         message: buffa::MessageField::some(dropped),
@@ -3817,7 +3814,7 @@ mod tests {
         message.message_secret = Some(vec![0x44; 32]);
         let hs = wa::HistorySync {
             conversations: vec![wa::Conversation {
-                id: chat.to_string(),
+                id: chat.into(),
                 messages: vec![wa::HistorySyncMsg {
                     message: buffa::MessageField::some(message),
                     ..Default::default()
@@ -3877,7 +3874,7 @@ mod tests {
             .collect();
         let hs = wa::HistorySync {
             conversations: vec![wa::Conversation {
-                id: "5511777776666@s.whatsapp.net".to_string(),
+                id: "5511777776666@s.whatsapp.net".into(),
                 messages,
                 ..Default::default()
             }],
@@ -4021,7 +4018,7 @@ mod tests {
         let hs = wa::HistorySync {
             sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
             conversations: vec![wa::Conversation {
-                id: chat.to_string(),
+                id: chat.into(),
                 messages: vec![wa::HistorySyncMsg {
                     message: buffa::MessageField::some(wa::WebMessageInfo {
                         key: buffa::MessageField::some(wa::MessageKey {
@@ -4070,7 +4067,7 @@ mod tests {
         let hs = wa::HistorySync {
             sync_type: wa::history_sync::HistorySyncType::INITIAL_BOOTSTRAP,
             conversations: vec![wa::Conversation {
-                id: chat.to_string(),
+                id: chat.into(),
                 messages: vec![wa::HistorySyncMsg {
                     message: buffa::MessageField::some(wa::WebMessageInfo {
                         key: buffa::MessageField::some(wa::MessageKey {
@@ -4243,7 +4240,7 @@ mod tests {
             });
         }
         let big_conv = wa::Conversation {
-            id: dm.to_string(),
+            id: dm.into(),
             messages: big_msgs,
             tc_token: Some(vec![0xABu8; 16]),
             tc_token_timestamp: Some(1_700_000_123),
@@ -4252,7 +4249,7 @@ mod tests {
 
         // Group conversation: a secret message, but its tctoken must be ignored.
         let group_conv = wa::Conversation {
-            id: group.to_string(),
+            id: group.into(),
             messages: vec![wa::HistorySyncMsg {
                 message: buffa::MessageField::some(wa::WebMessageInfo {
                     key: buffa::MessageField::some(wa::MessageKey {

@@ -1,7 +1,7 @@
 //! Tests for stanza preparation and encryption fanout.
 
 use super::*;
-use crate::client::context::{GroupInfo, SendContextResolver};
+use crate::client::context::{GroupRoutingInfo, SendContextResolver};
 use crate::libsignal::protocol::{IdentityKeyPair, KeyPair, PreKeyBundle};
 use crate::types::jid::make_sender_key_name;
 use std::collections::HashMap;
@@ -554,8 +554,11 @@ impl SendContextResolver for MockSendContextResolver {
         })
     }
 
-    async fn resolve_group_info(&self, _jid: &Jid) -> Result<std::sync::Arc<GroupInfo>> {
-        unimplemented!("resolve_group_info not needed for send.rs tests")
+    async fn resolve_group_routing_info(
+        &self,
+        _jid: &Jid,
+    ) -> Result<std::sync::Arc<GroupRoutingInfo>> {
+        unimplemented!("resolve_group_routing_info not needed for send.rs tests")
     }
 
     async fn get_lid_for_phone(&self, phone_user: &str) -> Option<CompactString> {
@@ -2653,6 +2656,57 @@ mod stanza_type {
     }
 
     #[test]
+    fn rich_response_is_text() {
+        let m = wa::Message {
+            rich_response_message: buffa::MessageField::some(Default::default()),
+            ..Default::default()
+        };
+        assert_eq!(media_type_from_message(&m), None);
+        assert_eq!(stanza_type_from_message(&m), stanza::MSG_TYPE_TEXT);
+    }
+
+    #[test]
+    fn bot_forwarded_classifies_by_inner() {
+        let rich = wa::Message {
+            bot_forwarded_message: buffa::MessageField::some(fpm(wa::Message {
+                rich_response_message: buffa::MessageField::some(Default::default()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert_eq!(stanza_type_from_message(&rich), stanza::MSG_TYPE_TEXT);
+        assert_eq!(media_type_from_message(&rich), None);
+
+        let img = wa::Message {
+            bot_forwarded_message: buffa::MessageField::some(fpm(wa::Message {
+                image_message: buffa::MessageField::some(Default::default()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert_eq!(stanza_type_from_message(&img), stanza::MSG_TYPE_MEDIA);
+        assert_eq!(media_type_from_message(&img), Some("image"));
+
+        let vazio = wa::Message {
+            bot_forwarded_message: buffa::MessageField::some(Default::default()),
+            ..Default::default()
+        };
+        assert_eq!(stanza_type_from_message(&vazio), stanza::MSG_TYPE_TEXT);
+    }
+
+    #[test]
+    fn lottie_behind_bot_forwarded_stays_sticker() {
+        let m = wa::Message {
+            bot_forwarded_message: buffa::MessageField::some(fpm(wa::Message {
+                lottie_sticker_message: buffa::MessageField::some(Default::default()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert_eq!(media_type_from_message(&m), Some("sticker"));
+    }
+
+    #[test]
     fn backfilled_wrappers_classify_by_inner() {
         let spoiler = wa::Message {
             spoiler_message: buffa::MessageField::some(fpm(text_inner())),
@@ -2895,7 +2949,7 @@ mod device_unregistered_tests {
 
 mod collect_stale_device_users {
     use super::super::collect_stale_device_users;
-    use crate::client::context::GroupInfo;
+    use crate::client::context::GroupRoutingInfo;
     use crate::types::message::AddressingMode;
     use std::collections::{HashMap, HashSet};
     use wacore_binary::{CompactString, Jid};
@@ -2908,8 +2962,8 @@ mod collect_stale_device_users {
         Jid::pn(user)
     }
 
-    fn group_info_lid(mapping: &[(&str, &str)]) -> GroupInfo {
-        let mut info = GroupInfo::new(Vec::new(), AddressingMode::Lid);
+    fn group_info_lid(mapping: &[(&str, &str)]) -> GroupRoutingInfo {
+        let mut info = GroupRoutingInfo::new(Vec::new(), AddressingMode::Lid);
         if !mapping.is_empty() {
             let mut map: HashMap<CompactString, Jid> = HashMap::new();
             for (lid_user, pn) in mapping {
@@ -3063,7 +3117,7 @@ mod collect_stale_device_users {
     fn pn_mode_group_does_not_emit_alias() {
         // In PN-mode groups the distribution list is already PN-form, so
         // there's no LID↔PN duality to emit.
-        let mut info = GroupInfo::new(Vec::new(), AddressingMode::Pn);
+        let mut info = GroupRoutingInfo::new(Vec::new(), AddressingMode::Pn);
         let mut map: HashMap<CompactString, Jid> = HashMap::new();
         map.insert(
             CompactString::from("100000000000006"),
@@ -3079,7 +3133,7 @@ mod collect_stale_device_users {
     fn skips_non_pn_alias() {
         // If phone_jid_for_lid_user returns a JID whose server isn't PN
         // (malformed/adversarial server response), do not emit it.
-        let mut info = GroupInfo::new(Vec::new(), AddressingMode::Lid);
+        let mut info = GroupRoutingInfo::new(Vec::new(), AddressingMode::Lid);
         let mut map: HashMap<CompactString, Jid> = HashMap::new();
         map.insert(
             CompactString::from("100000000000007"),
@@ -3454,7 +3508,7 @@ mod mark_full_distribution_list {
             prekey_store: &mut prekeys,
             signed_prekey_store: &signed_prekeys,
         };
-        let group = GroupInfo::new(Vec::new(), AddressingMode::Lid);
+        let group = GroupRoutingInfo::new(Vec::new(), AddressingMode::Lid);
         let message = wa::Message {
             conversation: Some("status retry".into()),
             ..Default::default()
@@ -3563,7 +3617,7 @@ mod mark_full_distribution_list {
             prekey_store: &mut prekeys,
             signed_prekey_store: &signed_prekeys,
         };
-        let group = GroupInfo::new(Vec::new(), AddressingMode::Lid);
+        let group = GroupRoutingInfo::new(Vec::new(), AddressingMode::Lid);
         let message = wa::Message {
             conversation: Some("status retry".into()),
             ..Default::default()
@@ -3644,7 +3698,7 @@ mod mark_full_distribution_list {
         let resolver = MockSendContextResolver::new();
         let rt = TokioTestRuntime;
 
-        let group_info = GroupInfo::new(
+        let group_info = GroupRoutingInfo::new(
             vec![own_jid.to_non_ad(), a.to_non_ad(), b.to_non_ad()],
             AddressingMode::Pn,
         );
@@ -3741,7 +3795,7 @@ mod mark_full_distribution_list {
         };
 
         let resolver = MockSendContextResolver::new();
-        let group_info = GroupInfo::new(
+        let group_info = GroupRoutingInfo::new(
             vec![own_jid.to_non_ad(), a.to_non_ad(), b_primary.to_non_ad()],
             AddressingMode::Pn,
         );
@@ -3824,7 +3878,7 @@ mod mark_full_distribution_list {
         // Empty resolver: B's prekey fetch returns no bundle at all, which is
         // not the 406 the stale-user signal keys off.
         let resolver = MockSendContextResolver::new();
-        let group_info = GroupInfo::new(
+        let group_info = GroupRoutingInfo::new(
             vec![own_jid.to_non_ad(), a.to_non_ad(), b.to_non_ad()],
             AddressingMode::Pn,
         );
@@ -3886,14 +3940,14 @@ mod mark_full_distribution_list {
         let own_lid: Jid = "100000000000000@lid".parse().unwrap();
         let a: Jid = "559911112222:0@s.whatsapp.net".parse().unwrap();
         let group_info =
-            GroupInfo::new(vec![own_jid.to_non_ad(), a.to_non_ad()], AddressingMode::Pn);
+            GroupRoutingInfo::new(vec![own_jid.to_non_ad(), a.to_non_ad()], AddressingMode::Pn);
 
         async fn prepare(
             group: &Jid,
             own_jid: &Jid,
             own_lid: &Jid,
             a: &Jid,
-            group_info: &GroupInfo,
+            group_info: &GroupRoutingInfo,
             msg: &wa::Message,
             req: &str,
         ) -> (Node, bool) {
@@ -4030,7 +4084,7 @@ mod mark_full_distribution_list {
         let rt = TokioTestRuntime;
 
         let group_info =
-            GroupInfo::new(vec![own_jid.to_non_ad(), b.to_non_ad()], AddressingMode::Pn);
+            GroupRoutingInfo::new(vec![own_jid.to_non_ad(), b.to_non_ad()], AddressingMode::Pn);
         let msg = wa::Message {
             conversation: Some("hi".into()),
             ..Default::default()
@@ -4125,7 +4179,7 @@ mod mark_full_distribution_list {
             .with_bundle(bad.clone(), create_mock_bundle());
         let rt = TokioTestRuntime;
 
-        let group_info = GroupInfo::new(
+        let group_info = GroupRoutingInfo::new(
             vec![own_jid.to_non_ad(), good.to_non_ad(), bad.to_non_ad()],
             AddressingMode::Pn,
         );
@@ -4206,7 +4260,7 @@ mod mark_full_distribution_list {
             .with_bundle(good.clone(), signed_prekey_bundle())
             .with_bundle(bad.clone(), create_mock_bundle());
 
-        let group_info = GroupInfo::new(
+        let group_info = GroupRoutingInfo::new(
             vec![own_jid.to_non_ad(), good.to_non_ad(), bad.to_non_ad()],
             AddressingMode::Pn,
         );
@@ -4282,7 +4336,7 @@ mod mark_full_distribution_list {
             .with_bundle(first.clone(), signed_prekey_bundle())
             .with_bundle(second.clone(), signed_prekey_bundle());
 
-        let group_info = GroupInfo::new(
+        let group_info = GroupRoutingInfo::new(
             vec![own_jid.to_non_ad(), first.to_non_ad(), second.to_non_ad()],
             AddressingMode::Pn,
         );
@@ -4614,7 +4668,7 @@ mod mark_full_distribution_list {
 
             let mut group_participants = participants.clone();
             group_participants.push(own_jid.to_non_ad());
-            let group_info = GroupInfo::new(group_participants, AddressingMode::Pn);
+            let group_info = GroupRoutingInfo::new(group_participants, AddressingMode::Pn);
             // The full resolved device set the warm send hashes into `phash`.
             // The companions belong inside it, not beside it: production filters
             // the SKDM targets out of this very set (`filter_skdm_targets` over
@@ -5318,6 +5372,7 @@ mod local_identity_change_on_send {
                 false,
                 None,
                 nodes,
+                None,
             )
             .await
             .expect("fan-out into the caller's buffer")
@@ -5418,6 +5473,7 @@ mod local_identity_change_on_send {
                 false,
                 None,
                 &mut nodes,
+                None,
             )
             .await
             .expect("one bad device must not abort the fan-out");
@@ -5803,6 +5859,143 @@ mod local_identity_change_on_send {
                 vec![reachable.to_string(), own_companion.to_string()],
                 "the stanza carries what encrypted, recipients first"
             );
+            let fanout = prepared.recipient_fanout;
+            assert_eq!(
+                (fanout.addressed, fanout.encrypted),
+                (2, 1),
+                "the caller must be able to see one recipient device was dropped"
+            );
+            assert!(fanout.is_partial());
+            assert!(
+                !fanout.skipped_primary,
+                "the device that dropped was a companion, not the phone"
+            );
+        }
+
+        /// Regression (issue #1361): the recipient's phone drops out of the
+        /// fan-out and a companion does not, so the stanza is built, acked and
+        /// returned as `Ok`. Nothing the recipient can read was sent (the
+        /// chat lives on the phone) and before this the return value was
+        /// identical to a send that reached every device.
+        #[tokio::test]
+        async fn a_dm_that_lost_the_recipients_phone_says_so() {
+            let own_jid: Jid = "5511900000050:0@s.whatsapp.net".parse().unwrap();
+            let own_companion: Jid = "5511900000050:1@s.whatsapp.net".parse().unwrap();
+            let recipient_primary: Jid = "5511900000051:0@s.whatsapp.net".parse().unwrap();
+            let recipient_companion: Jid = "5511900000051:2@s.whatsapp.net".parse().unwrap();
+
+            let devices = ResolvedDmDevices::new(
+                vec![
+                    recipient_primary.clone(),
+                    recipient_companion.clone(),
+                    own_companion.clone(),
+                    own_jid.clone(),
+                ],
+                &own_jid,
+                None,
+            );
+
+            let prepared = prepare_dm(
+                &own_jid,
+                &recipient_primary.to_non_ad(),
+                &devices,
+                &[recipient_companion.clone(), own_companion.clone()],
+                std::slice::from_ref(&recipient_primary),
+                "DM_SINK_10",
+            )
+            .await
+            .expect("a companion still encrypted, so the stanza is built");
+
+            let fanout = prepared.recipient_fanout;
+            assert_eq!((fanout.addressed, fanout.encrypted), (2, 1));
+            assert!(
+                fanout.skipped_primary,
+                "the one device whose absence means undelivered must be named"
+            );
+            assert!(fanout.is_partial());
+            assert_eq!(
+                prepared.unreached_devices,
+                vec![recipient_primary],
+                "a repair has to know which device holds no copy, not just how many"
+            );
+        }
+
+        /// The happy path answers the same question, and answers it "nobody was
+        /// lost": a caller reading `is_partial` must not have to special-case
+        /// a complete send.
+        #[tokio::test]
+        async fn a_dm_that_reached_every_device_reports_no_loss() {
+            let own_jid: Jid = "5511900000060:0@s.whatsapp.net".parse().unwrap();
+            let own_companion: Jid = "5511900000060:1@s.whatsapp.net".parse().unwrap();
+            let recipient_primary: Jid = "5511900000061:0@s.whatsapp.net".parse().unwrap();
+            let recipient_companion: Jid = "5511900000061:2@s.whatsapp.net".parse().unwrap();
+
+            let devices = ResolvedDmDevices::new(
+                vec![
+                    recipient_primary.clone(),
+                    recipient_companion.clone(),
+                    own_companion.clone(),
+                    own_jid.clone(),
+                ],
+                &own_jid,
+                None,
+            );
+
+            let prepared = prepare_dm(
+                &own_jid,
+                &recipient_primary.to_non_ad(),
+                &devices,
+                &[
+                    recipient_primary.clone(),
+                    recipient_companion.clone(),
+                    own_companion.clone(),
+                ],
+                &[],
+                "DM_SINK_11",
+            )
+            .await
+            .expect("every device has a session");
+
+            let fanout = prepared.recipient_fanout;
+            assert_eq!((fanout.addressed, fanout.encrypted), (2, 2));
+            assert!(!fanout.is_partial());
+            assert!(!fanout.skipped_primary);
+            assert!(!fanout.had_unregistered_device);
+            assert!(
+                prepared.unreached_devices.is_empty(),
+                "a complete fan-out names nobody, and allocates for nobody"
+            );
+        }
+
+        /// A note to self has no recipient half, so the fan-out it reports is
+        /// the empty one. `is_partial` must read false there: nothing was
+        /// addressed, so nothing was lost.
+        #[tokio::test]
+        async fn a_self_chat_reports_an_empty_recipient_fanout() {
+            let own_jid: Jid = "5511900000070:0@s.whatsapp.net".parse().unwrap();
+            let own_companion: Jid = "5511900000070:1@s.whatsapp.net".parse().unwrap();
+
+            let devices = ResolvedDmDevices::new(
+                vec![own_companion.clone(), own_jid.clone()],
+                &own_jid,
+                None,
+            );
+
+            let prepared = prepare_dm(
+                &own_jid,
+                &own_jid.to_non_ad(),
+                &devices,
+                std::slice::from_ref(&own_companion),
+                &[],
+                "DM_SINK_12",
+            )
+            .await
+            .expect("a note to self is its own-devices copy");
+
+            let fanout = prepared.recipient_fanout;
+            assert_eq!((fanout.addressed, fanout.encrypted), (0, 0));
+            assert!(!fanout.is_partial());
+            assert!(!fanout.skipped_primary);
         }
 
         /// A note to self has no recipient half at all: every resolved device is
@@ -6402,7 +6595,7 @@ mod warm_group_send_encoding_scale {
             signed_prekey_store: &signed_prekeys,
         };
 
-        let group_info = GroupInfo::new(members.clone(), AddressingMode::Pn);
+        let group_info = GroupRoutingInfo::new(members.clone(), AddressingMode::Pn);
         let resolved = std::sync::Arc::new(ResolvedGroupDevices::new(members));
         // Warm the phash memo in setup, exactly as `setup_group_send` does in
         // the benchmark and as production does on the first send after a

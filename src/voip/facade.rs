@@ -5,13 +5,14 @@
 //! feature; reject/terminate stay feature-free in `super`.
 
 use std::future::Future;
+#[cfg(test)]
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use bytes::Bytes;
 use log::warn;
+use portable_atomic::{AtomicU64, Ordering as PortableOrdering};
 use wacore::message_processing::EncType;
 use wacore::messages::MessageUtils;
 use wacore::stanza::call::{
@@ -31,25 +32,31 @@ use wacore::types::group_call::{
     CallLinkMedia, GROUP_CALL_MAX_PARTICIPANTS, GROUP_CALL_MAX_REMOTE_PARTICIPANTS,
     GroupCallDevice, GroupCallParticipant, GroupCallUpdate, ScreenShareState,
 };
-use wacore::voip::relay_parse::RelayData;
+#[cfg(all(test, feature = "voip-engine-wacore"))]
 use wacore::voip::transport::RelayTransportFactory;
-use wacore::voip::{
-    AudioConfig, AudioFormat, AudioRtpProfile, CallChannels, CallConfig, CallDirection, CallEngine,
-    CallEvent, CallPhase, EncodedAudioFrame, GroupEngineConfig, VideoControl, VideoControlReceiver,
-    VideoControlSender, VideoFrame, VideoUpgradeToken, video_control_channel,
+#[cfg(all(test, feature = "voip-engine-wacore"))]
+use wacore::voip::{CallConfig, EncodedAudioFrame};
+use wacore::voip_control::control::{
+    VideoControl, VideoControlReceiver, VideoControlSender, video_control_channel,
+};
+use wacore::voip_control::relay_parse::RelayData;
+use wacore::voip_control::{
+    CallDirection, CallEvent, CallPhase, MediaAudioCodec as AudioCodec,
+    MediaAudioFormat as AudioFormat, MediaAudioRtpProfile as AudioRtpProfile,
+    MediaKeyframeUrgency as KeyframeUrgency, MediaVideoUpgradeToken as VideoUpgradeToken,
+    VideoFrame, VideoInput, VoipMediaSession,
 };
 use wacore_binary::{Jid, JidExt as _, Server};
 use waproto::whatsapp as wa;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::client::{CallError, Client, ResponseWaiter};
-use crate::voip::audio::{
-    AudioSink, AudioSource, EncodedAudioSink, EncodedAudioSource, WA_FRAME_SAMPLES,
-};
-use crate::voip::driver::{RandTxIds, run_call_tokio};
-use crate::voip::transport::RelayMediaChannelFactory;
-use crate::voip::video::{VideoSink, VideoSource};
+#[cfg(all(test, feature = "voip-engine-wacore"))]
+use crate::voip::audio::WA_FRAME_SAMPLES;
+use crate::voip::audio::{AudioSink, AudioSource, EncodedAudioSink, EncodedAudioSource};
+use crate::voip::video::{TimedVideoFrame, VideoSink, VideoSource};
 
+#[derive(Clone)]
 enum AudioEndpoints {
     Pcm {
         source: Arc<dyn AudioSource>,
@@ -63,15 +70,33 @@ enum AudioEndpoints {
 }
 
 impl AudioEndpoints {
-    fn config(&self) -> AudioConfig {
+    fn config(&self) -> wacore::voip_control::MediaAudioSpec {
         match self {
-            Self::Pcm { .. } => AudioConfig::MLOW_PCM,
-            Self::Encoded { format, .. } => AudioConfig::encoded(*format),
+            Self::Pcm { .. } => wacore::voip_control::MediaAudioSpec::builder()
+                .format(wacore::voip_control::MediaAudioFormat::MLOW_16KHZ_60MS)
+                .io(wacore::voip_control::MediaAudioIo::Pcm)
+                .build(),
+            Self::Encoded { format, .. } => wacore::voip_control::MediaAudioSpec::builder()
+                .format(*format)
+                .io(wacore::voip_control::MediaAudioIo::Encoded)
+                .build(),
         }
     }
 
     fn signaling_rate(&self) -> u32 {
         self.config().format.signaling_rate
+    }
+
+    /// The neutral opening ports this endpoint pair maps to, moving the trait objects across.
+    fn into_ports(self) -> wacore::voip_control::MediaAudioPorts {
+        match self {
+            Self::Pcm { source, sink } => {
+                wacore::voip_control::MediaAudioPorts::Pcm { source, sink }
+            }
+            Self::Encoded { source, sink, .. } => {
+                wacore::voip_control::MediaAudioPorts::Encoded { source, sink }
+            }
+        }
     }
 }
 
@@ -92,6 +117,24 @@ macro_rules! impl_media_builder_methods {
         }
 
         /// Send and receive complete codec payloads instead of using the built-in PCM adapter.
+        ///
+        /// `format` is a promise about the bytes the source will emit, and the negotiation can
+        /// disagree with it: MLow needs both sides to have asked for it. Answering a call whose
+        /// peer selects the other codec fails with
+        /// [`CallError::EncodedAudioCodecNotNegotiated`](crate::CallError::EncodedAudioCodecNotNegotiated),
+        /// naming both codecs so the call can be retried on the right one.
+        ///
+        /// On an outgoing call the peer's answer arrives after media is up, so there is nothing to
+        /// refuse: the receive side switches -- inbound frames carry their own codec -- and the
+        /// send side stops, because this source emits the codec it was built with and the engine
+        /// cannot re-point it. The frames it keeps producing are dropped and counted in
+        /// `outbound_frames_without_encoder` rather than sent under a profile that would accept
+        /// them and leave the peer hearing noise. Both events fire, in this order:
+        /// [`AudioCodecSwitched`](wacore::voip_control::CallEvent::AudioCodecSwitched) and
+        /// [`AudioCodecSourceIsFixed`](wacore::voip_control::CallEvent::AudioCodecSourceIsFixed). Recovery
+        /// is to end this call and place a new one on the codec the peer named -- re-encoding in
+        /// place does not resume the outbound audio, since the format this call was built with is
+        /// what the engine compares against for its lifetime.
         pub fn encoded_audio<S, K>(mut self, format: AudioFormat, source: S, sink: K) -> Self
         where
             S: EncodedAudioSource,
@@ -129,7 +172,7 @@ pub struct AcceptCall<'a> {
 }
 
 async fn wait_for_group_relay(
-    registry: &wacore::voip::CallRegistry,
+    registry: &wacore::voip_control::registry::CallRegistry,
     call_id: &str,
     generation: u64,
 ) -> Result<GroupCallUpdate, CallError> {
@@ -179,17 +222,29 @@ impl<'a> AcceptCall<'a> {
         // Take the audio endpoints out first; the offline setup (decrypt + config + addr) only
         // borrows `&self`, so move the fields before those borrows to avoid a partial-move clash.
         let audio = self.audio.take().ok_or(CallError::MissingAudio)?;
-        let audio_config = audio.config();
+        let mut audio_config = audio.config();
+        // The callee learns the peer's capability in the `<offer>`, before anything is fixed, so it
+        // simply starts on the right codec: no mutable format, no mid-call switch, no first packet
+        // decoded under the wrong grammar. MLow survives only if we asked for it and the peer
+        // announced index 31; a peer outside that rollout emits standard Opus on the same payload
+        // type, and decoding it as MLow is what makes the call silent (issue #1105).
+        let selected = peer_selected_codec_from_offer(self.incoming, audio_config.format);
+        let plan = negotiated_audio_plan(
+            audio_config.format,
+            matches!(&audio, AudioEndpoints::Encoded { .. }),
+            selected,
+        )?;
+        audio_config.format = plan.engine_format;
+        let wire_format = plan.wire_format;
+        let engine_switch = plan.engine_switch;
+        let audio_config = audio_config;
         if let CallAction::Offer { audio, .. } = &self.incoming.action
             && !audio.is_empty()
             && !audio.iter().any(|codec| {
-                codec.enc.eq_ignore_ascii_case("opus")
-                    && codec.rate == audio_config.format.signaling_rate
+                codec.enc.eq_ignore_ascii_case("opus") && codec.rate == wire_format.signaling_rate
             })
         {
-            return Err(CallError::AudioFormatNotOffered(
-                audio_config.format.signaling_rate,
-            ));
+            return Err(CallError::AudioFormatNotOffered(wire_format.signaling_rate));
         }
         let CallAction::Offer {
             call_id,
@@ -287,10 +342,24 @@ impl<'a> AcceptCall<'a> {
         } else {
             self.incoming.from.clone()
         };
-        let mut session =
-            wacore::voip::CallSession::new_incoming(call_id, peer_jid, call_creator.clone());
-        session.audio_format = Some(audio_config.format);
+        let mut session = wacore::voip_control::CallSession::new_incoming(
+            call_id,
+            peer_jid,
+            call_creator.clone(),
+        );
+        session.audio_format = Some(wire_format);
         session.is_video = has_video;
+        // Why this has to survive registration: `CallEntry::peer_video_orientations`.
+        // Keyed by the offering device, which for a group offer rides the outer
+        // `<call participant>` rather than its group-wrapper `from`.
+        session.peer_video_orientation = self.incoming.video_orientation.map(|orientation| {
+            let announcer = self
+                .incoming
+                .participant
+                .clone()
+                .unwrap_or_else(|| self.incoming.from.clone());
+            (announcer, orientation)
+        });
         session.group = group.clone();
         // Register BEFORE the decrypt await. A peer <terminate> can now reap this generation during
         // setup, instead of falling through terminate_call as an unknown call and letting us accept
@@ -309,18 +378,18 @@ impl<'a> AcceptCall<'a> {
         let accept_id = self.client.generate_request_id();
         let (preaccept, accept) = build_answer_signaling(
             self.incoming,
-            audio_config.format,
+            wire_format,
             has_video,
             is_group,
             &preaccept_id,
             &accept_id,
         )?;
-        let (engine, built_call_id, addr) = send_preaccept_then_prepare(
+        let (spec, built_call_id) = send_preaccept_then_prepare(
             self.client,
             &registration,
             &mut teardown,
             preaccept,
-            self.build_engine(has_video, audio_config, group),
+            self.build_spec(has_video, audio_config, group, registration.generation),
         )
         .await?;
         debug_assert_eq!(built_call_id, registration.call_id);
@@ -331,26 +400,37 @@ impl<'a> AcceptCall<'a> {
             return Err(CallError::Connect(ERR_DISCONNECTED_DURING_SETUP.into()));
         }
         registration.ensure_current()?;
-        let factory = RelayMediaChannelFactory::new(addr, self.client.runtime.clone());
         // Final acceptance waits until media setup succeeded and the registered generation is still
         // current; only then may the caller apply the participant keys and enter the call.
         send_answer_node(self.client, &registration, &mut teardown, accept).await?;
-        let handle = spawn_answered_call(
+        let result = open_registered_media(
             self.client,
-            &mut registration,
-            teardown,
-            engine,
-            &factory,
+            &registration,
+            spec,
             audio,
             video,
+            // Incoming group epoch is applied through the roster replay, not here.
+            None,
+            engine_switch,
         )
-        .await?;
+        .await;
+        let handle = match result {
+            Ok(handle) => {
+                teardown.disarm();
+                registration.disarm();
+                handle
+            }
+            Err(error) => {
+                teardown.terminate(self.client).await;
+                return Err(error);
+            }
+        };
         if !is_group && let Some(own_lid) = self.client.lid() {
             self.client.call_registry().set_group_invite_self_device(
                 &handle.call_id,
                 handle.generation,
                 GroupCallDevice::new(own_lid)
-                    .with_capability(1, offer_capability(has_video, audio_config.format)),
+                    .with_capability(1, offer_capability(has_video, wire_format)),
             );
             if let Some(peer_device) = peer_invite_device {
                 self.client.call_registry().set_group_invite_peer_device(
@@ -363,15 +443,17 @@ impl<'a> AcceptCall<'a> {
         Ok(handle)
     }
 
-    /// Build the [`CallEngine`] from the offer: decrypt the callKey over the Signal session, then
-    /// assemble the incoming-call config from the parsed relay. No network I/O beyond the Signal
-    /// session the decrypt needs.
-    async fn build_engine(
+    /// Build the neutral [`MediaSessionSpec`] from the offer: decrypt the callKey over the Signal
+    /// session, then assemble the incoming-call spec from the parsed relay. No network I/O beyond
+    /// the Signal session the decrypt needs. `self_lid` comes back so the caller can mark the
+    /// session's participant identity without an engine.
+    async fn build_spec(
         &self,
         enable_video: bool,
-        audio: AudioConfig,
+        audio: wacore::voip_control::MediaAudioSpec,
         group: Option<GroupCallUpdate>,
-    ) -> Result<(CallEngine, String, SocketAddr), CallError> {
+        generation: u64,
+    ) -> Result<(wacore::voip_control::MediaSessionSpec, String), CallError> {
         let CallAction::Offer {
             call_id,
             call_creator,
@@ -387,32 +469,32 @@ impl<'a> AcceptCall<'a> {
         // Our own device LID: used both to pick the callKey enc for THIS device (a multi-device
         // offer lists one per `<destination><to jid>`) and as the send-side SRTP participant id.
         let own_lid = self.client.lid().ok_or(CallError::Media("no own LID"))?;
+        let key = wacore::voip_control::MediaSessionKey::builder()
+            .call_id(call_id.clone())
+            .generation(generation)
+            .build();
         if let Some(group) = group.as_ref()
             && let Some(relay) = group.relay.as_ref()
         {
             let self_lid = own_lid.to_string();
-            let mut config = CallConfig::for_group(
+            let mut spec = wacore::voip_control::MediaSessionSpec::for_group(
                 CallDirection::Incoming,
-                call_id,
+                key,
                 &self_lid,
                 &call_creator.to_string(),
                 relay,
             )
             .map_err(|error| CallError::Setup(error.to_string()))?;
-            config.audio = audio;
-            config.enable_video = enable_video;
-            let addr = socket_addr_from_config(&config)?;
-            let mut engine = CallEngine::new(config, Box::new(RandTxIds))
-                .map_err(|error| CallError::Setup(error.to_string()))?;
-            engine
-                .configure_group(GroupEngineConfig {
-                    call_creator: call_creator.clone(),
-                    self_jid: own_lid,
-                    initial_update: group.clone(),
-                    direct_peer: None,
-                })
-                .map_err(|error| CallError::Setup(error.to_string()))?;
-            return Ok((engine, call_id.clone(), addr));
+            spec.audio = audio;
+            spec.enable_video = enable_video;
+            spec.group = Some(
+                crate::voip_control::MediaGroupSpec::builder()
+                    .call_creator(call_creator.clone())
+                    .self_jid(own_lid)
+                    .initial_update(group.clone())
+                    .build(),
+            );
+            return Ok((spec, call_id.clone()));
         }
 
         let media = self
@@ -450,15 +532,18 @@ impl<'a> AcceptCall<'a> {
             .as_ref()
             .ok_or(CallError::Media("offer carried no <relay>"))?;
 
-        let mut config = CallConfig::for_incoming(call_id, &self_lid, &peer_lid, call_key, relay)
-            .map_err(|e| CallError::Setup(e.to_string()))?;
-        config.audio = audio;
-        config.enable_video = enable_video;
-        // Read the dial addr off the config before CallEngine::new consumes it (no second relay walk).
-        let addr = socket_addr_from_config(&config)?;
-        let engine = CallEngine::new(config, Box::new(RandTxIds))
-            .map_err(|e| CallError::Setup(e.to_string()))?;
-        Ok((engine, call_id.clone(), addr))
+        let mut spec = wacore::voip_control::MediaSessionSpec::from_relay(
+            CallDirection::Incoming,
+            key,
+            &self_lid,
+            &peer_lid,
+            call_key,
+            relay,
+        )
+        .map_err(|e| CallError::Setup(e.to_string()))?;
+        spec.audio = audio;
+        spec.enable_video = enable_video;
+        Ok((spec, call_id.clone()))
     }
 }
 
@@ -794,7 +879,7 @@ impl<'a> OutgoingGroupCall<'a> {
             request_id.clone(),
             cleanup_generation,
         );
-        let mut session = wacore::voip::CallSession::new_outgoing(
+        let mut session = wacore::voip_control::CallSession::new_outgoing(
             &call_id,
             Jid::new(&call_id, Server::Call),
             own_lid.clone(),
@@ -848,7 +933,8 @@ impl<'a> OutgoingGroupCall<'a> {
             registry.apply_group_update_if_current(ack_update.clone(), registration.generation);
         if !matches!(
             applied,
-            wacore::voip::GroupStateApply::Applied | wacore::voip::GroupStateApply::Stale
+            wacore::voip_control::group::GroupStateApply::Applied
+                | wacore::voip_control::group::GroupStateApply::Stale
         ) {
             return Err(CallError::Response(
                 "group offer ack snapshot was rejected".to_string(),
@@ -868,50 +954,57 @@ impl<'a> OutgoingGroupCall<'a> {
             .as_ref()
             .or(ack_update.relay.as_ref())
             .ok_or(CallError::Media("group offer ack has no relay"))?;
-        let mut config = CallConfig::for_group(
+        let key = wacore::voip_control::MediaSessionKey::builder()
+            .call_id(call_id.clone())
+            .generation(registration.generation)
+            .build();
+        let mut spec = wacore::voip_control::MediaSessionSpec::for_group(
             CallDirection::Outgoing,
-            &call_id,
+            key,
             &own_lid.to_string(),
             &own_lid.to_string(),
             relay,
         )
         .map_err(|error| CallError::Setup(error.to_string()))?;
-        config.audio = audio.config();
-        config.enable_video = video.is_some();
-        let addr = socket_addr_from_config(&config)?;
-        let mut engine = CallEngine::new(config, Box::new(RandTxIds))
-            .map_err(|error| CallError::Setup(error.to_string()))?;
-        engine
-            .configure_group(GroupEngineConfig {
-                call_creator: own_lid.clone(),
-                self_jid: own_lid.clone(),
-                initial_update: update.clone(),
-                direct_peer: None,
-            })
-            .map_err(|error| CallError::Setup(error.to_string()))?;
+        spec.group = Some(
+            crate::voip_control::MediaGroupSpec::builder()
+                .call_creator(own_lid.clone())
+                .self_jid(own_lid.clone())
+                .initial_update(update.clone())
+                .build(),
+        );
         // A newer pre-ACK update may have overtaken this ACK without requesting its own rekey.
         // Honor the ACK request unless the serialized signaling handler retained an equal/newer
         // epoch; fan out against the current roster so newly arrived participants receive it too.
         let retained_epoch =
             registry.pending_group_epoch_transaction_if_current(&call_id, registration.generation);
-        if let Some(rekey_update) = group_offer_epoch_update(&ack_update, &update, retained_epoch) {
-            fanout_group_epoch(self.client, rekey_update)
-                .await?
-                .commit(|epoch| {
-                    engine
-                        .apply_group_raw_epoch(rekey_update.transaction_id, epoch)
-                        .map_err(|error| CallError::Setup(error.to_string()))
-                })?;
-        }
+        let group_epoch = if let Some(rekey_update) =
+            group_offer_epoch_update(&ack_update, &update, retained_epoch)
+        {
+            let fanout = fanout_group_epoch(self.client, rekey_update).await?;
+            Some(
+                fanout
+                    .commit(|epoch| Ok(epoch.to_vec()))
+                    .map(|epoch| (rekey_update.transaction_id, epoch))?,
+            )
+        } else {
+            None
+        };
         drop(transition_guard);
 
         if !self.client.is_connected() {
             return Err(CallError::Connect(ERR_DISCONNECTED_DURING_SETUP.into()));
         }
-        let factory = RelayMediaChannelFactory::new(addr, self.client.runtime.clone());
-        let handle =
-            spawn_registered_call(self.client, &registration, engine, &factory, audio, video)
-                .await?;
+        let handle = open_registered_media(
+            self.client,
+            &registration,
+            spec,
+            audio,
+            video,
+            group_epoch,
+            None,
+        )
+        .await?;
         registration.disarm();
         teardown.disarm();
         Ok(handle)
@@ -951,7 +1044,7 @@ impl<'a> GroupBoundCall<'a> {
         let info = self
             .client
             .groups()
-            .query_info(self.group_jid)
+            .routing_info(self.group_jid)
             .await
             .map_err(|error| CallError::Setup(error.to_string()))?;
         OutgoingGroupCall {
@@ -1077,34 +1170,31 @@ impl<'a> CallLinkCall<'a> {
             .as_ref()
             .ok_or(CallError::Media("call-link group snapshot has no relay"))?;
         let own_lid = self.client.lid().ok_or(CallError::Media("no own LID"))?;
-        let mut config = CallConfig::for_group(
+        let key = wacore::voip_control::MediaSessionKey::builder()
+            .call_id(join.call_id.clone())
+            .generation(generation)
+            .build();
+        let mut spec = wacore::voip_control::MediaSessionSpec::for_group(
             CallDirection::Outgoing,
-            &join.call_id,
+            key,
             &own_lid.to_string(),
             &join.call_creator.to_string(),
             relay,
         )
         .map_err(|error| CallError::Setup(error.to_string()))?;
-        config.audio = audio.config();
-        config.enable_video = video.is_some();
-        let addr = socket_addr_from_config(&config)?;
-        let mut engine = CallEngine::new(config, Box::new(RandTxIds))
-            .map_err(|error| CallError::Setup(error.to_string()))?;
-        engine
-            .configure_group(GroupEngineConfig {
-                call_creator: join.call_creator.clone(),
-                self_jid: own_lid,
-                initial_update: update.clone(),
-                direct_peer: None,
-            })
-            .map_err(|error| CallError::Setup(error.to_string()))?;
+        spec.group = Some(
+            crate::voip_control::MediaGroupSpec::builder()
+                .call_creator(join.call_creator.clone())
+                .self_jid(own_lid)
+                .initial_update(update.clone())
+                .build(),
+        );
 
         if !self.client.is_connected() {
             return Err(CallError::Connect(ERR_DISCONNECTED_DURING_SETUP.into()));
         }
-        let factory = RelayMediaChannelFactory::new(addr, self.client.runtime.clone());
         let handle =
-            spawn_registered_call(self.client, &registration, engine, &factory, audio, video)
+            open_registered_media(self.client, &registration, spec, audio, video, None, None)
                 .await?;
         registration.disarm();
         teardown.disarm();
@@ -1113,6 +1203,7 @@ impl<'a> CallLinkCall<'a> {
 }
 
 /// The video source/sink pair a builder's `.video()` provided.
+#[derive(Clone)]
 struct VideoEndpoints {
     source: Arc<dyn VideoSource>,
     sink: Arc<dyn VideoSink>,
@@ -1163,6 +1254,111 @@ pub(crate) fn offer_capability(video: bool, audio: AudioFormat) -> &'static [u8]
         (true, false) => &CAPABILITY_VIDEO_OFFER,
         (false, false) => &CAPABILITY_OFFER,
     }
+}
+
+/// The codec the offering peer's `<capability>` selects, or `None` when the local choice stands.
+///
+/// Mirrors `reset_voip_params_if_no_capability`: a peer that announced nothing resets nothing, a
+/// peer whose blob is unreadable resets everything, and MLow needs both sides to have asked for it.
+/// Only the MLow/Opus pair at one RTP timing is swappable, so a locally-selected profile outside
+/// that pair (the 48 kHz RFC 7587 one) is left exactly as the consumer configured it.
+/// What the peer's capability decides about a call that has not started yet.
+///
+/// Three facts come out of one selection and they are not the same fact: which format the ENGINE is
+/// built with, which one the SIGNALING announces, and whether the engine has to be switched after
+/// construction. They coincide for a PCM endpoint and part company for an encoded one, whose format
+/// is a promise the APPLICATION made about the bytes it will hand us -- the source is already built
+/// and carries no per-frame codec, so nothing can tell it the call chose the other one.
+#[derive(Debug, PartialEq, Eq)]
+struct NegotiatedAudioPlan {
+    /// What the engine is constructed with. For an encoded endpoint this stays the source's own
+    /// format, because that is what `audio.format` means to the engine: what arrives from the
+    /// application, not what goes on the wire. Overwriting it is what let escape-profile bytes
+    /// reach a native-Opus peer with their rewritten TOCs intact -- the engine compares the two to
+    /// decide whether to translate, and had been told they agreed.
+    engine_format: AudioFormat,
+    /// What the peer is told, and what the wire actually carries.
+    wire_format: AudioFormat,
+    /// Set when the engine must be moved off the format it was built with, before media flows.
+    engine_switch: Option<AudioCodec>,
+}
+
+fn negotiated_audio_plan(
+    configured: AudioFormat,
+    encoded_endpoint: bool,
+    selected: Option<AudioCodec>,
+) -> Result<NegotiatedAudioPlan, CallError> {
+    let unchanged = NegotiatedAudioPlan {
+        engine_format: configured,
+        wire_format: configured,
+        engine_switch: None,
+    };
+    let Some(codec) = selected else {
+        return Ok(unchanged);
+    };
+    // A codec with no sibling at this timing cannot be reached without re-signalling, so the call
+    // stays as configured rather than silently changing what the peer was told.
+    let Some(format) = configured.sibling_for(codec) else {
+        return Ok(unchanged);
+    };
+    // Only a change of CODEC is unanswerable: the source emits one grammar and cannot be told to
+    // emit another, so the application has to pick again. A change of container is answerable --
+    // the escape profile and native Opus carry the same Opus bytes, and the engine is what stops
+    // rewriting their TOCs.
+    if encoded_endpoint && configured.codec != codec {
+        return Err(CallError::EncodedAudioCodecNotNegotiated {
+            configured: configured.codec,
+            selected: codec,
+        });
+    }
+    Ok(NegotiatedAudioPlan {
+        engine_format: if encoded_endpoint { configured } else { format },
+        wire_format: format,
+        engine_switch: encoded_endpoint.then_some(codec),
+    })
+}
+
+fn peer_selected_codec_from_offer(
+    incoming: &IncomingCall,
+    format: AudioFormat,
+) -> Option<AudioCodec> {
+    use wacore::stanza::call::{CAPABILITY_INDEX_MLOW_V1, CapabilityBit, capability_bit};
+    use wacore::voip_control::{MediaAudioCodec as AudioCodec, MediaAudioFormat as AudioFormat};
+
+    // 1:1 only, and the guard lives here rather than at the call site because the question itself
+    // does not have a call-wide answer for a group. A group offer carries the capability of the ONE
+    // device that invited us, while the engine applies the call's format to every participant: read
+    // as a decision, it decodes the whole roster under one member's grammar and every member still
+    // on negotiated MLOW goes silent. A group answers per participant instead, which the engine's
+    // own classification and probe provide.
+    if incoming.group.is_some() {
+        return None;
+    }
+    if format != AudioFormat::MLOW_16KHZ_60MS
+        && format != AudioFormat::OPUS_16KHZ_60MS
+        && format != AudioFormat::OPUS_MLOW_16KHZ_60MS
+    {
+        return None;
+    }
+    let peer = incoming
+        .media()
+        .and_then(|media| media.peer_device.as_ref())
+        .map_or(CapabilityBit::Unknown, |device| {
+            capability_bit(
+                device.capability_version,
+                device.capability(),
+                CAPABILITY_INDEX_MLOW_V1,
+            )
+        });
+    // The capability gates MLOW's CONTAINER, not the codec inside it -- the escape profile carries
+    // standard Opus in MLOW's framing, and a peer that cleared the bit cannot parse that either.
+    let local_mlow = format.rtp_profile == AudioRtpProfile::Mlow;
+    let effective_mlow = wacore::stanza::call::mlow_after_peer_capability(local_mlow, peer);
+    (effective_mlow != local_mlow).then_some(if effective_mlow {
+        AudioCodec::Mlow
+    } else {
+        AudioCodec::Opus
+    })
 }
 
 fn ensure_group_offer_media(
@@ -1747,8 +1943,11 @@ async fn place_call(
     // incoming register-before-connect ordering. The handle starts dormant; the ack-waiter task
     // attaches the media engine once the relay arrives.
     let registry = client.call_registry();
-    let mut session =
-        wacore::voip::CallSession::new_outgoing(&call_id, peer.clone(), call_creator.clone());
+    let mut session = wacore::voip_control::CallSession::new_outgoing(
+        &call_id,
+        peer.clone(),
+        call_creator.clone(),
+    );
     session.audio_format = Some(audio.config().format);
     session.is_video = video.is_some();
     // The rung device set lives on the session so an inbound <accept>/<reject> from one callee device
@@ -1776,25 +1975,24 @@ async fn place_call(
         let ended = ended.clone();
         move || ended.notify()
     });
-    let (ev_tx, ev_rx) = async_channel::bounded::<CallEvent>(CALL_EVENT_CHANNEL_CAPACITY);
+    // The handle reads the session's own public stream from birth, so a signaling event that lands
+    // while the call is still dormant (no relay yet, `open` never ran) reaches the same queue the
+    // drive loop publishes into later. No await separates this from the insert above, so the
+    // freshly registered generation is still current.
+    let media = registry
+        .media_session(&call_id, generation)
+        .ok_or(CallError::CallEndedDuringSetup)?;
+    let ev_rx = media.subscribe();
 
-    // Recv-rekey channel, created now (not at engine build) so a `<accept>` that races ahead of the
-    // relay still lands: the sender lives on the registry from this point; the receiver is parked on
-    // the pending entry and handed to the drive loop when the relay arrives (the bounded(1) buffers a
-    // pre-engine rekey). One slot is enough — the rekey is one-shot (first answerer wins).
-    let (rekey_tx, rekey_rx) = async_channel::bounded::<String>(1);
-    registry.set_rekey_sender(&call_id, generation, rekey_tx);
+    // The recv-rekey channel is session-owned (created at reservation), so an `<accept>` that
+    // races ahead of the relay is buffered there. The drive loop takes its receiver when the relay
+    // arrives; the control plane only delivers `RekeyRecv` commands.
 
     // Video plumbing exists for EVERY call (idle channels cost nothing): the signaling handler and
-    // CallHandle::start_video need the senders even when the call starts audio-only.
+    // CallHandle::start_video need the senders even when the call starts audio-only. The teardown
+    // hook and any retained rotation travel through the open context now, not a registry setter.
     let video_shared = Arc::new(VideoShared::new());
-    registry.set_video_channels(
-        &call_id,
-        generation,
-        ev_tx.clone(),
-        video_shared.ctl_tx.clone(),
-        video_teardown_hook(&video_shared),
-    );
+    let video_teardown = video_teardown_hook(&video_shared);
 
     // Park the material needed to spawn the engine once the relay arrives. Keyed by call-id.
     client
@@ -1812,10 +2010,10 @@ async fn place_call(
                 audio,
                 video,
                 video_shared: video_shared.clone(),
+                video_teardown,
                 muted: muted.clone(),
                 ended: ended.clone(),
-                ev_tx,
-                rekey_rx,
+                media: media.clone(),
             },
         );
 
@@ -1846,17 +2044,18 @@ async fn place_call(
     spawn_outgoing_relay_waiter(client, call_id.clone(), generation, offer_stanza_id, ack_rx);
 
     Ok(CallHandle {
-        call_id,
+        call_id: call_id.clone(),
         generation,
         peer_jid: peer.clone(),
         call_creator: call_creator.clone(),
-        client_registry: registry,
+        client_registry: registry.clone(),
         pending_outgoing_calls: client.voip_state().pending_outgoing_calls.clone(),
         client: client_weak(client),
         muted,
         video: video_shared,
         events: ev_rx,
         ended,
+        media: Some(media),
     })
 }
 
@@ -1872,17 +2071,6 @@ fn client_weak(client: &Client) -> std::sync::Weak<Client> {
 
 /// Time to wait for the server's `<ack type=offer>` carrying the relay before giving up.
 const OFFER_ACK_RELAY_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Three 60 ms frames absorb scheduling jitter without building a long capture delay.
-const MIC_CHANNEL_CAPACITY: usize = 3;
-
-/// Bound on the consumer-facing `CallEvent` queue. The driver posts with `try_send`, so once a slow
-/// or absent consumer lets it fill, further diagnostics drop instead of growing without bound.
-/// Lifecycle events (RelayAllocated/Failed/TimedOut) are emitted before media flows, so they are
-/// never dropped, and call teardown is driven by the `ended` flag, not this channel.
-const CALL_EVENT_CHANNEL_CAPACITY: usize = 64;
-/// Signaling controls are rare, but the queue stays bounded against a stalled media task.
-const GROUP_CONTROL_CHANNEL_CAPACITY: usize = 64;
 
 /// Returned by `CallError::Connect` when the socket drops mid-setup, before the engine is attached.
 const ERR_DISCONNECTED_DURING_SETUP: &str = "connection dropped during call setup";
@@ -1906,33 +2094,51 @@ fn spawn_outgoing_relay_waiter(
     runtime
         .clone()
         .spawn(Box::pin(async move {
+            // Three outcomes and not two. They used to collapse into one `None`, which was fine
+            // while the only consumer was a log line saying "(timeout or absent)" -- and is not,
+            // now that the reason reaches the caller: an ack that arrived carrying no relay and an
+            // ack that never arrived are different faults, and telling somebody the server's reply
+            // lacked something when there was no reply sends them looking in the wrong place.
             let relay =
                 match wacore::runtime::timeout(&*runtime, OFFER_ACK_RELAY_TIMEOUT, ack_rx).await {
                     // The ack node re-encoded as OwnedNodeRef; find its <relay> child and parse it (same
                     // path the incoming offer uses). handle_ack_response already removed our waiter entry.
                     Ok(Ok(ack)) => wacore::stanza::call::find_relay(ack.get())
-                        .and_then(wacore::voip::relay_parse::parse_relay_data),
+                        .and_then(wacore::voip_control::relay_parse::parse_relay_data)
+                        .ok_or("the server acked the offer but carried no relay"),
                     // Sender dropped (disconnect cleared the waiter map) or the timeout elapsed:
                     // handle_ack_response never ran, so our still-registered waiter entry must be dropped
                     // here or send_keepalive suppresses pings for the life of the connection.
-                    Ok(Err(_)) | Err(_) => {
+                    Ok(Err(_)) => {
                         client.response_waiters_guard().remove(&offer_stanza_id);
-                        None
+                        Err("the connection dropped before the server acked the offer")
+                    }
+                    Err(_) => {
+                        client.response_waiters_guard().remove(&offer_stanza_id);
+                        Err("the server did not ack the offer in time")
                     }
                 };
 
             match relay {
-                Some(relay) => {
+                Ok(relay) => {
                     if let Err(e) = attach_outgoing_relay(&client, &call_id, &relay).await {
                         warn!("voip: failed to attach outgoing relay for {call_id}: {e}");
-                        fail_pending_outgoing(&client, &call_id, generation);
+                        fail_pending_outgoing_with(
+                            &client,
+                            &call_id,
+                            generation,
+                            Some(e.to_string()),
+                        );
                     }
                 }
-                None => {
-                    warn!(
-                        "voip: no relay in offer ack for {call_id} (timeout or absent); call failed"
+                Err(reason) => {
+                    warn!("voip: {reason} for {call_id}; call failed");
+                    fail_pending_outgoing_with(
+                        &client,
+                        &call_id,
+                        generation,
+                        Some(reason.to_string()),
                     );
-                    fail_pending_outgoing(&client, &call_id, generation);
                 }
             }
         }))
@@ -1977,12 +2183,87 @@ fn take_pending_if_current(
     }
 }
 
+/// Put the reason a call never started onto its handle's stream.
+///
+/// Through the session's public stream (the dormant handle reads it): the entry may already be
+/// removed, but the held session still publishes. `VoipMediaSession::publish` force-sends, which
+/// is what this event needs -- a full queue must drop the oldest diagnostic, never the reason
+/// the call failed. Never blocks; a teardown cannot wait on a consumer.
+fn publish_setup_failure(media: &Arc<dyn VoipMediaSession>, reason: String) {
+    let _ = media.publish(CallEvent::MediaSetupFailed(reason));
+}
+
+/// Why a setup path stopped, which is not the same question as what went wrong.
+///
+/// [`CallEvent::MediaSetupFailed`] means the media never came up *and nobody asked for that*, so
+/// it may not be published for a call that was hung up while its media was still being built:
+/// there the person who pressed the button would be told the setup they cancelled had failed, and
+/// a front end drawing the event has nothing to tell the two apart with. The distinction is only
+/// in what is published -- every stop here is still an `Err` to whoever is awaiting it, because a
+/// cancelled setup did not produce a call either.
+enum SetupStop {
+    /// Nothing came up: no relay in the ack, an engine that would not build, a provider that
+    /// refused or never answered. Published, because this is the whole reason the event exists.
+    Failed(CallError),
+    /// The call ended underneath the setup -- a local hangup, a peer `<terminate>`, a disconnect.
+    /// Not published: whoever ended it already knows, and the ordinary end is not a failure.
+    Cancelled(CallError),
+}
+
+impl SetupStop {
+    /// The error to propagate, having published the reason if there was one to publish.
+    ///
+    /// Takes the session rather than being called beside `publish_setup_failure` so the choice is
+    /// made once, at the one exit both kinds leave through.
+    fn into_error(self, media: &Arc<dyn VoipMediaSession>) -> CallError {
+        match self {
+            Self::Failed(e) => {
+                publish_setup_failure(media, e.to_string());
+                e
+            }
+            Self::Cancelled(e) => e,
+        }
+    }
+}
+
 fn fail_pending_outgoing(client: &Client, call_id: &str, generation: u64) {
+    fail_pending_outgoing_with(client, call_id, generation, None);
+}
+
+/// The same teardown, with the reason the media path never came up.
+///
+/// `wait_ended()` resolving is all a caller used to get from this, which says a call is over and
+/// not that it never started -- so a setup failure was indistinguishable from an ordinary remote
+/// hangup, and the reason lived only in a log line. That was survivable while the failures here
+/// were a missing `<relay>` or an engine that would not build, both rare; it is not once a
+/// platform's transport provider is one of them, because a browser with no WebRTC fails *every*
+/// outgoing call this way and the person placing it deserves to be told which.
+///
+/// [`CallEvent::MediaSetupFailed`] and not `RelayAllocateFailed`, which carries a STUN error code:
+/// there is no relay answering here, and dressing "the browser has no WebRTC" as a STUN class
+/// would be a worse lie than saying nothing. Sent before `ended` is notified, because a caller
+/// racing the two would otherwise see the call end and then the explanation -- the same ordering
+/// rule the terminal events in the drive loop follow.
+///
+/// A terminal stanza (`<reject>`, `<terminate>`) passes `None`: that is a call the peer ended, not
+/// a relay that failed, and dressing it as one would be a worse lie than saying nothing.
+fn fail_pending_outgoing_with(
+    client: &Client,
+    call_id: &str,
+    generation: u64,
+    reason: Option<String>,
+) {
     let pending = take_pending_if_current(
         &client.voip_state().pending_outgoing_calls,
         call_id,
         generation,
     );
+    // Queue the reason before the removal below closes the session stream.
+    if let Some(reason) = reason
+        && let Some(pending) = pending.as_ref()
+    {
+        publish_setup_failure(&pending.media, reason);
+    }
     client
         .call_registry()
         .remove_if_current(call_id, generation);
@@ -2022,22 +2303,86 @@ pub(crate) struct PendingOutgoing {
     audio: AudioEndpoints,
     /// `.video()` endpoints for a video-from-the-start call; `None` for audio-only.
     video: Option<VideoEndpoints>,
-    /// The handle's video plumbing (created at place time so `start_video` works while dormant).
+    /// The handle's video plumbing, created at place time so `start_video` works while the call is
+    /// still dormant. Its loop halves are handed to `open` when the relay arrives.
     video_shared: Arc<VideoShared>,
+    /// Releases the local video endpoints on a terminal teardown or refused upgrade.
+    video_teardown: Box<dyn Fn() + Send + Sync>,
     muted: Arc<AtomicBool>,
     ended: Arc<EndedFlag>,
-    ev_tx: async_channel::Sender<CallEvent>,
-    /// Receiver half of the one-shot recv-rekey channel (sender lives on the registry). Handed to the
-    /// drive loop when the relay arrives so a `<accept>` that beat the relay is still applied (buffered).
-    rekey_rx: async_channel::Receiver<String>,
+    /// The reserved media session. Setup failures publish through it (it owns the public stream
+    /// the dormant handle reads), so the reason survives even when the registry entry is already
+    /// gone -- the same reason the old facade-owned sender was held here rather than re-read.
+    media: Arc<dyn VoipMediaSession>,
+}
+
+/// Take the video plumbing's loop halves and wire the out-drain, yielding the neutral channels the
+/// backend's `open` consumes. Shared by the outgoing relay-attach path and the other three.
+fn take_video_channels(
+    client: &Client,
+    video_shared: &Arc<VideoShared>,
+    ended: Arc<EndedFlag>,
+    generation: u64,
+) -> wacore::voip_control::MediaVideoChannels {
+    let (video_in, timed_video_in, control) = video_shared.take_receivers();
+    let control_sender = video_shared.ctl_tx.clone();
+    let (video_out, video_out_rx) = async_channel::bounded::<VideoFrame>(VIDEO_OUT_CHANNEL_CAP);
+    let sink_slot = video_shared.sink_slot.clone();
+    client.runtime.spawn_detached(Box::pin(async move {
+        while let Ok(mut frame) = video_out_rx.recv().await {
+            frame.generation = generation;
+            let tx = sink_slot.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if let Some(tx) = tx {
+                let _ = tx.try_send(frame);
+            }
+        }
+    }));
+    let _ = ended;
+    wacore::voip_control::MediaVideoChannels::builder()
+        .control(control)
+        .control_sender(control_sender)
+        .video_in(video_in)
+        .timed_video_in(timed_video_in)
+        .video_out(video_out)
+        .build()
 }
 
 /// The relay socket address to dial, read off a built config's already-parsed endpoint (avoids
 /// re-walking the relay block, which `CallConfig::for_*` already did into `relay_ip`/`relay_port`).
+#[cfg(all(test, feature = "voip-engine-wacore"))]
 fn socket_addr_from_config(config: &CallConfig) -> Result<SocketAddr, CallError> {
     format!("{}:{}", config.relay_ip, config.relay_port)
         .parse()
         .map_err(|_| CallError::Media("relay address is not a valid socket addr"))
+}
+
+/// Everything the platform's transport needs to reach this call's relay.
+///
+/// The two ICE fields are read off the config rather than looked up again, because the config is
+/// what the relay walk already resolved: `auth_token` is the selected endpoint's `<auth_token>`,
+/// and `integrity_key` is the relay `<key>` in the ASCII base64 form it arrived in, which is both
+/// the STUN MESSAGE-INTEGRITY key and the `a=ice-pwd` a synthetic SDP answer carries. A native
+/// dialer ignores both; a browser cannot build an `RTCPeerConnection` without them, and looking
+/// them up from the transport would mean handing every transport the call's whole `RelayData`.
+///
+/// `auth_token` and **not** `relay_token`, which is the neighbouring field and the wrong one: they
+/// are two indexed sets, selected by `auth_token_id` and `token_id` respectively, and where those
+/// differ a ufrag built from the allocate token is one the relay refuses the browser's very first
+/// connectivity check over. `token_to_ice_ufrag`'s own doc has always named its input the auth
+/// token.
+#[cfg(all(test, feature = "voip-engine-wacore"))]
+fn relay_endpoint_from_config(
+    config: &CallConfig,
+) -> Result<wacore::voip_control::transport::RelayEndpointParams, CallError> {
+    Ok(wacore::voip_control::transport::RelayEndpointParams {
+        addr: socket_addr_from_config(config)?,
+        ice_ufrag: wacore::voip_control::relay_parse::token_to_ice_ufrag(&config.auth_token),
+        // Lossy rather than fallible: the relay key is base64 text in every offer that has one, and
+        // a call is not worth failing over a byte that is not. A relay that then refuses the
+        // credential says so in the ICE check, which is a far more legible failure than "the
+        // integrity key was not UTF-8".
+        ice_pwd: String::from_utf8_lossy(&config.integrity_key).into_owned(),
+    })
 }
 
 /// Build the engine from a relay that arrived for a pending OUTGOING call and start the driver,
@@ -2073,34 +2418,72 @@ pub(crate) async fn attach_outgoing_relay(
         return Ok(true);
     }
 
-    // The pending entry is already removed above. The setup below (config/engine build + addr parse)
-    // runs BEFORE attach_engine takes over registry/ended ownership, so on any of these errors the
-    // call would otherwise leak its registry generation and a parked wait_ended() would hang forever
-    // (no pending entry left for a later hangup to drain). Build everything in a fallible block and, on
-    // any early-return error in this window, reap the generation and notify `ended` before propagating.
-    let build = (|| {
-        let mut config = CallConfig::for_outgoing(
-            call_id,
+    // The pending entry is already removed above. The backend's `open` owns the whole startup now
+    // (engine build, relay dial, drive loop), so this function only supplies the relay context and
+    // races the setup against the call's own ending. `open` returning `Err` is a real setup failure
+    // and is published; the race's losing arm is an ordinary ending and is not.
+    let build = async {
+        let key = wacore::voip_control::MediaSessionKey::builder()
+            .call_id(call_id.to_string())
+            .generation(pending.generation)
+            .build();
+        let mut spec = wacore::voip_control::MediaSessionSpec::from_relay(
+            CallDirection::Outgoing,
+            key,
             &pending.self_lid,
             &pending.peer_lid,
             pending.call_key.clone(),
             relay,
         )
-        .map_err(|e| CallError::Setup(e.to_string()))?;
-        config.audio = pending.audio.config();
-        config.enable_video = pending.video.is_some();
-        // Read the dial addr off the config before CallEngine::new consumes it (no second relay walk).
-        let addr = socket_addr_from_config(&config)?;
-        let engine = CallEngine::new(config, Box::new(RandTxIds))
-            .map_err(|e| CallError::Setup(e.to_string()))?;
-        Ok::<_, CallError>((
-            engine,
-            RelayMediaChannelFactory::new(addr, client.runtime.clone()),
-        ))
-    })();
-    let (engine, factory) = match build {
-        Ok(pair) => pair,
-        Err(e) => {
+        .map_err(|e| SetupStop::Failed(CallError::Setup(e.to_string())))?;
+        spec.audio = pending.audio.config();
+        spec.enable_video = pending.video.is_some();
+
+        let session = client
+            .call_registry()
+            .media_session(call_id, pending.generation)
+            .ok_or_else(|| {
+                SetupStop::Cancelled(CallError::Connect("call ended during relay connect".into()))
+            })?;
+        if let Some(v) = &pending.video {
+            // `.video()` from the start: attach the endpoints before the loop reads the channels.
+            pending.video_shared.attach_endpoints(
+                client,
+                &v.source,
+                &v.sink,
+                pending.ended.clone(),
+            );
+            pending.video_shared.send_control(VideoControl::Enable);
+        }
+        let video_channels = take_video_channels(
+            client,
+            &pending.video_shared,
+            pending.ended.clone(),
+            pending.generation,
+        );
+        let ctx = wacore::voip_control::MediaOpenContext::builder()
+            .audio(pending.audio.clone().into_ports())
+            .video_channels(video_channels)
+            .video_teardown(pending.video_teardown)
+            // Re-read at open time, not parked at registration: a rotation the peer announced
+            // between the offer and the relay ack must still stamp the first frames.
+            .peer_video_orientations(
+                client
+                    .call_registry()
+                    .peer_video_orientations(call_id, pending.generation)
+                    .unwrap_or_default(),
+            )
+            // The recv-rekey receiver is session-owned; `open` takes it for the drive loop.
+            .muted(pending.muted.clone())
+            .build();
+        Ok::<_, SetupStop>((session, spec, ctx))
+    }
+    .await;
+    let (session, spec, ctx) = match build {
+        Ok(triple) => triple,
+        Err(stop) => {
+            // Queue the reason before the removal below closes the session stream.
+            let e = stop.into_error(&pending.media);
             client
                 .call_registry()
                 .remove_if_current(call_id, pending.generation);
@@ -2109,24 +2492,49 @@ pub(crate) async fn attach_outgoing_relay(
         }
     };
 
-    attach_engine(
-        client,
-        call_id,
-        pending.generation,
-        FailureCleanup::Here,
-        engine,
-        &factory,
-        pending.audio,
-        pending.video,
-        pending.video_shared,
-        pending.muted,
-        pending.ended,
-        pending.ev_tx,
-        // Outgoing: hand the drive loop the recv-rekey receiver so a callee `<accept>` rekeys recv to
-        // the answering device (buffered if the accept beat this relay).
-        Some(pending.rekey_rx),
-    )
-    .await?;
+    // Race the backend's setup against the call ending: a hangup arriving now must cancel an
+    // in-flight provider without leaving a parked `wait_ended()`.
+    let backend = client.call_registry().backend();
+    let open = backend.open(spec, ctx);
+    let ending = pending.ended.wait();
+    futures::pin_mut!(open, ending);
+    let result = match futures::future::select(open, ending).await {
+        futures::future::Either::Left((result, _)) => result,
+        futures::future::Either::Right(((), _)) => {
+            client
+                .call_registry()
+                .remove_if_current(call_id, pending.generation);
+            pending.ended.notify();
+            return Err(CallError::Connect("call ended during relay connect".into()));
+        }
+    };
+    if let Err(error) = result {
+        client.call_registry().set_close_reason(
+            call_id,
+            pending.generation,
+            wacore::voip_control::MediaCloseReason::SetupFailed(error.to_string()),
+        );
+        // Queue the reason before the removal below closes the session stream.
+        publish_setup_failure(&pending.media, error.to_string());
+        client
+            .call_registry()
+            .remove_if_current(call_id, pending.generation);
+        pending.ended.notify();
+        return Err(map_setup_error(error));
+    }
+    // The open awaited the relay dial, so the call may have ended or been superseded while it
+    // waited: returning `Ok(true)` now would leave a live drive task behind a stale handle.
+    // Close what open started and report the end instead, mirroring `open_registered_media`.
+    // No removal: a superseding generation owns the entry now, and reaping it would end the
+    // wrong call.
+    if !client
+        .call_registry()
+        .is_current(call_id, pending.generation)
+    {
+        session.close(wacore::voip_control::MediaCloseReason::Local);
+        pending.ended.notify();
+        return Err(CallError::CallEndedDuringSetup);
+    }
     Ok(true)
 }
 
@@ -2134,7 +2542,7 @@ pub(crate) async fn attach_outgoing_relay(
 /// guard removes only its own generation, so setup/signaling errors cannot leak a task-less registry
 /// entry or reap a same-call-id replacement.
 struct RegisteredCall {
-    registry: Arc<wacore::voip::CallRegistry>,
+    registry: Arc<wacore::voip_control::registry::CallRegistry>,
     call_id: String,
     peer_jid: Jid,
     call_creator: Jid,
@@ -2144,17 +2552,17 @@ struct RegisteredCall {
 }
 
 impl RegisteredCall {
-    async fn new(client: &Client, session: wacore::voip::CallSession) -> Self {
+    async fn new(client: &Client, session: wacore::voip_control::CallSession) -> Self {
         Self::new_inner(client, session, false).await
     }
 
-    async fn new_group(client: &Client, session: wacore::voip::CallSession) -> Self {
+    async fn new_group(client: &Client, session: wacore::voip_control::CallSession) -> Self {
         Self::new_inner(client, session, true).await
     }
 
     async fn new_inner(
         client: &Client,
-        session: wacore::voip::CallSession,
+        session: wacore::voip_control::CallSession,
         force_group: bool,
     ) -> Self {
         let registry = client.call_registry();
@@ -2240,7 +2648,7 @@ impl Drop for RegisteredCall {
 /// superseding same-call-id offer cannot be installed in the removal-before-send window.
 struct AnswerTeardown {
     client: std::sync::Weak<Client>,
-    registry: Arc<wacore::voip::CallRegistry>,
+    registry: Arc<wacore::voip_control::registry::CallRegistry>,
     call_id: String,
     peer_jid: Jid,
     call_creator: Jid,
@@ -2252,7 +2660,7 @@ struct AnswerTeardown {
 
 struct GroupOfferTeardown {
     client: std::sync::Weak<Client>,
-    registry: Arc<wacore::voip::CallRegistry>,
+    registry: Arc<wacore::voip_control::registry::CallRegistry>,
     call_id: String,
     call_creator: Jid,
     generation: u64,
@@ -2499,64 +2907,139 @@ pub(crate) async fn send_answer_terminate(
     }
 }
 
-/// Spawn the call driver over `factory` after registering it. Generic over the relay factory so a
-/// test can inject an in-memory transport instead of the real DTLS/SCTP dialer.
-#[cfg(test)]
-async fn spawn_call(
-    client: &Client,
-    session: wacore::voip::CallSession,
-    engine: CallEngine,
-    factory: &dyn RelayTransportFactory,
-    audio: AudioEndpoints,
-    video: Option<VideoEndpoints>,
-) -> Result<CallHandle, CallError> {
-    let mut registration = RegisteredCall::new(client, session).await;
-    let result = spawn_registered_call(client, &registration, engine, factory, audio, video).await;
-    if result.is_ok() {
-        registration.disarm();
+/// Attach media to an already-registered generation by driving the backend's `open`.
+///
+/// This is the sole media startup path: the facade builds the neutral spec and opening context,
+/// hands its own video plumbing and event stream to the backend, and lets `open` own the engine
+/// and the drive loop. The `CallHandle` reads the session's stream and holds the session.
+/// Map a backend setup failure onto the call error surface: transport failures stay
+/// `CallError::Connect` (the relay never came up), everything else is `CallError::Setup`.
+fn map_setup_error(error: wacore::voip_control::MediaSetupError) -> CallError {
+    match error {
+        wacore::voip_control::MediaSetupError::Connect(reason) => CallError::Connect(reason),
+        // Unwrap one layer, never serialize the type into itself: `Backend` already carries the
+        // reason string, so formatting the whole error would stack "call setup failed: media
+        // session setup failed: ..." on every provider refusal crossing the seam twice.
+        wacore::voip_control::MediaSetupError::Backend(reason) => CallError::Setup(reason),
+        other => CallError::Setup(other.to_string()),
     }
-    result
 }
 
-/// Attach media to a generation that is already registered. Answering uses this after registering
-/// before call-key decryption; the generic spawn wrapper above uses the same path for tests.
-async fn spawn_registered_call(
+#[allow(clippy::too_many_arguments)]
+async fn open_registered_media(
     client: &Client,
     registration: &RegisteredCall,
-    engine: CallEngine,
-    factory: &dyn RelayTransportFactory,
+    mut spec: wacore::voip_control::MediaSessionSpec,
     audio: AudioEndpoints,
     video: Option<VideoEndpoints>,
+    group_epoch: Option<(u32, Vec<u8>)>,
+    initial_codec: Option<AudioCodec>,
 ) -> Result<CallHandle, CallError> {
     registration.ensure_current()?;
-    let registry = &registration.registry;
+    let registry = registration.registry.clone();
     let muted = Arc::new(AtomicBool::new(false));
-    let (ev_tx, ev_rx) = async_channel::bounded::<CallEvent>(CALL_EVENT_CHANNEL_CAPACITY);
+    // The handle reads the session's own public stream: the callee's accept-time signaling (peer
+    // video states racing the answer) lands in the same queue as the drive loop's media events.
+    let session = registry
+        .media_session(&registration.call_id, registration.generation)
+        .ok_or(CallError::CallEndedDuringSetup)?;
+    let ev_rx = session.subscribe();
     let video_shared = Arc::new(VideoShared::new());
-    registry.set_video_channels(
-        &registration.call_id,
-        registration.generation,
-        ev_tx.clone(),
-        video_shared.ctl_tx.clone(),
-        video_teardown_hook(&video_shared),
-    );
-    attach_engine(
-        client,
-        &registration.call_id,
-        registration.generation,
-        FailureCleanup::Guard,
-        engine,
-        factory,
-        audio,
-        video,
-        video_shared.clone(),
-        muted.clone(),
-        registration.ended.clone(),
-        ev_tx,
-        // Incoming (callee): no recv-rekey — the callee already keys recv on its own self LID.
-        None,
-    )
-    .await?;
+    // The handle's video plumbing is created before media exists (so a dormant handle can steer),
+    // so its loop halves are taken here and handed to `open`, which must use them.
+    let (video_in, timed_video_in, video_ctl) = video_shared.take_receivers();
+    let video_ctl_sender = video_shared.ctl_tx.clone();
+    let (video_out, video_out_rx) = async_channel::bounded::<VideoFrame>(VIDEO_OUT_CHANNEL_CAP);
+    // Drain the loop's output into whatever sink is currently attached (swappable mid-call).
+    let sink_slot = video_shared.sink_slot.clone();
+    let generation = registration.generation;
+    client.runtime.spawn_detached(Box::pin(async move {
+        while let Ok(mut frame) = video_out_rx.recv().await {
+            frame.generation = generation;
+            let tx = sink_slot.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if let Some(tx) = tx {
+                let _ = tx.try_send(frame);
+            }
+        }
+    }));
+    if let Some(v) = &video {
+        // `.video()` from the start: attach the endpoints now.
+        video_shared.attach_endpoints(client, &v.source, &v.sink, registration.ended.clone());
+        video_shared.send_control(VideoControl::Enable);
+    }
+
+    spec.audio = audio.config();
+    spec.enable_video = video.is_some();
+
+    let ctx = wacore::voip_control::MediaOpenContext::builder()
+        .audio(audio.into_ports())
+        .video_channels(
+            wacore::voip_control::MediaVideoChannels::builder()
+                .control(video_ctl)
+                .control_sender(video_ctl_sender)
+                .video_in(video_in)
+                .timed_video_in(timed_video_in)
+                .video_out(video_out)
+                .build(),
+        )
+        // Incoming, group, and call-link paths retain the offer's rotation the same way the
+        // outgoing path does; replay it at open so the first frames are stamped.
+        .peer_video_orientations(
+            registry
+                .peer_video_orientations(&registration.call_id, registration.generation)
+                .unwrap_or_default(),
+        )
+        // The handle steers this channel from dormancy, so its teardown travels with the open
+        // like the outgoing hook does. Upgrade paths replace it via `set_video_teardown`.
+        .maybe_video_teardown(video.is_some().then(|| video_teardown_hook(&video_shared)))
+        .muted(muted.clone())
+        .maybe_group_epoch(group_epoch.map(|(transaction_id, epoch)| {
+            (
+                transaction_id,
+                wacore::voip_control::MediaGroupEpoch::new(epoch),
+            )
+        }))
+        .maybe_initial_codec(initial_codec)
+        .build();
+    // Race the backend's setup against the call ending, mirroring the outgoing path: a hangup,
+    // peer terminate, or disconnect landing mid-dial drops the in-flight `open` future with it
+    // instead of holding callKey, credentials, and engine until the dial ceiling. The open future
+    // is cancellation-safe, so nothing detached survives the drop.
+    let backend = registry.backend();
+    let open = backend.open(spec, ctx);
+    let ending = registration.ended.wait();
+    futures::pin_mut!(open, ending);
+    let result = match futures::future::select(open, ending).await {
+        futures::future::Either::Left((result, _)) => result,
+        // Ended mid-setup: the loser `open` future drops here, aborting the in-flight dial.
+        // `Connect`, mirroring the outgoing race arm: the relay never came up because the call
+        // went away first, which is transport failure, not a setup bug.
+        futures::future::Either::Right(((), _)) => {
+            registry.remove_if_current(&registration.call_id, registration.generation);
+            registration.ended.notify();
+            return Err(CallError::Connect("call ended during relay connect".into()));
+        }
+    };
+    // A failed open is a setup failure, not a local hangup: record it now, or the caller's
+    // registration guard drops the entry with the `Local` default when `close` runs.
+    // The ended-race arm above is external cancellation, not a failure, so it records nothing.
+    if let Err(error) = result {
+        registry.set_close_reason(
+            &registration.call_id,
+            registration.generation,
+            wacore::voip_control::MediaCloseReason::SetupFailed(error.to_string()),
+        );
+        return Err(map_setup_error(error));
+    }
+    // The open awaited the relay dial, so the call may have ended or been superseded while it
+    // waited: returning the handle now would hand out a stale generation, and the backend would
+    // have installed its drive task after the teardown. Close what open started and report the
+    // end instead.
+    if !registry.is_current(&registration.call_id, registration.generation) {
+        session.close(wacore::voip_control::MediaCloseReason::Local);
+        return Err(CallError::CallEndedDuringSetup);
+    }
+
     Ok(CallHandle {
         call_id: registration.call_id.clone(),
         generation: registration.generation,
@@ -2569,217 +3052,8 @@ async fn spawn_registered_call(
         video: video_shared,
         events: ev_rx,
         ended: registration.ended.clone(),
+        media: Some(session),
     })
-}
-
-/// Finish an answer after the peer has received `<accept>`. The teardown guard explicitly ends a
-/// locally failed or cancelled startup, but its generation claim no-ops after peer termination or
-/// same-call-id supersession.
-async fn spawn_answered_call(
-    client: &Client,
-    registration: &mut RegisteredCall,
-    mut teardown: AnswerTeardown,
-    engine: CallEngine,
-    factory: &dyn RelayTransportFactory,
-    audio: AudioEndpoints,
-    video: Option<VideoEndpoints>,
-) -> Result<CallHandle, CallError> {
-    match spawn_registered_call(client, registration, engine, factory, audio, video).await {
-        Ok(handle) => {
-            teardown.disarm();
-            registration.disarm();
-            Ok(handle)
-        }
-        Err(error) => {
-            teardown.terminate(client).await;
-            Err(error)
-        }
-    }
-}
-
-/// Connect the relay and spawn the driver task against pre-built shared handle state (mute flag,
-/// ended flag, event sender). Shared so the outgoing relay-arrival path can drive the same
-/// already-handed-out [`CallHandle`]. The registry entry under `generation` must already exist.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum FailureCleanup {
-    /// No outer registration guard remains, so attach_engine reaps failures itself.
-    Here,
-    /// RegisteredCall/AnswerTeardown owns generation-aware cleanup.
-    Guard,
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn attach_engine(
-    client: &Client,
-    call_id: &str,
-    generation: u64,
-    failure_cleanup: FailureCleanup,
-    engine: CallEngine,
-    factory: &dyn RelayTransportFactory,
-    audio: AudioEndpoints,
-    video: Option<VideoEndpoints>,
-    video_shared: Arc<VideoShared>,
-    muted: Arc<AtomicBool>,
-    ended: Arc<EndedFlag>,
-    ev_tx: async_channel::Sender<CallEvent>,
-    // Caller-only recv-rekey receiver; `None` for an incoming call (the callee keys recv on its own
-    // self LID and never rekeys).
-    rekey_rx: Option<async_channel::Receiver<String>>,
-) -> Result<(), CallError> {
-    let (group_tx, group_rx) = async_channel::bounded(GROUP_CONTROL_CHANNEL_CAPACITY);
-    if !client.call_registry().set_group_control_sender(
-        call_id,
-        generation,
-        engine.media_warp_mi_tag_len(),
-        group_tx,
-    ) {
-        if failure_cleanup == FailureCleanup::Here {
-            client
-                .call_registry()
-                .remove_if_current(call_id, generation);
-        }
-        ended.notify();
-        return Err(CallError::Setup(
-            "group relay WARP tag length changed during media attachment".to_string(),
-        ));
-    }
-    let group_ctl = Some(group_rx);
-    // The registry entry already exists. Re-check is_connected NOW (after insert, before connect) so a
-    // disconnect that clears is_connected before abort_all can't slip through the gap between an
-    // earlier guard's load and the insert: either we inserted before abort_all (it catches us) or this
-    // sees !is_connected and the direct caller / outer registration guard cleans up. Wake
-    // wait_ended() before bailing so a parked waiter resolves.
-    if !client.is_connected() {
-        if failure_cleanup == FailureCleanup::Here {
-            client
-                .call_registry()
-                .remove_if_current(call_id, generation);
-        }
-        ended.notify();
-        return Err(CallError::Connect(ERR_DISCONNECTED_DURING_SETUP.into()));
-    }
-
-    // Connect failure leaves the call already visible (registry entry inserted before connect; for an
-    // outgoing call the PendingOutgoing was already removed by attach_outgoing_relay). Direct callers
-    // reap here; guarded callers retain the generation so answer teardown can claim it atomically.
-    // Either way, wake wait_ended() before propagating.
-    //
-    // Race the dial against the call ending. A hangup, a peer <terminate>, or a disconnect landing in
-    // this window all remove our registry entry, and its `on_terminal` hook notifies `ended` even
-    // though no media task exists yet -- so selecting on `ended` drops the in-flight connect future to
-    // abort the unwanted DTLS/SCTP dial instead of letting it run to success or the 12s timeout while
-    // wait_ended() stays parked.
-    let dial = factory.connect();
-    let (transport, relay_events) =
-        match futures::future::select(dial, std::pin::pin!(ended.wait())).await {
-            futures::future::Either::Left((Ok(pair), _)) => pair,
-            futures::future::Either::Left((Err(e), _)) => {
-                if failure_cleanup == FailureCleanup::Here {
-                    client
-                        .call_registry()
-                        .remove_if_current(call_id, generation);
-                }
-                ended.notify();
-                return Err(CallError::Connect(e.to_string()));
-            }
-            // Ended mid-dial: the loser `dial` future drops here, aborting the connect. The generation
-            // was already reaped by whoever ended us; reap defensively and stop.
-            futures::future::Either::Right(((), _dial)) => {
-                client
-                    .call_registry()
-                    .remove_if_current(call_id, generation);
-                return Err(CallError::Connect("call ended during relay connect".into()));
-            }
-        };
-
-    // Only the selected I/O pair stays open. Closed inactive channels make their driver select arms
-    // retire immediately without per-frame branching or idle tasks.
-    let (mic_rx, speaker, encoded_audio_in, encoded_audio_out, audio_feed) = match audio {
-        AudioEndpoints::Pcm { source, sink } => {
-            let (mic_tx, mic_rx) = async_channel::bounded::<Vec<i16>>(MIC_CHANNEL_CAPACITY);
-            let mute_feed = MuteFeed {
-                src: source.frames(),
-                out: mic_tx,
-                muted,
-            };
-            let feed = client.runtime.spawn(Box::pin(mute_feed.run()));
-            let (_encoded_tx, encoded_audio_in) = async_channel::bounded::<Bytes>(1);
-            let (encoded_audio_out, _encoded_rx) = async_channel::bounded::<EncodedAudioFrame>(1);
-            (
-                mic_rx,
-                sink.playout(),
-                encoded_audio_in,
-                encoded_audio_out,
-                Some(feed),
-            )
-        }
-        AudioEndpoints::Encoded { source, sink, .. } => {
-            let (_mic_tx, mic_rx) = async_channel::bounded::<Vec<i16>>(1);
-            let (speaker, _speaker_rx) = async_channel::bounded::<Vec<i16>>(1);
-            (mic_rx, speaker, source.frames(), sink.frames(), None)
-        }
-    };
-
-    // Video plumbing: the drive loop always gets the channels; the endpoints attach now (a
-    // `.video()` call) or later (an upgrade via CallHandle::start_video/accept_video).
-    let (video_in_rx, video_ctl_rx) = video_shared.take_receivers();
-    let (video_out_tx, video_out_rx) = async_channel::bounded::<VideoFrame>(VIDEO_OUT_CHANNEL_CAP);
-    // Forwarder from the drive loop to whatever sink is CURRENTLY attached (swappable mid-call).
-    // Ends when the drive loop drops its video_out sender; moved into the media task like mic_feed.
-    let sink_slot = video_shared.sink_slot.clone();
-    let video_out_feed = client.runtime.spawn(Box::pin(async move {
-        while let Ok(frame) = video_out_rx.recv().await {
-            let tx = sink_slot.lock().unwrap_or_else(|e| e.into_inner()).clone();
-            if let Some(tx) = tx {
-                // Loss tolerant, like the speaker: a stalled sink sheds frames.
-                let _ = tx.try_send(frame);
-            }
-        }
-    }));
-    if let Some(v) = &video {
-        video_shared.attach_endpoints(client, &v.source, &v.sink, ended.clone());
-        // From-start video: the engine was built with enable_video, but a same-path Enable is
-        // idempotent and keeps one code path for both entries.
-        video_shared.send_control(VideoControl::Enable);
-    }
-
-    let channels = CallChannels {
-        mic: mic_rx,
-        speaker,
-        encoded_audio_in,
-        encoded_audio_out,
-        events: ev_tx,
-        rekey: rekey_rx,
-        video_in: video_in_rx,
-        video_out: video_out_tx,
-        video_ctl: video_ctl_rx,
-        group_ctl,
-    };
-
-    let registry = client.call_registry();
-    let registry_for_task = registry.clone();
-    let cid = call_id.to_string();
-    // Build the notify-on-drop guard OUTSIDE the future and move it in. A captured value is dropped
-    // with the future even if the task is aborted before its first poll; a value `let`-bound inside
-    // the body is only constructed on poll, so it would be skipped on an abort-before-poll and leave
-    // a parked wait_ended() waiter asleep forever.
-    let ended_guard = scopeguard::guard(ended, |e| {
-        e.notify();
-    });
-    let task = client.runtime.spawn(Box::pin(async move {
-        // All are captured (moved in), so any teardown -- even an abort before the first poll --
-        // drops them: the feeds are aborted and `ended` is notified.
-        let _ended_guard = ended_guard;
-        let _audio_feed = audio_feed;
-        let _video_out_feed = video_out_feed;
-        run_call_tokio(transport, relay_events, channels, engine).await;
-        // A locally-ended call gets no <terminate>; drop our own entry so the registry doesn't grow.
-        // The call's `ring_devices` live on the session, so this also drops the sibling-dismiss
-        // tracking -- no separate map to clean up.
-        registry_for_task.remove_if_current(&cid, generation);
-    }));
-    registry.set_media_task(call_id, generation, task);
-    Ok(())
 }
 
 /// Outbound video AU backlog before the source feed back-pressures (AUs are large; keep it short).
@@ -2791,7 +3065,12 @@ const VIDEO_DEC_REQUEST: &str = "H264";
 /// `dec` WA Web advertises on an UpgradeAccept.
 const VIDEO_DEC_ACCEPT: &str = "H264,AV1";
 /// WA's native upgrade timer downgrades an unanswered request after five seconds.
-const VIDEO_UPGRADE_TIMEOUT: Duration = Duration::from_secs(5);
+///
+/// Published because it is a cross-crate contract: clients arm their own
+/// answer-wait against it (a full second under, so device-close latency
+/// cannot lose the race), and a value they cannot see is one they hardcode
+/// around instead of coordinate with.
+pub const VIDEO_UPGRADE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy)]
 enum VideoUpgradeRole {
@@ -2807,33 +3086,44 @@ pub(crate) struct VideoShared {
     ctl_tx: VideoControlSender,
     /// Outbound AUs into the drive loop; a `VideoFeed` pumps the attached source into it.
     in_tx: async_channel::Sender<Vec<u8>>,
+    /// Optional capture-timestamped AUs, kept separate so the legacy source channel remains ABI
+    /// compatible for callers that only provide a fixed cadence.
+    timed_in_tx: async_channel::Sender<VideoInput>,
     /// The CURRENTLY attached sink (swappable: upgrade attaches, downgrade clears). The
     /// out-forwarder task reads it per frame.
     sink_slot: Arc<std::sync::Mutex<Option<async_channel::Sender<VideoFrame>>>>,
     /// The live source feed, aborted on downgrade/replacement.
     feed: std::sync::Mutex<Option<wacore::runtime::AbortHandle>>,
-    /// Receiver halves parked until `attach_engine` hands them to the drive loop.
+    generation: AtomicU64,
+    /// Receiver halves parked until `backend.open` takes them into the drive loop.
     receivers: std::sync::Mutex<Option<VideoReceivers>>,
 }
 
 /// The drive-loop halves of the video channels: (outbound AUs, plane control).
-type VideoReceivers = (async_channel::Receiver<Vec<u8>>, VideoControlReceiver);
+type VideoReceivers = (
+    async_channel::Receiver<Vec<u8>>,
+    async_channel::Receiver<VideoInput>,
+    VideoControlReceiver,
+);
 
 impl VideoShared {
     fn new() -> Self {
         let (ctl_tx, ctl_rx) = video_control_channel();
         let (in_tx, in_rx) = async_channel::bounded::<Vec<u8>>(VIDEO_IN_CHANNEL_CAP);
+        let (timed_in_tx, timed_in_rx) = async_channel::bounded::<VideoInput>(VIDEO_IN_CHANNEL_CAP);
         Self {
             ctl_tx,
             in_tx,
+            timed_in_tx,
             sink_slot: Arc::new(std::sync::Mutex::new(None)),
             feed: std::sync::Mutex::new(None),
-            receivers: std::sync::Mutex::new(Some((in_rx, ctl_rx))),
+            generation: AtomicU64::new(0),
+            receivers: std::sync::Mutex::new(Some((in_rx, timed_in_rx, ctl_rx))),
         }
     }
 
-    /// The drive-loop halves. After the one real take (attach_engine), fresh closed channels are
-    /// returned defensively — their arms disable themselves in the driver.
+    /// The drive-loop halves. After the one real take (the backend's open), fresh closed
+    /// channels are returned defensively — their arms disable themselves in the driver.
     fn take_receivers(&self) -> VideoReceivers {
         self.receivers
             .lock()
@@ -2841,7 +3131,11 @@ impl VideoShared {
             .take()
             .unwrap_or_else(|| {
                 let (_ctl_tx, ctl_rx) = video_control_channel();
-                (async_channel::bounded(1).1, ctl_rx)
+                (
+                    async_channel::bounded(1).1,
+                    async_channel::bounded(1).1,
+                    ctl_rx,
+                )
             })
     }
 
@@ -2858,40 +3152,70 @@ impl VideoShared {
         sink: &Arc<dyn VideoSink>,
         ended: Arc<EndedFlag>,
     ) {
+        // Retire queued AUs before replacing the source. The driver drains legacy input and
+        // generation filtering retires timestamped frames that race with the control.
+        let timed_source = source.timed_frames();
+        let old = self.feed.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(old) = old {
+            old.abort();
+            self.send_control(if timed_source.is_some() {
+                VideoControl::Disable
+            } else {
+                VideoControl::DisableKeepLegacy
+            });
+        }
+        let generation = self
+            .generation
+            .fetch_add(1, PortableOrdering::Relaxed)
+            .wrapping_add(1);
+        self.send_control(VideoControl::SetInputGeneration(generation));
         // Queue timing before the feed can make an AU ready. The driver's control arm is biased
         // ahead of media, so the first RTP timestamp already uses the source's cadence.
         self.send_control(VideoControl::SetTimestampStride(
             source.rtp_timestamp_stride(),
         ));
         *self.sink_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(sink.playout());
-        let feed = VideoFeed {
-            source: source.clone(),
-            src: source.frames(),
-            out: self.in_tx.clone(),
-            ended,
+        let handle = if let Some(src) = timed_source {
+            let feed = TimedVideoFeed {
+                source: source.clone(),
+                src,
+                out: self.timed_in_tx.clone(),
+                ended,
+                generation,
+            };
+            client.runtime.spawn(Box::pin(feed.run()))
+        } else {
+            let feed = VideoFeed {
+                source: source.clone(),
+                src: source.frames(),
+                out: self.in_tx.clone(),
+                ended,
+            };
+            client.runtime.spawn(Box::pin(feed.run()))
         };
-        let handle = client.runtime.spawn(Box::pin(feed.run()));
-        // Abort outside the guard: edition 2024 keeps an `if let` scrutinee temporary
-        // alive for the whole matching arm, and a `Runtime` that cancels synchronously
-        // would drop the task inline and re-enter this non-reentrant mutex.
-        let old = self
-            .feed
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .replace(handle);
-        if let Some(old) = old {
-            old.abort();
-        }
+        *self.feed.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
     }
 
     /// Release the endpoints (downgrade / refused upgrade): the source feed is aborted, the sink is
     /// dropped, and the drive loop's video plane is disabled so it stops emitting/decoding video.
     fn detach_endpoints(&self) {
-        *self.sink_slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.detach_source();
+        self.detach_sink();
+    }
+
+    /// Drop the local capture feed and gate outbound video off the wire. Inbound keeps decoding,
+    /// so stopping our camera does not lose the picture we are watching.
+    fn detach_source(&self) {
         let feed = self.feed.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(feed) = feed {
             feed.abort();
         }
+        self.send_control(VideoControl::DisableOutbound);
+    }
+
+    /// Drop the attached sink and disable the whole video plane.
+    fn detach_sink(&self) {
+        *self.sink_slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
         self.send_control(VideoControl::Disable);
     }
 }
@@ -2902,8 +3226,33 @@ fn video_teardown_hook(video: &Arc<VideoShared>) -> Box<dyn Fn() + Send + Sync> 
     Box::new(move || video.detach_endpoints())
 }
 
+/// Drop a stale pending upgrade's endpoints and gate local capture off the
+/// wire, keeping the inbound sink: the direction-local abort runs while the
+/// peer is still video, so the remote picture must keep flowing. The terminal
+/// teardown hook stays armed for hangup, which still takes the whole plane.
+fn release_local_video_source(
+    pending_outgoing_calls: &std::sync::Mutex<std::collections::HashMap<String, PendingOutgoing>>,
+    video: &VideoShared,
+    call_id: &str,
+    generation: u64,
+) {
+    let pending_video = {
+        // This synchronous map is shared with non-async setup paths; its lock covers only one
+        // lookup/take and is never held across an await.
+        let mut pending = pending_outgoing_calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pending
+            .get_mut(call_id)
+            .filter(|entry| entry.generation == generation)
+            .and_then(|entry| entry.video.take())
+    };
+    drop(pending_video);
+    video.detach_source();
+}
+
 fn release_video_endpoints(
-    registry: &wacore::voip::CallRegistry,
+    registry: &wacore::voip_control::registry::CallRegistry,
     pending_outgoing_calls: &std::sync::Mutex<std::collections::HashMap<String, PendingOutgoing>>,
     video: &VideoShared,
     call_id: &str,
@@ -2936,6 +3285,53 @@ struct VideoFeed {
     ended: Arc<EndedFlag>,
 }
 
+struct TimedVideoFeed {
+    source: Arc<dyn VideoSource>,
+    src: async_channel::Receiver<TimedVideoFrame>,
+    out: async_channel::Sender<VideoInput>,
+    ended: Arc<EndedFlag>,
+    generation: u64,
+}
+
+impl TimedVideoFeed {
+    async fn run(self) {
+        use futures::FutureExt;
+        let _source = self.source;
+        loop {
+            let ended = self.ended.wait().fuse();
+            let recv = self.src.recv().fuse();
+            futures::pin_mut!(ended, recv);
+            let frame = futures::select_biased! {
+                _ = ended => break,
+                frame = recv => match frame {
+                    Ok(frame) => frame,
+                    Err(_) => break,
+                },
+            };
+            let ended = self.ended.wait().fuse();
+            let send = self
+                .out
+                .send(
+                    VideoInput::builder()
+                        .data(frame.data)
+                        .timestamp(frame.timestamp)
+                        .generation(self.generation)
+                        .build(),
+                )
+                .fuse();
+            futures::pin_mut!(ended, send);
+            futures::select_biased! {
+                _ = ended => break,
+                res = send => {
+                    if res.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl VideoFeed {
     async fn run(self) {
         use futures::FutureExt;
@@ -2953,7 +3349,7 @@ impl VideoFeed {
             };
             // Await the send (the bounded channel back-pressures a source that outruns the wire),
             // but race it against `ended` too: a dormant call whose 4-AU queue filled before
-            // `attach_engine` drained it would otherwise park here forever past teardown.
+            // the backend's open drained it would otherwise park here forever past teardown.
             let ended = self.ended.wait().fuse();
             let send = self.out.send(au).fuse();
             futures::pin_mut!(ended, send);
@@ -2972,12 +3368,14 @@ impl VideoFeed {
 /// Forwards mic frames to the engine, zeroing them while muted. Zeroing (vs. dropping) keeps the
 /// media stream fed: the engine turns an exact-zero frame into a one-byte DTX comfort-noise packet,
 /// so the relay's consent-freshness timer never sees a gap (a gap makes the peer re-negotiate).
+#[cfg(all(test, feature = "voip-engine-wacore"))]
 struct MuteFeed {
     src: async_channel::Receiver<Vec<i16>>,
     out: async_channel::Sender<Vec<i16>>,
     muted: Arc<AtomicBool>,
 }
 
+#[cfg(all(test, feature = "voip-engine-wacore"))]
 impl MuteFeed {
     async fn run(self) {
         while let Ok(mut frame) = self.src.recv().await {
@@ -3060,7 +3458,7 @@ pub struct CallHandle {
     /// offer rang; `peer_jid()` upgrades it to the answering device once an `<accept>` arrives.
     peer_jid: Jid,
     call_creator: Jid,
-    client_registry: Arc<wacore::voip::CallRegistry>,
+    client_registry: Arc<wacore::voip_control::registry::CallRegistry>,
     /// The same map `voip().call()` parked this call's relay-attach material in. A dormant outgoing
     /// hangup (engine not yet attached) must drop its entry here AND notify `ended` itself, since no
     /// engine task exists yet to fire the drop-guard.
@@ -3072,6 +3470,10 @@ pub struct CallHandle {
     video: Arc<VideoShared>,
     events: async_channel::Receiver<CallEvent>,
     ended: Arc<EndedFlag>,
+    /// The media session this call reserved. Held so counters are read through the seam
+    /// (`VoipMediaSession::stats`) rather than a parallel cell, and so the handle can steer video
+    /// without reaching into a backend.
+    media: Option<Arc<dyn VoipMediaSession>>,
 }
 
 fn ensure_group_invite_capacity(
@@ -3113,7 +3515,7 @@ fn group_invite_target_matches(
 }
 
 fn current_group_invite_offer_context(
-    registry: &wacore::voip::CallRegistry,
+    registry: &wacore::voip_control::registry::CallRegistry,
     call_id: &str,
     generation: u64,
     target: &Jid,
@@ -3174,7 +3576,7 @@ fn current_group_invite_offer_context(
     Ok((participants, session.is_video))
 }
 
-fn group_video_upgrade_allowed(group: &wacore::voip::GroupCallState) -> bool {
+fn group_video_upgrade_allowed(group: &wacore::voip_control::group::GroupCallState) -> bool {
     !group
         .waiting_room()
         .is_some_and(|room| room.media == CallLinkMedia::Audio)
@@ -3187,6 +3589,33 @@ impl CallHandle {
     /// The call-id this handle controls.
     pub fn call_id(&self) -> &str {
         &self.call_id
+    }
+
+    /// Media counters for this call: what arrived, what was discarded, and where.
+    ///
+    /// All-zero until the media plane attaches, and additive after that; sample twice and subtract
+    /// for a rate. Pair it with [`wacore::voip_control::CallEvent::AudioSilent`], which fires on its own
+    /// when packets keep arriving and none of them becomes sound: the event says a call is silent
+    /// and these counters say why.
+    ///
+    /// **Readable after the call ends**, which is the point: the drive loop publishes once more on
+    /// its way out, and this handle holds the cell itself, so the natural moment to inspect a call
+    /// that carried nothing -- right after [`wait_ended`](Self::wait_ended) -- returns the final
+    /// counters rather than zeroes.
+    pub fn media_stats(&self) -> wacore::voip_control::media_stats::CallMediaStats {
+        self.media
+            .as_ref()
+            .map(|media| media.stats())
+            .unwrap_or_default()
+    }
+
+    /// The peer captured when this handle was created.
+    ///
+    /// For a direct outgoing call, this is the builder's resolved offer target, not the device
+    /// selected by an inbound accept. It does not change after acceptance, group promotion or
+    /// teardown, and does not consult the identity cache. Use [`Self::peer_jid`] for signaling.
+    pub fn initial_peer_jid(&self) -> &Jid {
+        &self.peer_jid
     }
 
     /// The peer this call is with, as the `<terminate>` target. For an outgoing call this is the
@@ -3240,7 +3669,7 @@ impl CallHandle {
     }
 
     /// Latest transaction-ordered group state, including waiting-room and participant controls.
-    pub fn group_state(&self) -> Option<wacore::voip::GroupCallState> {
+    pub fn group_state(&self) -> Option<wacore::voip_control::group::GroupCallState> {
         self.client_registry
             .group_state_if_current(&self.call_id, self.generation)
     }
@@ -3516,6 +3945,14 @@ impl CallHandle {
             .unwrap_or(0)
     }
 
+    /// Read back this call's video negotiation state as `(self, peer)`, or `None`
+    /// when the call is gone. Diagnostics for clients driving upgrades from
+    /// outside: confirm what the negotiation holds rather than guessing it.
+    pub fn video_states(&self) -> Option<(VideoState, VideoState)> {
+        self.client_registry
+            .video_states(&self.call_id, self.generation)
+    }
+
     /// Announce this side's camera rotation to the peer, as quarter turns in
     /// `0..=3`. See `CallEntry::self_video_orientation` for what the value is
     /// and what it is not.
@@ -3632,6 +4069,23 @@ impl CallHandle {
         .await
     }
 
+    /// Ask the peer to send a video keyframe, by RTCP PLI.
+    ///
+    /// For the consumer of [`VideoSink`]: call it whenever your decoder loses or
+    /// discards an access unit, which is a loss nothing else here can see.
+    /// Throttled in the engine, so calling on every dropped unit is the intended
+    /// usage rather than an abuse -- including with
+    /// [`KeyframeUrgency::Immediate`], which shortens the interval rather than
+    /// removing it.
+    ///
+    /// Fire-and-forget: the engine decides whether a request goes out, and the
+    /// outcome is not reported back. **Does nothing in a group call** -- see
+    /// [`wacore::voip::CallEngine::request_peer_keyframe`] for why.
+    pub fn request_peer_keyframe(&self, urgency: KeyframeUrgency) {
+        self.video
+            .send_control(VideoControl::RequestPeerKeyframe(urgency));
+    }
+
     /// Send the standalone `<video state=1 dec="H264" device_orientation="0">` used after a
     /// mid-call video upgrade. Captured video-from-start callees do not need this extra stanza.
     pub async fn announce_video_enabled(&self) -> Result<(), CallError> {
@@ -3656,9 +4110,79 @@ impl CallHandle {
         Ok(())
     }
 
-    /// Stop our video direction: sends `<video state=6>` (Stopped, no marker), tears the local
-    /// video plane down, and releases the source/sink. The peer may keep sending its direction;
-    /// audio is untouched. Idempotent.
+    /// Re-ask for video while a local upgrade is outstanding: re-emit
+    /// `<video state=11 dec="H264">` without touching endpoints.
+    ///
+    /// `begin_video(Initiate)` refuses once local video is requested, so an
+    /// upgrade request the peer never answered cannot be asked again through
+    /// it. This mints a fresh epoch under the reached state and sends the
+    /// identical stanza shape; media and teardown hooks stay with the original
+    /// initiation, and a new timeout is armed for the fresh epoch (the old one
+    /// goes inert on the epoch mismatch). A failed send rolls the pending
+    /// epoch back so the previous timeout stays valid instead of stranding the
+    /// upgrade. Refuses without an outstanding local upgrade.
+    pub async fn re_request_video_upgrade(&self) -> Result<(), CallError> {
+        self.ensure_current()?;
+        // Group downgrades also reset video negotiation: take their lane first
+        // like `begin_video` does, so a racing downgrade cannot leave a stale
+        // state=11 in flight for a now-audio group.
+        let group_transition_lock = self
+            .client_registry
+            .group_transition_lock(&self.call_id, self.generation)
+            .ok_or(CallError::Media("call no longer active"))?;
+        let _group_transition_guard = group_transition_lock.lock().await;
+        self.ensure_current()?;
+        if let Some(group) = self
+            .client_registry
+            .group_state_if_current(&self.call_id, self.generation)
+            && !group_video_upgrade_allowed(&group)
+        {
+            return Err(CallError::Media(
+                "group media mode does not allow a video upgrade",
+            ));
+        }
+        let transition_lock = self
+            .client_registry
+            .video_transition_lock(&self.call_id, self.generation)
+            .ok_or(CallError::Media("call no longer active"))?;
+        let _transition_guard = transition_lock.lock().await;
+        self.ensure_current()?;
+        let client = self.upgrade_client()?;
+        let (previous, epoch) = self
+            .client_registry
+            .re_request_local_video(&self.call_id, self.generation)
+            .ok_or_else(|| {
+                self.unanswerable_upgrade_refusal("no outstanding video upgrade to re-request")
+            })?;
+        let stanza = build_video_state(&VideoStateParams {
+            call_id: &self.call_id,
+            to: &self.peer_jid(),
+            id: &client.generate_request_id(),
+            call_creator: &self.call_creator,
+            state: VideoState::UpgradeRequestV2,
+            dec: Some(VIDEO_DEC_REQUEST),
+            device_orientation: Some(self.local_video_orientation()),
+        });
+        // Arm the timeout before the send: `send_node` awaits, so a caller
+        // cancelling there would otherwise leave the fresh epoch with no live
+        // timeout. On send failure the rollback below restores the previous
+        // epoch, and this timeout then mismatches and no-ops.
+        self.spawn_video_upgrade_timeout(epoch, client.clone());
+        if let Err(e) = client.send_node(stanza).await {
+            self.client_registry.rollback_re_request(
+                &self.call_id,
+                self.generation,
+                previous,
+                epoch,
+            );
+            return Err(e.into());
+        }
+        Ok(())
+    }
+
+    /// Stop our video direction: sends `<video state=6>` (Stopped, no marker) and releases only
+    /// the local capture feed. The sink stays attached and inbound keeps decoding, so the peer's
+    /// picture keeps flowing; audio is untouched. Idempotent.
     pub async fn stop_video(&self) -> Result<(), CallError> {
         self.ensure_current()?;
         let transition_lock = self
@@ -3668,9 +4192,8 @@ impl CallHandle {
         let _transition_guard = transition_lock.lock().await;
         self.ensure_current()?;
         // Tear local media down FIRST, matching `Voip::terminate`: the app asked to stop video, so
-        // a failed signaling send must NOT leave the camera streaming. If the peer misses the
-        // Stopped it keeps sending video, but our plane is disabled so those PT-97 packets drop.
-        self.release_local_video();
+        // a failed signaling send must NOT leave the camera streaming.
+        self.stop_local_source();
         self.client_registry
             .stop_local_video(&self.call_id, self.generation);
         let client = self.upgrade_client()?;
@@ -3687,6 +4210,137 @@ impl CallHandle {
         });
         client.send_node(stanza).await?;
         Ok(())
+    }
+
+    /// Re-add our video direction inside an already-video call: re-attaches
+    /// the endpoints, enables the plane ungated, and announces
+    /// `<video state=1 dec="H264" device_orientation="0">`. Unlike
+    /// [`start_video`](Self::start_video) it opens no upgrade handshake and
+    /// arms no timeout, because the call is already video and the peer
+    /// applies a bare `Enabled` unconditionally -- this is the mute-path
+    /// re-add official clients use instead of a second `11`.
+    ///
+    /// Refuses unless our direction is stopped (or never enabled while the
+    /// peer's is) with no upgrade outstanding in either direction: a fresh
+    /// upgrade belongs on `start_video`, and a pending peer request belongs
+    /// on [`accept_video`](Self::accept_video), which answers it explicitly.
+    pub async fn resume_video<S, K>(&self, source: S, sink: K) -> Result<(), CallError>
+    where
+        S: VideoSource,
+        K: VideoSink,
+    {
+        self.ensure_current()?;
+        if source.rtp_timestamp_stride() == 0 {
+            return Err(CallError::Media(
+                "video RTP timestamp stride must be non-zero",
+            ));
+        }
+        let client = self.upgrade_client()?;
+        // Same lanes as `begin_video`: a group downgrade resets video
+        // negotiation, so eligibility, attachment, and the announce are one
+        // transition relative to it, and one video transition at a time.
+        let group_transition_lock = self
+            .client_registry
+            .group_transition_lock(&self.call_id, self.generation)
+            .ok_or(CallError::Media("call no longer active"))?;
+        let _group_transition_guard = group_transition_lock.lock().await;
+        self.ensure_current()?;
+        if let Some(group) = self
+            .client_registry
+            .group_state_if_current(&self.call_id, self.generation)
+            && !group_video_upgrade_allowed(&group)
+        {
+            return Err(CallError::Media(
+                "group media mode does not allow a video upgrade",
+            ));
+        }
+        let transition_lock = self
+            .client_registry
+            .video_transition_lock(&self.call_id, self.generation)
+            .ok_or(CallError::Media("call no longer active"))?;
+        let _transition_guard = transition_lock.lock().await;
+        self.ensure_current()?;
+        let previous = match self
+            .client_registry
+            .resume_local_video(&self.call_id, self.generation)
+        {
+            Some(previous) => previous,
+            None => return Err(self.unresumable_video_refusal()),
+        };
+        let source: Arc<dyn VideoSource> = Arc::new(source);
+        let sink: Arc<dyn VideoSink> = Arc::new(sink);
+        self.video
+            .attach_endpoints(&client, &source, &sink, self.ended.clone());
+        if !self.client_registry.set_video_teardown(
+            &self.call_id,
+            self.generation,
+            video_teardown_hook(&self.video),
+        ) {
+            self.video.detach_endpoints();
+            self.client_registry
+                .restore_self_video_state(&self.call_id, self.generation, previous);
+            return Err(CallError::Media("call no longer active"));
+        }
+        // The peer is already video, so no accept to wait for.
+        self.video.send_control(VideoControl::Enable);
+        let stanza = build_video_state(&VideoStateParams {
+            call_id: &self.call_id,
+            to: &self.peer_jid(),
+            id: &client.generate_request_id(),
+            call_creator: &self.call_creator,
+            state: VideoState::Enabled,
+            dec: Some(VIDEO_DEC_REQUEST),
+            device_orientation: Some(self.local_video_orientation()),
+        });
+        if let Err(e) = client.send_node(stanza).await {
+            self.release_local_video();
+            self.client_registry
+                .restore_self_video_state(&self.call_id, self.generation, previous);
+            return Err(e.into());
+        }
+        Ok(())
+    }
+
+    /// Why a resume just refused: point at the path that owns the current
+    /// state instead of hanging one generic message on every misuse.
+    /// Message-only (the registry owns the rule); a state that raced past
+    /// the refusal keeps the audio-call text.
+    fn unresumable_video_refusal(&self) -> CallError {
+        match self
+            .client_registry
+            .video_states(&self.call_id, self.generation)
+        {
+            Some((VideoState::Enabled, _)) => {
+                CallError::Media("own video direction is already sending")
+            }
+            Some((self_state, _)) if self_state.is_upgrade_request() => {
+                CallError::Media("video upgrade already in progress")
+            }
+            Some((_, peer_state)) if peer_state.is_upgrade_request() => {
+                CallError::Media("answer the peer's upgrade request with accept_video() instead")
+            }
+            Some(_) => CallError::Media(
+                "call has no stopped video direction to resume; use start_video() to upgrade",
+            ),
+            None => CallError::Media("call no longer active"),
+        }
+    }
+
+    fn stop_local_source(&self) {
+        let pending_video = {
+            // This synchronous map is shared with non-async setup paths; its lock covers only one
+            // lookup/take and is never held across an await.
+            let mut pending = self
+                .pending_outgoing_calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            pending
+                .get_mut(&self.call_id)
+                .filter(|entry| entry.generation == self.generation)
+                .and_then(|entry| entry.video.take())
+        };
+        drop(pending_video);
+        self.video.detach_source();
     }
 
     /// Release local codec endpoints without changing the directional signaling state.
@@ -3745,7 +4399,9 @@ impl CallHandle {
             VideoUpgradeRole::Initiate => Some(
                 self.client_registry
                     .begin_local_video_request(&self.call_id, self.generation)
-                    .ok_or(CallError::Media("video transition already in progress"))?,
+                    .ok_or_else(|| {
+                        self.unanswerable_upgrade_refusal("video transition already in progress")
+                    })?,
             ),
             VideoUpgradeRole::Accept(request) => {
                 if request.generation() != self.generation
@@ -3863,6 +4519,22 @@ impl CallHandle {
         Ok(())
     }
 
+    /// Why a local upgrade open just refused: an upgrade asked of an
+    /// already-video peer is unanswerable, so say to re-add instead of hanging
+    /// the generic message on it. Message-only (the registry owns the rule);
+    /// a state that raced past the refusal keeps `otherwise`.
+    fn unanswerable_upgrade_refusal(&self, otherwise: &'static str) -> CallError {
+        let peer_active = self
+            .client_registry
+            .video_states(&self.call_id, self.generation)
+            .is_some_and(|(_, peer)| !peer.is_inactive_for_call_mode());
+        CallError::Media(if peer_active {
+            "call already has video; use resume_video() to re-add a stopped direction"
+        } else {
+            otherwise
+        })
+    }
+
     fn spawn_video_upgrade_timeout(&self, epoch: u64, client: Arc<Client>) {
         let runtime = client.runtime.clone();
         let sleeper = runtime.clone();
@@ -3882,6 +4554,34 @@ impl CallHandle {
                     return;
                 };
                 let _transition_guard = transition_lock.lock().await;
+                // The peer stayed video while our request went unanswered: it
+                // ignored the request against its active direction, so there
+                // is no parked peer request to withdraw. Stand only our
+                // direction down with `Stopped`, which the peer applies
+                // without touching its own. The mutual kill below stays for
+                // the initial upgrade, where both directions are down and the
+                // peer may still hold our request.
+                if registry.abort_local_video_request(&call_id, generation, epoch) {
+                    release_local_video_source(&pending, &video, &call_id, generation);
+                    let Some(client) = weak_client.upgrade() else {
+                        return;
+                    };
+                    let stanza = build_video_state(&VideoStateParams {
+                        call_id: &call_id,
+                        to: &peer,
+                        id: &client.generate_request_id(),
+                        call_creator: &call_creator,
+                        state: VideoState::Stopped,
+                        dec: None,
+                        device_orientation: None,
+                    });
+                    if let Err(e) = client.send_node(stanza).await {
+                        warn!(
+                            "voip: failed to announce video upgrade abort call_id={call_id}: {e}"
+                        );
+                    }
+                    return;
+                }
                 if !registry.end_local_video_request(&call_id, generation, epoch) {
                     return;
                 }
@@ -3955,9 +4655,10 @@ impl CallHandle {
         //
         // Notify `ended` whenever we actually removed our own registration. For an attached call this
         // is redundant with the task drop-guard; it's load-bearing in the window where the relay dial
-        // (attach_engine's connect) is still in flight -- no media task exists yet to fire a drop-guard
-        // and the PendingOutgoing was already consumed, so nothing else would wake wait_ended() or stop
-        // the dial. A superseded/already-gone handle removed nothing and stays quiet.
+        // (the backend open's connect) is still in flight -- no media task exists yet to fire a
+        // drop-guard and the PendingOutgoing was already consumed, so nothing else would wake
+        // wait_ended() or stop the dial. A superseded/already-gone handle removed nothing and stays
+        // quiet.
         if removed_registry || removed_pending.is_some() {
             self.ended.notify();
         }
@@ -4028,15 +4729,16 @@ impl CallHandle {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "voip-engine-wacore", not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    #[cfg(test)]
     use bytes::Bytes;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
-    use wacore::voip::relay_parse::{RelayAddress, RelayData, RelayEndpoint};
     use wacore::voip::transport::{RelayDisconnectReason, RelayTransport, RelayTransportEvent};
+    use wacore::voip_control::relay_parse::{RelayAddress, RelayData, RelayEndpoint};
     use wacore_binary::{Jid, Server};
 
     use crate::store::persistence_manager::PersistenceManager;
@@ -4173,8 +4875,8 @@ mod tests {
             .build()
     }
 
-    fn mk_session() -> wacore::voip::CallSession {
-        wacore::voip::CallSession::new_incoming("CID-FACADE", caller(), caller())
+    fn mk_session() -> wacore::voip_control::CallSession {
+        wacore::voip_control::CallSession::new_incoming("CID-FACADE", caller(), caller())
     }
 
     fn rekey_update(client: &Client, recipients: &[Jid]) -> GroupCallUpdate {
@@ -4207,7 +4909,7 @@ mod tests {
     }
 
     fn register_group_update(client: &Client, update: &GroupCallUpdate) -> u64 {
-        let mut session = wacore::voip::CallSession::new_incoming(
+        let mut session = wacore::voip_control::CallSession::new_incoming(
             &update.call_id,
             update.call_creator.clone(),
             update.call_creator.clone(),
@@ -4232,7 +4934,7 @@ mod tests {
 
     #[tokio::test]
     async fn group_call_by_id_uses_cached_roster_and_excludes_every_local_identity() {
-        use wacore::client::context::GroupInfo;
+        use wacore::client::context::GroupRoutingInfo;
         use wacore::store::traits::{DeviceInfo, DeviceListRecord};
         use wacore::types::message::AddressingMode;
 
@@ -4250,8 +4952,8 @@ mod tests {
         for peer in [&peer_a, &peer_b] {
             client
                 .update_device_list(DeviceListRecord {
-                    user: peer.user.to_string(),
-                    devices: vec![DeviceInfo::new(0, None)],
+                    user: peer.user.as_str().into(),
+                    devices: [DeviceInfo::new(0, None)].into(),
                     timestamp: wacore::time::now_secs(),
                     phash: None,
                     raw_id: None,
@@ -4264,7 +4966,7 @@ mod tests {
             .get_group_cache()
             .insert(
                 group.clone(),
-                Arc::new(GroupInfo::new(
+                Arc::new(GroupRoutingInfo::new(
                     vec![own_pn, own_lid.to_non_ad(), peer_a.clone(), peer_b.clone()],
                     AddressingMode::Lid,
                 )),
@@ -4415,11 +5117,11 @@ mod tests {
 
     #[test]
     fn group_invite_context_revalidates_the_latest_roster_and_media() {
-        let registry = wacore::voip::CallRegistry::new();
+        let registry = wacore::voip_control::registry::CallRegistry::new();
         let creator = Jid::new("111111111111111", Server::Lid);
         let target = Jid::new("222222222222222", Server::Lid);
         let connected = Jid::new("333333333333333", Server::Lid);
-        let generation = registry.insert_group(wacore::voip::CallSession::new_outgoing(
+        let generation = registry.insert_group(wacore::voip_control::CallSession::new_outgoing(
             "GROUP-CALL",
             Jid::new("GROUP-CALL", Server::Call),
             creator.clone(),
@@ -4449,7 +5151,7 @@ mod tests {
         assert_eq!(
             registry
                 .apply_group_update_if_current(update(1, "audio", "disconnected", 32), generation,),
-            wacore::voip::GroupStateApply::Applied
+            wacore::voip_control::group::GroupStateApply::Applied
         );
         assert!(
             !current_group_invite_offer_context(
@@ -4467,7 +5169,7 @@ mod tests {
         assert_eq!(
             registry
                 .apply_group_update_if_current(update(2, "video", "disconnected", 32), generation,),
-            wacore::voip::GroupStateApply::Applied
+            wacore::voip_control::group::GroupStateApply::Applied
         );
         assert!(
             current_group_invite_offer_context(
@@ -4486,7 +5188,7 @@ mod tests {
         assert_eq!(
             registry
                 .apply_group_update_if_current(update(3, "video", "connected", 32), generation,),
-            wacore::voip::GroupStateApply::Applied
+            wacore::voip_control::group::GroupStateApply::Applied
         );
         assert!(matches!(
             current_group_invite_offer_context(
@@ -4503,7 +5205,7 @@ mod tests {
         assert_eq!(
             registry
                 .apply_group_update_if_current(update(4, "video", "disconnected", 1), generation,),
-            wacore::voip::GroupStateApply::Applied
+            wacore::voip_control::group::GroupStateApply::Applied
         );
         assert!(matches!(
             current_group_invite_offer_context(
@@ -4523,12 +5225,12 @@ mod tests {
 
     #[test]
     fn new_group_invite_context_excludes_disconnected_members() {
-        let registry = wacore::voip::CallRegistry::new();
+        let registry = wacore::voip_control::registry::CallRegistry::new();
         let creator = Jid::new("111111111111111", Server::Lid);
         let connected = Jid::new("222222222222222", Server::Lid);
         let disconnected = Jid::new("333333333333333", Server::Lid);
         let target = Jid::new("444444444444444", Server::Lid);
-        let generation = registry.insert_group(wacore::voip::CallSession::new_outgoing(
+        let generation = registry.insert_group(wacore::voip_control::CallSession::new_outgoing(
             "GROUP-CALL",
             Jid::new("GROUP-CALL", Server::Call),
             creator.clone(),
@@ -4554,7 +5256,7 @@ mod tests {
             .build();
         assert_eq!(
             registry.apply_group_update_if_current(snapshot, generation),
-            wacore::voip::GroupStateApply::Applied
+            wacore::voip_control::group::GroupStateApply::Applied
         );
 
         let (participants, video) = current_group_invite_offer_context(
@@ -4573,12 +5275,12 @@ mod tests {
 
     #[test]
     fn group_invite_context_matches_pn_and_lid_roster_aliases() {
-        let registry = wacore::voip::CallRegistry::new();
+        let registry = wacore::voip_control::registry::CallRegistry::new();
         let creator = Jid::new("111111111111111", Server::Lid);
         let connected = Jid::new("222222222222222", Server::Lid);
         let target_lid = Jid::new("333333333333333", Server::Lid);
         let target_pn = Jid::new("12025550123", Server::Pn);
-        let generation = registry.insert_group(wacore::voip::CallSession::new_outgoing(
+        let generation = registry.insert_group(wacore::voip_control::CallSession::new_outgoing(
             "GROUP-CALL",
             Jid::new("GROUP-CALL", Server::Call),
             creator.clone(),
@@ -4607,7 +5309,7 @@ mod tests {
             .build();
         assert_eq!(
             registry.apply_group_update_if_current(snapshot, generation),
-            wacore::voip::GroupStateApply::Applied
+            wacore::voip_control::group::GroupStateApply::Applied
         );
 
         let (participants, video) = current_group_invite_offer_context(
@@ -4787,13 +5489,248 @@ mod tests {
     }
 
     async fn register_answer(client: &Client, incoming: &IncomingCall) -> RegisteredCall {
-        let mut session = wacore::voip::CallSession::new_incoming(
+        let mut session = wacore::voip_control::CallSession::new_incoming(
             incoming.action.call_id(),
             incoming.from.clone(),
             incoming.action.call_creator().clone(),
         );
-        session.audio_format = Some(AudioFormat::MLOW_16KHZ_60MS);
+        session.audio_format = Some(crate::voip_control::MediaAudioFormat::MLOW_16KHZ_60MS);
         RegisteredCall::new(client, session).await
+    }
+
+    /// An `<offer>` whose `<capability>` carries the given blob, or none at all.
+    fn offer_with_capability(capability: Option<(u32, Vec<u8>)>) -> IncomingCall {
+        let peer_device = capability
+            .map(|(version, bytes)| GroupCallDevice::new(caller()).with_capability(version, bytes));
+        incoming_offer(false).with_peer_device_for_test(peer_device)
+    }
+
+    // The callee half of the #1105 fix, and the cheaper of the two: the peer's capability is in the
+    // offer, before anything is fixed, so the call simply starts on the right codec. It had no test.
+    #[test]
+    fn a_callee_starts_on_opus_when_the_offer_clears_the_mlow_bit() {
+        use wacore::stanza::call::{CAPABILITY_OFFER, CAPABILITY_STANDARD_OPUS_OFFER};
+        use wacore::voip::AudioCodec;
+
+        let outside_rollout =
+            offer_with_capability(Some((1, CAPABILITY_STANDARD_OPUS_OFFER.to_vec())));
+        assert_eq!(
+            peer_selected_codec_from_offer(&outside_rollout, AudioFormat::MLOW_16KHZ_60MS),
+            Some(AudioCodec::Opus),
+            "a peer that cannot decode MLOW must not be sent it"
+        );
+
+        let inside_rollout = offer_with_capability(Some((1, CAPABILITY_OFFER.to_vec())));
+        assert_eq!(
+            peer_selected_codec_from_offer(&inside_rollout, AudioFormat::MLOW_16KHZ_60MS),
+            None,
+            "both sides asked for MLOW, so nothing changes"
+        );
+
+        assert_eq!(
+            peer_selected_codec_from_offer(
+                &offer_with_capability(None),
+                AudioFormat::MLOW_16KHZ_60MS
+            ),
+            None,
+            "a peer that announced nothing resets nothing"
+        );
+    }
+
+    // A group offer carries the capability of the ONE device that invited us, while the engine
+    // applies the call's format to EVERY participant. Read as a call-wide decision, one member
+    // outside the MLOW rollout silences every member still inside it -- the roster decoded under a
+    // grammar only the inviter uses. A group answers per participant instead, which the engine's
+    // classification and probe already provide.
+    #[test]
+    fn a_group_offer_never_picks_the_roster_codec_from_the_inviting_device() {
+        use wacore::stanza::call::CAPABILITY_STANDARD_OPUS_OFFER;
+        use wacore::voip::AudioCodec;
+
+        let mut incoming =
+            offer_with_capability(Some((1, CAPABILITY_STANDARD_OPUS_OFFER.to_vec())));
+        assert_eq!(
+            peer_selected_codec_from_offer(&incoming, AudioFormat::MLOW_16KHZ_60MS),
+            Some(AudioCodec::Opus),
+            "the same capability decides a 1:1 call, which is the case it is for"
+        );
+
+        let group = GroupCallUpdate::builder()
+            .call_id(incoming.action.call_id().to_string())
+            .call_creator(caller())
+            .transaction_id(1)
+            .media("audio".to_string())
+            .connected_limit(32)
+            .joinable(true)
+            .av_upgradable(true)
+            .rekey_requested(false)
+            .participants(Vec::new())
+            .build();
+        incoming.group = Some(Box::new(group));
+        assert_eq!(
+            peer_selected_codec_from_offer(&incoming, AudioFormat::MLOW_16KHZ_60MS),
+            None,
+            "but one device cannot answer it for a roster"
+        );
+    }
+
+    // A consumer that deliberately configured a profile whose TIMING differs keeps it: the RFC 7587
+    // clock is not something a capability bit may silently change under a live stream.
+    #[test]
+    fn a_profile_with_its_own_timing_is_left_exactly_as_configured() {
+        use wacore::stanza::call::CAPABILITY_STANDARD_OPUS_OFFER;
+
+        let outside_rollout =
+            offer_with_capability(Some((1, CAPABILITY_STANDARD_OPUS_OFFER.to_vec())));
+        for format in [
+            AudioFormat::OPUS_RFC7587_16KHZ_60MS,
+            AudioFormat::OPUS_RFC7587_48KHZ_60MS,
+        ] {
+            assert_eq!(
+                peer_selected_codec_from_offer(&outside_rollout, format),
+                None,
+                "{format:?} has its own timing and must be preserved"
+            );
+        }
+    }
+
+    // MLOW's escape profile carries standard Opus inside MLOW's container, so what the capability
+    // gates is the container, not the codec name. A peer that cleared the bit registers native Opus
+    // on the same payload type and cannot parse the escape's rewritten TOC -- and because the two
+    // formats agree on every timing field, dropping the escape costs nothing and changes no RTP
+    // header byte. Read as "the codec is already Opus, nothing to do", the call would keep sending
+    // a container the peer does not speak.
+    #[test]
+    fn the_mlow_escape_is_dropped_for_a_peer_outside_the_rollout() {
+        use wacore::stanza::call::{CAPABILITY_OFFER, CAPABILITY_STANDARD_OPUS_OFFER};
+        use wacore::voip::AudioCodec;
+
+        let outside_rollout =
+            offer_with_capability(Some((1, CAPABILITY_STANDARD_OPUS_OFFER.to_vec())));
+        assert_eq!(
+            peer_selected_codec_from_offer(&outside_rollout, AudioFormat::OPUS_MLOW_16KHZ_60MS),
+            Some(AudioCodec::Opus),
+            "the escape has to give way to native Opus"
+        );
+        assert_eq!(
+            AudioFormat::OPUS_MLOW_16KHZ_60MS.sibling_for(AudioCodec::Opus),
+            Some(AudioFormat::OPUS_16KHZ_60MS),
+            "and the timing lets it, so nothing is re-signalled"
+        );
+
+        // A peer inside the rollout speaks the container: the escape stays.
+        let inside_rollout = offer_with_capability(Some((1, CAPABILITY_OFFER.to_vec())));
+        assert_eq!(
+            peer_selected_codec_from_offer(&inside_rollout, AudioFormat::OPUS_MLOW_16KHZ_60MS),
+            None
+        );
+    }
+
+    // Which format the ENGINE gets and which one the WIRE gets are two answers, and for an encoded
+    // endpoint they differ. Collapsing them told the engine its source was already native Opus,
+    // which is exactly the comparison it uses to decide whether the escape's TOCs need translating
+    // -- so it translated nothing and the peer got bytes it cannot parse.
+    #[test]
+    fn an_encoded_endpoint_keeps_its_own_format_while_the_wire_moves() {
+        use wacore::voip::AudioCodec;
+
+        let plan = negotiated_audio_plan(
+            AudioFormat::OPUS_MLOW_16KHZ_60MS,
+            true,
+            Some(AudioCodec::Opus),
+        )
+        .expect("a container change is answerable");
+        assert_eq!(
+            plan.engine_format,
+            AudioFormat::OPUS_MLOW_16KHZ_60MS,
+            "the engine has to keep knowing what the source emits"
+        );
+        assert_eq!(plan.wire_format, AudioFormat::OPUS_16KHZ_60MS);
+        assert_eq!(
+            plan.engine_switch,
+            Some(AudioCodec::Opus),
+            "so the move onto the wire format is a switch, applied before any packet"
+        );
+
+        // A PCM endpoint has no fixed source, so the engine is simply built on the wire format and
+        // there is nothing to switch.
+        let plan =
+            negotiated_audio_plan(AudioFormat::MLOW_16KHZ_60MS, false, Some(AudioCodec::Opus))
+                .expect("PCM follows the negotiation");
+        assert_eq!(plan.engine_format, AudioFormat::OPUS_16KHZ_60MS);
+        assert_eq!(plan.wire_format, AudioFormat::OPUS_16KHZ_60MS);
+        assert_eq!(plan.engine_switch, None);
+
+        // A codec the source cannot emit is still refused: nothing can tell it to encode MLow.
+        assert!(matches!(
+            negotiated_audio_plan(AudioFormat::OPUS_16KHZ_60MS, true, Some(AudioCodec::Mlow)),
+            Err(CallError::EncodedAudioCodecNotNegotiated { .. })
+        ));
+
+        // Nothing selected changes nothing, for either kind of endpoint.
+        for encoded in [true, false] {
+            let plan = negotiated_audio_plan(AudioFormat::MLOW_16KHZ_60MS, encoded, None)
+                .expect("no selection is not a failure");
+            assert_eq!(plan.engine_format, AudioFormat::MLOW_16KHZ_60MS);
+            assert_eq!(plan.wire_format, AudioFormat::MLOW_16KHZ_60MS);
+            assert_eq!(plan.engine_switch, None);
+        }
+    }
+
+    // A blob the peer sent that cannot be read resets everything, unlike a blob it never sent. The
+    // two are opposite directions and getting them the same way round is the shape of #1105.
+    #[test]
+    fn an_unreadable_offer_capability_downgrades_but_an_absent_one_does_not() {
+        use wacore::voip::AudioCodec;
+
+        // Present, valid `ver`, but no bitmask at all.
+        let empty = offer_with_capability(Some((1, Vec::new())));
+        assert_eq!(
+            peer_selected_codec_from_offer(&empty, AudioFormat::MLOW_16KHZ_60MS),
+            Some(AudioCodec::Opus)
+        );
+        // A version below the one index 31 belongs to answers false for everything.
+        let stale =
+            offer_with_capability(Some((0, vec![0x00, 0x05, 0xf7, 0x09, 0xe0, 0xbb, 0x13])));
+        assert_eq!(
+            peer_selected_codec_from_offer(&stale, AudioFormat::MLOW_16KHZ_60MS),
+            Some(AudioCodec::Opus)
+        );
+    }
+
+    // An `EncodedAudioSource` emits one codec for the life of the call and has nothing to be told
+    // a switch on, so a call whose negotiation lands on the other one is refused rather than
+    // answered: taking it would send MLow bytes in a profile that accepts any nonempty payload, and
+    // the peer would hear noise with nothing on this side noticing.
+    #[tokio::test]
+    async fn accept_refuses_a_fixed_encoded_codec_the_peer_did_not_negotiate() {
+        use wacore::stanza::call::CAPABILITY_STANDARD_OPUS_OFFER;
+        use wacore::voip::AudioCodec;
+
+        let client = make_client().await;
+        let outside_rollout =
+            offer_with_capability(Some((1, CAPABILITY_STANDARD_OPUS_OFFER.to_vec())));
+        let (_source_tx, source_rx) = async_channel::unbounded::<Bytes>();
+        let (sink_tx, _sink_rx) = async_channel::unbounded::<EncodedAudioFrame>();
+
+        let result = client
+            .voip()
+            .accept(&outside_rollout)
+            .encoded_audio(AudioFormat::MLOW_16KHZ_60MS, source_rx, sink_tx)
+            .start()
+            .await;
+
+        let error = result.err().expect("the mismatch must be refused");
+        assert!(
+            matches!(
+                error,
+                CallError::EncodedAudioCodecNotNegotiated {
+                    configured: AudioCodec::Mlow,
+                    selected: AudioCodec::Opus,
+                }
+            ),
+            "expected the mismatch to be refused, got {error:?}"
+        );
     }
 
     #[tokio::test]
@@ -4839,7 +5776,7 @@ mod tests {
             .build();
         group.relay = Some(sample_group_relay(1));
         incoming.group = Some(Box::new(group));
-        let mut session = wacore::voip::CallSession::new_incoming(
+        let mut session = wacore::voip_control::CallSession::new_incoming(
             incoming.action.call_id(),
             incoming.from.clone(),
             incoming.action.call_creator().clone(),
@@ -4881,7 +5818,7 @@ mod tests {
         let incoming = incoming_offer(false);
         let call_id = incoming.action.call_id().to_string();
         let group_creator = Jid::new("15550003333", Server::Lid);
-        let mut group_session = wacore::voip::CallSession::new_incoming(
+        let mut group_session = wacore::voip_control::CallSession::new_incoming(
             &call_id,
             group_creator.clone(),
             group_creator.clone(),
@@ -4941,8 +5878,11 @@ mod tests {
         update.relay = Some(sample_group_relay(1));
         incoming.group = Some(Box::new(update.clone()));
 
-        let mut stale_session =
-            wacore::voip::CallSession::new_incoming(&call_id, creator.clone(), creator.clone());
+        let mut stale_session = wacore::voip_control::CallSession::new_incoming(
+            &call_id,
+            creator.clone(),
+            creator.clone(),
+        );
         stale_session.group = Some(update.clone());
         let stale = client
             .call_registry()
@@ -4952,7 +5892,7 @@ mod tests {
         incoming.set_ringing_generation(stale);
 
         let mut replacement_session =
-            wacore::voip::CallSession::new_incoming(&call_id, creator.clone(), creator);
+            wacore::voip_control::CallSession::new_incoming(&call_id, creator.clone(), creator);
         replacement_session.group = Some(update);
         let replacement = client
             .call_registry()
@@ -4976,7 +5916,7 @@ mod tests {
 
     #[tokio::test]
     async fn active_group_invite_waits_for_its_usable_relay_snapshot() {
-        let registry = wacore::voip::CallRegistry::new();
+        let registry = wacore::voip_control::registry::CallRegistry::new();
         let call_id = "ACTIVE-GROUP-INVITE";
         let creator = caller();
         let update = GroupCallUpdate::builder()
@@ -4991,7 +5931,7 @@ mod tests {
             .participants(Vec::new())
             .build();
         let mut session =
-            wacore::voip::CallSession::new_incoming(call_id, creator.clone(), creator);
+            wacore::voip_control::CallSession::new_incoming(call_id, creator.clone(), creator);
         session.group = Some(update.clone());
         let generation = registry
             .insert_ringing_group_if_inactive(session)
@@ -5010,7 +5950,7 @@ mod tests {
         admitted.relay = Some(sample_group_relay(2));
         assert_eq!(
             registry.apply_group_update_if_current(admitted, generation),
-            wacore::voip::GroupStateApply::Applied
+            wacore::voip_control::group::GroupStateApply::Applied
         );
         assert!(
             wait.await.expect("relay update").relay.is_some(),
@@ -5415,6 +6355,7 @@ mod tests {
             video: Arc::new(VideoShared::new()),
             events: ev_rx,
             ended: Arc::new(EndedFlag::default()),
+            media: None,
         };
         assert_eq!(handle.peer_jid(), caller(), "bare peer before any accept");
         let device = caller().with_device(2);
@@ -5440,7 +6381,7 @@ mod tests {
             .build();
         assert_eq!(
             client.call_registry().apply_group_update(update),
-            wacore::voip::GroupStateApply::Applied
+            wacore::voip_control::group::GroupStateApply::Applied
         );
         assert_eq!(
             handle.peer_jid(),
@@ -5449,20 +6390,176 @@ mod tests {
         );
     }
 
-    fn engine() -> CallEngine {
-        let cfg = CallConfig::for_incoming(
-            "CID-FACADE",
+    /// A relay provider that always hands out the test's own factory, so a migrated test keeps
+    /// its in-memory (or gated, or failing) transport while driving the production startup path.
+    /// The resident backend dials through the client's installed provider; this is what plugs the
+    /// test factory into that dial without touching production.
+    #[cfg(feature = "voip-engine-wacore")]
+    struct FixedProvider {
+        factory: Arc<dyn RelayTransportFactory>,
+    }
+
+    #[cfg(feature = "voip-engine-wacore")]
+    #[async_trait]
+    impl wacore::voip_control::transport::RelayTransportProvider for FixedProvider {
+        async fn factory(
+            &self,
+            _relay: &wacore::voip_control::transport::RelayEndpointParams,
+        ) -> anyhow::Result<Arc<dyn RelayTransportFactory>> {
+            Ok(self.factory.clone())
+        }
+    }
+
+    /// Test-only bridge from the retired `spawn_call` harness to the production startup path.
+    ///
+    /// Builds the neutral spec for the shared incoming CID-FACADE call over `sample_relay()`,
+    /// installs `factory` as the client's relay provider, and
+    /// drives `open_registered_media` — the `reserve() + backend.open()` production uses. Migrated
+    /// tests keep their asserts; the media startup under them is the one that ships.
+    #[cfg(feature = "voip-engine-wacore")]
+    async fn spawn_call_via_backend(
+        client: &Client,
+        session: wacore::voip_control::CallSession,
+        factory: Arc<dyn RelayTransportFactory>,
+        audio: AudioEndpoints,
+        video: Option<VideoEndpoints>,
+    ) -> Result<CallHandle, CallError> {
+        client.set_relay_transport_provider(Arc::new(FixedProvider { factory }));
+        let mut registration = RegisteredCall::new(client, session).await;
+        let key = wacore::voip_control::MediaSessionKey::builder()
+            .call_id(registration.call_id.clone())
+            .generation(registration.generation)
+            .build();
+        let spec = wacore::voip_control::MediaSessionSpec::from_relay(
+            CallDirection::Incoming,
+            key,
             "111111111111111:0@lid",
             "222222222222222:0@lid",
             (0u8..32).collect(),
             &sample_relay(),
         )
-        .expect("config");
-        CallEngine::new(cfg, Box::new(RandTxIds)).expect("engine")
+        .expect("sample spec");
+        let result =
+            open_registered_media(client, &registration, spec, audio, video, None, None).await;
+        if result.is_ok() {
+            registration.disarm();
+        }
+        result
+    }
+
+    /// Test-only bridge from the retired `spawn_answered_call` harness to the production path.
+    ///
+    /// Mirrors `spawn_answered_call` exactly: on success both guards disarm, on failure the armed
+    /// teardown terminates the peer. A timeout that drops this future still triggers
+    /// `AnswerTeardown::drop`, which sends the terminate — the same cancel semantics as the old
+    /// harness, with media startup going through `open_registered_media`.
+    #[cfg(feature = "voip-engine-wacore")]
+    async fn spawn_answered_via_backend(
+        client: &Client,
+        registration: &mut RegisteredCall,
+        mut teardown: AnswerTeardown,
+        factory: Arc<dyn RelayTransportFactory>,
+        audio: AudioEndpoints,
+        video: Option<VideoEndpoints>,
+    ) -> Result<CallHandle, CallError> {
+        client.set_relay_transport_provider(Arc::new(FixedProvider { factory }));
+        let key = wacore::voip_control::MediaSessionKey::builder()
+            .call_id(registration.call_id.clone())
+            .generation(registration.generation)
+            .build();
+        let spec = wacore::voip_control::MediaSessionSpec::from_relay(
+            CallDirection::Incoming,
+            key,
+            "111111111111111:0@lid",
+            "222222222222222:0@lid",
+            (0u8..32).collect(),
+            &sample_relay(),
+        )
+        .expect("sample spec");
+        match open_registered_media(client, registration, spec, audio, video, None, None).await {
+            Ok(handle) => {
+                teardown.disarm();
+                registration.disarm();
+                Ok(handle)
+            }
+            Err(error) => {
+                teardown.terminate(client).await;
+                Err(error)
+            }
+        }
+    }
+
+    /// A failed `open` must record `SetupFailed` on the entry before the registration guard
+    /// drops it: without the record the entry falls back to `Local`, and a lingering handle
+    /// cannot tell a failed setup from a hangup.
+    #[tokio::test]
+    async fn failed_open_records_setup_failed_close_reason() {
+        use wacore::voip_control::fake_backend::FakeMediaBackend;
+
+        let backend = Arc::new(FakeMediaBackend::refusing());
+        let client = crate::test_utils::create_test_client_with_voip_backend(backend.clone()).await;
+        let registration = RegisteredCall::new(&client, mk_session()).await;
+        let key = wacore::voip_control::MediaSessionKey::builder()
+            .call_id(registration.call_id.clone())
+            .generation(registration.generation)
+            .build();
+        let spec = wacore::voip_control::MediaSessionSpec::from_relay(
+            CallDirection::Incoming,
+            key.clone(),
+            "111111111111111:0@lid",
+            "222222222222222:0@lid",
+            (0u8..32).collect(),
+            &sample_relay(),
+        )
+        .expect("sample spec");
+        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
+        let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
+
+        // CallHandle has no Debug, so match on the Result rather than expect_err.
+        let res = open_registered_media(
+            &client,
+            &registration,
+            spec,
+            pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(res, Err(CallError::Setup(_))),
+            "a refused open must surface a Setup error"
+        );
+        let session = backend.session(&key).expect("reserved session");
+        drop(registration);
+        assert_eq!(
+            client.call_registry().active_count(),
+            0,
+            "a refused open must not leak the registry entry"
+        );
+        assert!(
+            matches!(
+                session.record().closed,
+                Some(wacore::voip_control::MediaCloseReason::SetupFailed(_))
+            ),
+            "the session close must carry the setup failure, not Local"
+        );
+    }
+
+    /// The generation the background drive registered, so a trigger handle can target it. The
+    /// bridge registers before dialing; a trigger that lands before that would hang up nothing.
+    async fn poll_generation(client: &Arc<Client>) -> u64 {
+        for _ in 0..100 {
+            if let Some(generation) = client.call_registry().generation_of("CID-FACADE") {
+                return generation;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("the drive must register before the relay connect");
     }
 
     /// In-memory relay factory: returns a transport that records sends and a channel the test feeds
-    /// inbound events through. Lets `spawn_call` be exercised without a real DTLS/SCTP dialer.
+    /// inbound events through. Lets the backend's dial be exercised without a real DTLS/SCTP dialer.
     struct MockFactory {
         sent: Arc<Mutex<Vec<Bytes>>>,
         relay_rx: Mutex<Option<async_channel::Receiver<RelayTransportEvent>>>,
@@ -5498,7 +6595,495 @@ mod tests {
         }
     }
 
-    // spawn_call: connects via the injected factory, registers the call, emits the STUN allocate,
+    /// A provider that hands out a [`MockFactory`] and records the relay it was asked about.
+    struct RecordingProvider {
+        asked: Arc<Mutex<Vec<(SocketAddr, String, String)>>>,
+    }
+
+    #[async_trait]
+    impl wacore::voip_control::transport::RelayTransportProvider for RecordingProvider {
+        async fn factory(
+            &self,
+            relay: &wacore::voip_control::transport::RelayEndpointParams,
+        ) -> anyhow::Result<Arc<dyn RelayTransportFactory>> {
+            self.asked.lock().unwrap().push((
+                relay.addr,
+                relay.ice_ufrag.clone(),
+                relay.ice_pwd.clone(),
+            ));
+            let (_tx, rx) = async_channel::unbounded();
+            Ok(Arc::new(MockFactory {
+                sent: Arc::new(Mutex::new(Vec::new())),
+                relay_rx: Mutex::new(Some(rx)),
+                connects: Arc::new(AtomicUsize::new(0)),
+            }))
+        }
+    }
+
+    /// An installed provider is what dials, and it is told which relay to dial.
+    ///
+    /// This is the seam a page reaches a call through: with no provider a native build falls back
+    /// to its own UDP dialer, and a build without one -- wasm32, where there is no UDP socket to
+    /// open -- has nothing to fall back to. Guarding it here rather than only in the wasm CI build
+    /// is what makes "the browser transport is used" a fact this test suite can hold, since the
+    /// browser half itself cannot run in this test suite at all.
+    #[tokio::test]
+    #[cfg(feature = "voip-engine-wacore")]
+    async fn an_installed_relay_transport_provider_is_what_dials() {
+        let client = make_client().await;
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        client.set_relay_transport_provider(Arc::new(RecordingProvider {
+            asked: asked.clone(),
+        }));
+
+        let addr: SocketAddr = "203.0.113.7:3478".parse().expect("addr");
+        let endpoint = wacore::voip_control::transport::RelayEndpointParams {
+            addr,
+            ice_ufrag: "UFRAG".to_string(),
+            ice_pwd: "PWD".to_string(),
+        };
+        client
+            .relay_transport_factory(&endpoint)
+            .await
+            .expect("the installed provider answers");
+
+        assert_eq!(
+            asked.lock().unwrap().as_slice(),
+            &[(addr, "UFRAG".to_string(), "PWD".to_string())],
+            "the provider is asked about the relay the call named, with the ICE credentials a \
+             synthetic SDP answer needs -- an address alone cannot build an RTCPeerConnection"
+        );
+    }
+
+    /// The ICE credentials a browser signs its connectivity checks with are the call's own, read
+    /// off the config the relay walk already resolved. Getting either wrong is a call that dials
+    /// the right host and is refused by it, which looks like a network fault and is not one.
+    #[test]
+    fn a_relay_endpoint_carries_the_call_ice_credentials() {
+        let mut config = CallConfig::for_outgoing(
+            "CID-ICE",
+            "111:0@lid",
+            "222:0@lid",
+            vec![7u8; 32],
+            &sample_relay(),
+        )
+        .expect("config");
+        config.relay_ip = "198.51.100.9".to_string();
+        config.relay_port = 3480;
+        // Deliberately different, because the two are separate indexed sets and building the
+        // ufrag from the allocate token is a call the relay refuses at the first ICE check.
+        config.relay_token = vec![0x11, 0x22, 0x33];
+        config.auth_token = vec![0xaa, 0xbb, 0xcc];
+        config.integrity_key = b"EBESExQVFhcYGRobHB0eHw==".to_vec();
+
+        let endpoint = relay_endpoint_from_config(&config).expect("endpoint");
+        assert_eq!(endpoint.addr.to_string(), "198.51.100.9:3480");
+        assert_eq!(
+            endpoint.ice_ufrag,
+            wacore::voip_control::relay_parse::token_to_ice_ufrag(&[0xaa, 0xbb, 0xcc]),
+            "ice-ufrag is the endpoint's auth token, base64 -- not the allocate token beside it"
+        );
+        assert_ne!(
+            endpoint.ice_ufrag,
+            wacore::voip_control::relay_parse::token_to_ice_ufrag(&[0x11, 0x22, 0x33]),
+            "and never the relay token"
+        );
+        assert_eq!(
+            endpoint.ice_pwd, "EBESExQVFhcYGRobHB0eHw==",
+            "ice-pwd is the relay <key> in the ASCII form it arrived in"
+        );
+    }
+
+    /// The redaction is the point of the manual Debug: a transport implementation reaching for a
+    /// `{:?}` must not put the relay key in a log.
+    #[test]
+    fn a_relay_endpoint_does_not_print_its_password() {
+        let printed = format!(
+            "{:?}",
+            wacore::voip_control::transport::RelayEndpointParams {
+                addr: "203.0.113.7:3480".parse().expect("addr"),
+                ice_ufrag: "UFRAG".to_string(),
+                ice_pwd: "SECRET-RELAY-KEY".to_string(),
+            }
+        );
+        assert!(!printed.contains("SECRET-RELAY-KEY"), "got: {printed}");
+        assert!(printed.contains("UFRAG"), "got: {printed}");
+    }
+
+    /// A factory whose `connect()` never resolves fails the call rather than hanging it.
+    ///
+    /// The native dialer carries its own `RELAY_CONNECT_TIMEOUT`, so nothing here needed a ceiling
+    /// before a provider could supply a factory. One that an installed provider returns carries
+    /// whatever bound its author gave it -- a browser whose ICE never settles gives it none -- and
+    /// racing `ended` is not a floor on this path: an `accept()` is *awaited* by its caller, so
+    /// with no peer terminate there is nothing to notify `ended` and the await would never return.
+    #[tokio::test(start_paused = true)]
+    async fn a_factory_that_never_connects_fails_the_call() {
+        struct NeverConnects;
+        #[async_trait]
+        impl RelayTransportFactory for NeverConnects {
+            async fn connect(
+                &self,
+            ) -> anyhow::Result<(
+                Arc<dyn RelayTransport>,
+                async_channel::Receiver<RelayTransportEvent>,
+            )> {
+                std::future::pending().await
+            }
+        }
+        // Through the bridge rather than the outgoing relay waiter, deliberately: that path also
+        // carries `OFFER_ACK_RELAY_TIMEOUT`, which under a paused clock fires first and ends the
+        // call before this ceiling can. Real, and a different mechanism -- what is under test here
+        // is the one that has to hold when nothing else ends the call, which is exactly an
+        // `accept()` awaiting its own setup.
+        let client = make_client().await;
+        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
+        let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
+
+        let error = match spawn_call_via_backend(
+            &client,
+            mk_session(),
+            Arc::new(NeverConnects),
+            pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
+            None,
+        )
+        .await
+        {
+            Ok(_) => panic!("a factory that never connects must not succeed"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("did not connect within"),
+            "the ceiling has to say what it gave up on, got: {error}"
+        );
+        assert_eq!(
+            client.call_registry().active_count(),
+            0,
+            "and the generation it registered must not be left behind"
+        );
+    }
+
+    /// A hangup during relay setup cancels the provider rather than waiting it out.
+    ///
+    /// The timeout beside this is the floor and not the answer: `attach_outgoing_relay` takes the
+    /// pending entry out of the map on its way in, so a hangup arriving while the provider is
+    /// still building finds no call to end -- and without the race the task would hold the audio,
+    /// the video and the call key for the rest of `RELAY_PROVIDER_TIMEOUT`.
+    #[tokio::test]
+    async fn a_hangup_during_relay_setup_stops_waiting_for_the_provider() {
+        /// Answers only when told to, so the test owns the ordering.
+        struct Gated {
+            release: async_channel::Receiver<()>,
+        }
+        #[async_trait]
+        impl wacore::voip_control::transport::RelayTransportProvider for Gated {
+            async fn factory(
+                &self,
+                _relay: &wacore::voip_control::transport::RelayEndpointParams,
+            ) -> anyhow::Result<Arc<dyn RelayTransportFactory>> {
+                let _ = self.release.recv().await;
+                anyhow::bail!("released")
+            }
+        }
+
+        let (client, _count) = make_sending_client().await;
+        let (handle, call_id) = place_dormant_outgoing(&client).await;
+        let (_release_tx, release) = async_channel::bounded::<()>(1);
+        client.set_relay_transport_provider(Arc::new(Gated { release }));
+
+        // The attach parks in the provider; the hangup is what has to end it.
+        let attaching = {
+            let client = client.clone();
+            let call_id = call_id.clone();
+            tokio::spawn(
+                async move { attach_outgoing_relay(&client, &call_id, &sample_relay()).await },
+            )
+        };
+        tokio::task::yield_now().await;
+        handle.hangup_local().await;
+
+        let result = tokio::time::timeout(Duration::from_secs(2), attaching)
+            .await
+            .expect("the hangup must end the attach, not leave it on the provider")
+            .expect("task");
+        assert!(
+            matches!(result, Err(CallError::Connect(_))),
+            "a call that ended during setup is a Connect error, got {result:?}"
+        );
+    }
+
+    /// A hangup while the transport is being built is not a media setup failure.
+    ///
+    /// The two stop the same way -- no engine attaches and the caller gets a `Connect` error --
+    /// and they are not the same event. `MediaSetupFailed` is terminal and means the media never
+    /// came up *and nobody asked for that*, so publishing it for a call somebody just hung up
+    /// tells the person who pressed the button that the setup they cancelled had broken, with
+    /// nothing on the stream to tell them apart. `SetupStop` is that distinction; this is the arm
+    /// that must stay silent.
+    #[tokio::test]
+    async fn a_hangup_during_relay_setup_is_not_a_setup_failure() {
+        /// Never answers, so the hangup is what ends the setup.
+        struct NeverAnswers;
+        #[async_trait]
+        impl wacore::voip_control::transport::RelayTransportProvider for NeverAnswers {
+            async fn factory(
+                &self,
+                _relay: &wacore::voip_control::transport::RelayEndpointParams,
+            ) -> anyhow::Result<Arc<dyn RelayTransportFactory>> {
+                std::future::pending().await
+            }
+        }
+
+        let (client, _count) = make_sending_client().await;
+        let (handle, call_id) = place_dormant_outgoing(&client).await;
+        client.set_relay_transport_provider(Arc::new(NeverAnswers));
+
+        let attaching = {
+            let client = client.clone();
+            let call_id = call_id.clone();
+            tokio::spawn(
+                async move { attach_outgoing_relay(&client, &call_id, &sample_relay()).await },
+            )
+        };
+        tokio::task::yield_now().await;
+        handle.hangup_local().await;
+
+        let result = tokio::time::timeout(Duration::from_secs(2), attaching)
+            .await
+            .expect("the hangup must end the attach")
+            .expect("task");
+        assert!(
+            matches!(result, Err(CallError::Connect(_))),
+            "a call that ended during setup is still a Connect error, got {result:?}"
+        );
+
+        // Whatever the stream carries, none of it may claim the media setup failed.
+        while let Ok(event) = handle.events().try_recv() {
+            assert!(
+                !matches!(event, CallEvent::MediaSetupFailed(_)),
+                "a hangup published a setup failure: {event:?}"
+            );
+        }
+    }
+
+    /// A dial that fails reaches a dormant outgoing handle, rather than only its caller.
+    ///
+    /// `attach_outgoing_relay` removes the `PendingOutgoing` on its way in, so by the time the
+    /// backend's `open` gives up on the dial there is no pending entry left for the relay
+    /// waiter's `fail_pending_outgoing_with` to publish through. The held session still
+    /// publishes, so the reason is said on the handle's own stream or nowhere.
+    ///
+    /// Through a `connect()` that refuses rather than one that stalls, deliberately. The stalling
+    /// version tests `RELAY_DIAL_CEILING` and cannot be written here: under a paused clock this
+    /// path carries a shorter timer of its own, which fires first, ends the call, and sends the
+    /// dial into its *cancelled* arm -- so the test would pass or fail on a mechanism it is not
+    /// about. The ceiling has its own test through the bridge
+    /// (`a_factory_that_never_connects_fails_the_call`); what is under test here is the
+    /// publication, and a refusing dial reaches the same exit with no clock involved.
+    #[tokio::test]
+    async fn a_failed_dial_reaches_a_dormant_handle() {
+        struct RefusesToConnect;
+        #[async_trait]
+        impl RelayTransportFactory for RefusesToConnect {
+            async fn connect(
+                &self,
+            ) -> anyhow::Result<(
+                Arc<dyn RelayTransport>,
+                async_channel::Receiver<RelayTransportEvent>,
+            )> {
+                anyhow::bail!("ICE gathering produced no candidates")
+            }
+        }
+        /// Hands back a factory promptly; it is the dial behind it that refuses.
+        struct Hands;
+        #[async_trait]
+        impl wacore::voip_control::transport::RelayTransportProvider for Hands {
+            async fn factory(
+                &self,
+                _relay: &wacore::voip_control::transport::RelayEndpointParams,
+            ) -> anyhow::Result<Arc<dyn RelayTransportFactory>> {
+                Ok(Arc::new(RefusesToConnect))
+            }
+        }
+
+        let (client, _count) = make_sending_client().await;
+        let (handle, call_id) = place_dormant_outgoing(&client).await;
+        client.set_relay_transport_provider(Arc::new(Hands));
+
+        let res = attach_outgoing_relay(&client, &call_id, &sample_relay()).await;
+        assert!(
+            matches!(res, Err(CallError::Connect(_))),
+            "a dial that refuses must fail the attach, got {res:?}"
+        );
+
+        let event = tokio::time::timeout(Duration::from_secs(2), handle.events().recv())
+            .await
+            .expect("the dial's reason must reach the handle, not only its caller")
+            .expect("the event stream must carry it before it closes");
+        match event {
+            CallEvent::MediaSetupFailed(reason) => assert!(
+                reason.contains("ICE gathering produced no candidates"),
+                "the dial's own reason has to survive to the caller, got: {reason}"
+            ),
+            other => panic!("expected MediaSetupFailed, got {other:?}"),
+        }
+
+        tokio::time::timeout(Duration::from_secs(2), handle.wait_ended())
+            .await
+            .expect("and the call must still end rather than hang");
+    }
+
+    /// A peer `<terminate>` cancels the provider await on a call that is already registered.
+    ///
+    /// `RELAY_PROVIDER_TIMEOUT` is the floor and not the answer here. `accept()` and the group
+    /// starts are *awaited* by their callers, so a wait that watched only the ceiling would be
+    /// the caller's wait too — up to fifteen seconds holding the engine, the audio endpoints and
+    /// the call key for a call the peer has already hung up. The production open races the
+    /// provider await against the registration's `ended` flag, so the terminate ends it.
+    ///
+    /// On a real clock deliberately: under `start_paused` the fifteen-second ceiling
+    /// auto-advances and fires, so the test would pass without the race and prove nothing. Two
+    /// seconds is far inside it, so only the cancellation can satisfy this.
+    #[tokio::test]
+    async fn a_peer_terminate_cancels_a_registered_call_s_provider_await() {
+        struct NeverAnswers;
+        #[async_trait]
+        impl wacore::voip_control::transport::RelayTransportProvider for NeverAnswers {
+            async fn factory(
+                &self,
+                _relay: &wacore::voip_control::transport::RelayEndpointParams,
+            ) -> anyhow::Result<Arc<dyn RelayTransportFactory>> {
+                std::future::pending().await
+            }
+        }
+
+        let (client, _sent) = make_sending_client().await;
+        let incoming = incoming_offer(false);
+        let registration = register_answer(&client, &incoming).await;
+        client.set_relay_transport_provider(Arc::new(NeverAnswers));
+        // Drive the production open: it parks inside the provider's factory await, and the
+        // peer terminate ends it through the open-vs-ended race.
+        let key = wacore::voip_control::MediaSessionKey::builder()
+            .call_id(incoming.action.call_id().to_string())
+            .generation(registration.generation)
+            .build();
+        let spec = wacore::voip_control::MediaSessionSpec::from_relay(
+            CallDirection::Incoming,
+            key,
+            "111111111111111:0@lid",
+            "222222222222222:0@lid",
+            (0u8..32).collect(),
+            &sample_relay(),
+        )
+        .expect("sample spec");
+        let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
+        let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
+        let drive = open_registered_media(
+            &client,
+            &registration,
+            spec,
+            pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
+            None,
+            None,
+            None,
+        );
+        let end_peer = async {
+            tokio::task::yield_now().await;
+            terminate_call(&client, incoming.action.call_id());
+        };
+
+        let (result, ()) = tokio::time::timeout(
+            Duration::from_secs(2),
+            futures::future::join(drive, end_peer),
+        )
+        .await
+        .expect("the peer's terminate must end the await, not leave it on the provider");
+
+        let error = match result {
+            Ok(_) => panic!("a provider that never answers must not resolve"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("call ended"),
+            "the reason has to name the ending rather than the ceiling, got: {error}"
+        );
+    }
+
+    /// A provider that never answers fails the call rather than parking its setup forever.
+    ///
+    /// The await this bounds is new: the native dialer it replaced was a synchronous constructor,
+    /// so nothing on the setup path could stall here. An installed provider is somebody else's I/O,
+    /// and on the outgoing path the pending entry has already been taken out of the map by the time
+    /// it is awaited -- so a hangup can no longer find the call to end it, and `wait_ended()` would
+    /// wait on the provider rather than on the call.
+    #[tokio::test(start_paused = true)]
+    #[cfg(feature = "voip-engine-wacore")]
+    async fn a_provider_that_never_answers_does_not_park_the_call() {
+        struct NeverAnswers;
+        #[async_trait]
+        impl wacore::voip_control::transport::RelayTransportProvider for NeverAnswers {
+            async fn factory(
+                &self,
+                _relay: &wacore::voip_control::transport::RelayEndpointParams,
+            ) -> anyhow::Result<Arc<dyn RelayTransportFactory>> {
+                std::future::pending().await
+            }
+        }
+
+        let client = make_client().await;
+        client.set_relay_transport_provider(Arc::new(NeverAnswers));
+        let endpoint = wacore::voip_control::transport::RelayEndpointParams {
+            addr: "203.0.113.7:3478".parse().expect("addr"),
+            ice_ufrag: String::new(),
+            ice_pwd: String::new(),
+        };
+
+        let error = match client.relay_transport_factory(&endpoint).await {
+            Ok(_) => panic!("a provider that never answers must not resolve"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("did not answer"),
+            "the timeout has to say what it gave up on, got: {error}"
+        );
+    }
+
+    /// A provider that refuses fails the call with its reason, rather than falling back to a dialer
+    /// the platform may not have. A browser with no `RTCPeerConnection` is exactly this case, and
+    /// the reason is the only thing a person ever sees of it.
+    #[tokio::test]
+    #[cfg(feature = "voip-engine-wacore")]
+    async fn a_refusing_provider_fails_the_call_with_its_reason() {
+        struct Refuses;
+        #[async_trait]
+        impl wacore::voip_control::transport::RelayTransportProvider for Refuses {
+            async fn factory(
+                &self,
+                _relay: &wacore::voip_control::transport::RelayEndpointParams,
+            ) -> anyhow::Result<Arc<dyn RelayTransportFactory>> {
+                anyhow::bail!("this browser has no WebRTC")
+            }
+        }
+
+        let client = make_client().await;
+        client.set_relay_transport_provider(Arc::new(Refuses));
+        let endpoint = wacore::voip_control::transport::RelayEndpointParams {
+            addr: "203.0.113.7:3478".parse().expect("addr"),
+            ice_ufrag: String::new(),
+            ice_pwd: String::new(),
+        };
+        // `expect_err` wants the Ok side to be Debug, and `dyn RelayTransportFactory` is not.
+        let error = match client.relay_transport_factory(&endpoint).await {
+            Ok(_) => panic!("a refusing provider must not fall through to the native dialer"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("this browser has no WebRTC"),
+            "the provider's own reason has to survive to the caller, got: {error}"
+        );
+    }
+
+    // The bridge: connects via the injected factory, registers the call, emits the STUN allocate,
     // and tears down (registry empties, handle.wait_ended resolves) when the relay disconnects.
     #[tokio::test]
     async fn spawn_call_registers_drives_and_tears_down() {
@@ -5514,11 +7099,10 @@ mod tests {
         let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
         let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
 
-        let handle = spawn_call(
+        let handle = spawn_call_via_backend(
             &client,
             mk_session(),
-            engine(),
-            &factory,
+            Arc::new(factory),
             pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
             None,
         )
@@ -5577,14 +7161,14 @@ mod tests {
         let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
         let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
 
-        let mut session = wacore::voip::CallSession::new_outgoing("CID-FACADE", caller(), caller());
+        let mut session =
+            wacore::voip_control::CallSession::new_outgoing("CID-FACADE", caller(), caller());
         session.ring_devices = vec![caller().with_device(1), caller().with_device(2)];
 
-        let handle = spawn_call(
+        let handle = spawn_call_via_backend(
             &client,
             session,
-            engine(),
-            &factory,
+            Arc::new(factory),
             pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
             None,
         )
@@ -5632,11 +7216,10 @@ mod tests {
         };
         let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
         let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
-        let handle = spawn_call(
+        let handle = spawn_call_via_backend(
             &client,
             mk_session(),
-            engine(),
-            &factory,
+            Arc::new(factory),
             pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
             None,
         )
@@ -5667,7 +7250,65 @@ mod tests {
             video: Arc::new(VideoShared::new()),
             events: ev_rx,
             ended: Arc::new(EndedFlag::default()),
+            media: None,
         }
+    }
+
+    // The counters of a call that carried nothing are the ones worth reading, and the natural moment
+    // to read them is right after `wait_ended()` -- by which point the registry entry is already
+    // gone. A handle that looked its stats up by call id answered that question with zeroes.
+    #[tokio::test]
+    async fn media_stats_survive_the_end_of_the_call() {
+        use wacore::voip_control::fake_backend::FakeMediaBackend;
+        let backend = Arc::new(FakeMediaBackend::new());
+        let client = crate::test_utils::create_test_client_with_voip_backend(backend.clone()).await;
+        client.set_connected_for_test(true);
+        let generation = client.call_registry().insert(mk_session());
+        let (_ev_tx, ev_rx) = async_channel::unbounded::<CallEvent>();
+        let handle = CallHandle {
+            call_id: "CID-FACADE".into(),
+            generation,
+            peer_jid: caller(),
+            call_creator: caller(),
+            client_registry: client.call_registry(),
+            pending_outgoing_calls: client.voip_state().pending_outgoing_calls.clone(),
+            client: std::sync::Weak::new(),
+            muted: Arc::new(AtomicBool::new(false)),
+            video: Arc::new(VideoShared::new()),
+            events: ev_rx,
+            ended: Arc::new(EndedFlag::default()),
+            media: client
+                .call_registry()
+                .media_session("CID-FACADE", generation),
+        };
+        let session = backend
+            .session(
+                &wacore::voip_control::MediaSessionKey::builder()
+                    .call_id("CID-FACADE".into())
+                    .generation(generation)
+                    .build(),
+            )
+            .expect("the fake backend reserved this call's session");
+        // What the drive loop publishes on its way out: a call that heard nothing and said why.
+        assert_eq!(
+            handle.media_stats(),
+            wacore::voip_control::media_stats::CallMediaStats::default()
+        );
+        session.set_stats(
+            wacore::voip_control::MediaStats::builder()
+                .rtp_received(120)
+                .audio_frames_without_decoder(120)
+                .build(),
+        );
+        client
+            .call_registry()
+            .remove_if_current("CID-FACADE", generation);
+        let stats = handle.media_stats();
+        assert_eq!(
+            (stats.rtp_received, stats.audio_frames_without_decoder),
+            (120, 120),
+            "the final counters must outlive the registry entry, read through the seam"
+        );
     }
 
     // The reported symptom: ending a call from the handle used to be local-only, so the peer kept
@@ -5733,7 +7374,7 @@ mod tests {
             .build();
         assert_eq!(
             client.call_registry().apply_group_update(update),
-            wacore::voip::GroupStateApply::Applied
+            wacore::voip_control::group::GroupStateApply::Applied
         );
     }
 
@@ -5782,7 +7423,7 @@ mod tests {
     async fn muting_a_direct_call_announces_to_the_answering_device() {
         let (client, sends) = make_sending_client().await;
         let registry = client.call_registry();
-        let generation = registry.insert(wacore::voip::CallSession::new_outgoing(
+        let generation = registry.insert(wacore::voip_control::CallSession::new_outgoing(
             "CID-FACADE",
             caller(),
             caller(),
@@ -5818,7 +7459,7 @@ mod tests {
         let (transport, entered, _release) = gated_send_transport(0, false);
         install_noise_transport(&client, transport).await;
         let registry = client.call_registry();
-        let generation = registry.insert(wacore::voip::CallSession::new_outgoing(
+        let generation = registry.insert(wacore::voip_control::CallSession::new_outgoing(
             "CID-FACADE",
             caller(),
             caller(),
@@ -5847,7 +7488,7 @@ mod tests {
     async fn an_announced_unmute_opens_the_microphone() {
         let (client, sends) = make_sending_client().await;
         let registry = client.call_registry();
-        let generation = registry.insert(wacore::voip::CallSession::new_outgoing(
+        let generation = registry.insert(wacore::voip_control::CallSession::new_outgoing(
             "CID-FACADE",
             caller(),
             caller(),
@@ -5879,7 +7520,7 @@ mod tests {
     async fn cancelling_a_mute_at_the_lane_leaves_both_sides_on_the_old_state() {
         let (client, sends) = make_sending_client().await;
         let registry = client.call_registry();
-        let generation = registry.insert(wacore::voip::CallSession::new_outgoing(
+        let generation = registry.insert(wacore::voip_control::CallSession::new_outgoing(
             "CID-FACADE",
             caller(),
             caller(),
@@ -5928,7 +7569,7 @@ mod tests {
         ] {
             let (client, sends) = make_sending_client().await;
             let mut session =
-                wacore::voip::CallSession::new_outgoing("CID-FACADE", caller(), caller());
+                wacore::voip_control::CallSession::new_outgoing("CID-FACADE", caller(), caller());
             session.ring_devices = ring_devices;
             let generation = client.call_registry().insert(session);
             let handle = registry_handle(&client, generation);
@@ -5949,13 +7590,14 @@ mod tests {
     async fn muting_an_answered_incoming_call_announces_to_the_caller_device() {
         let (client, sends) = make_sending_client().await;
         let device = caller().with_device(5);
-        let generation = client
-            .call_registry()
-            .insert(wacore::voip::CallSession::new_incoming(
-                "CID-FACADE",
-                device.clone(),
-                caller(),
-            ));
+        let generation =
+            client
+                .call_registry()
+                .insert(wacore::voip_control::CallSession::new_incoming(
+                    "CID-FACADE",
+                    device.clone(),
+                    caller(),
+                ));
         let handle = registry_handle(&client, generation);
 
         let waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
@@ -5984,7 +7626,8 @@ mod tests {
     async fn partly_delivered_terminate_reports_what_reached_the_wire() {
         // The second send fails, so the first device is told and the second is not.
         let (client, sends) = make_sending_client_with_failure_after(Some(1)).await;
-        let mut session = wacore::voip::CallSession::new_outgoing("CID-FACADE", caller(), caller());
+        let mut session =
+            wacore::voip_control::CallSession::new_outgoing("CID-FACADE", caller(), caller());
         session.ring_devices = vec![caller().with_device(1), caller().with_device(2)];
         let generation = client.call_registry().insert(session);
         let handle = registry_handle(&client, generation);
@@ -6149,7 +7792,7 @@ mod tests {
             .build();
         assert_eq!(
             registry.apply_group_update(update),
-            wacore::voip::GroupStateApply::Applied
+            wacore::voip_control::group::GroupStateApply::Applied
         );
 
         let waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
@@ -6268,7 +7911,8 @@ mod tests {
         let (client, sends) = make_sending_client().await;
         let first = caller().with_device(1);
         let second = caller().with_device(2);
-        let mut session = wacore::voip::CallSession::new_outgoing("CID-FACADE", caller(), caller());
+        let mut session =
+            wacore::voip_control::CallSession::new_outgoing("CID-FACADE", caller(), caller());
         session.ring_devices = vec![first.clone(), second.clone()];
         let generation = client.call_registry().insert(session);
         let handle = registry_handle(&client, generation);
@@ -6449,11 +8093,10 @@ mod tests {
         };
 
         let (f1, mic1, spk1) = spawn(&client);
-        let stale = spawn_call(
+        let stale = spawn_call_via_backend(
             &client,
             mk_session(),
-            engine(),
-            &f1,
+            Arc::new(f1),
             pcm_audio(mic1, spk1),
             None,
         )
@@ -6461,11 +8104,10 @@ mod tests {
         .expect("first spawn_call");
         // A same-call-id re-offer replaces the first (new generation, aborts its task).
         let (f2, mic2, spk2) = spawn(&client);
-        let live = spawn_call(
+        let live = spawn_call_via_backend(
             &client,
             mk_session(),
-            engine(),
-            &f2,
+            Arc::new(f2),
             pcm_audio(mic2, spk2),
             None,
         )
@@ -6523,22 +8165,20 @@ mod tests {
         };
 
         let (f1, mic1, spk1) = spawn(&client);
-        let stale = spawn_call(
+        let stale = spawn_call_via_backend(
             &client,
             mk_session(),
-            engine(),
-            &f1,
+            Arc::new(f1),
             pcm_audio(mic1, spk1),
             None,
         )
         .await
         .expect("first spawn_call");
         let (f2, mic2, spk2) = spawn(&client);
-        let _live = spawn_call(
+        let _live = spawn_call_via_backend(
             &client,
             mk_session(),
-            engine(),
-            &f2,
+            Arc::new(f2),
             pcm_audio(mic2, spk2),
             None,
         )
@@ -6567,11 +8207,10 @@ mod tests {
         let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
         let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
         let handle = Arc::new(
-            spawn_call(
+            spawn_call_via_backend(
                 &client,
                 mk_session(),
-                engine(),
-                &factory,
+                Arc::new(factory),
                 pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
                 None,
             )
@@ -7098,7 +8737,7 @@ mod tests {
         seed_peer_session(&client, &recipient).await;
         let update = rekey_update(&client, &[recipient]);
         let stale_generation = register_group_update(&client, &update);
-        let mut replacement = wacore::voip::CallSession::new_incoming(
+        let mut replacement = wacore::voip_control::CallSession::new_incoming(
             &update.call_id,
             update.call_creator.clone(),
             update.call_creator.clone(),
@@ -7200,7 +8839,7 @@ mod tests {
             "the failed generation is claimed before its terminal send"
         );
 
-        let mut replacement_session = wacore::voip::CallSession::new_incoming(
+        let mut replacement_session = wacore::voip_control::CallSession::new_incoming(
             &update.call_id,
             update.call_creator.clone(),
             update.call_creator.clone(),
@@ -7248,7 +8887,7 @@ mod tests {
             .expect("second rekey send must block")
             .expect("send gate");
         let replacement_generation = {
-            let mut replacement = wacore::voip::CallSession::new_incoming(
+            let mut replacement = wacore::voip_control::CallSession::new_incoming(
                 &update.call_id,
                 update.call_creator.clone(),
                 update.call_creator.clone(),
@@ -7311,7 +8950,7 @@ mod tests {
                 .call_registry()
                 .snapshot(handle.call_id())
                 .and_then(|session| session.audio_format),
-            Some(AudioFormat::OPUS_16KHZ_60MS)
+            Some(wacore::voip_control::MediaAudioFormat::OPUS_16KHZ_60MS)
         );
     }
 
@@ -7659,13 +9298,13 @@ mod tests {
     }
 
     // Finding 1: the call is registered BEFORE the relay connect().await. If cleanup_connection_state
-    // (abort_all) runs during that connect gap, the entry is gone by the time connect returns, so
-    // set_media_task aborts the just-spawned media task immediately. The call must not survive as a
-    // stale entry, and wait_ended() must resolve (the aborted task's drop-guard fires `ended`).
+    // (abort_all) runs during that connect gap, the drive's ended race fires off the entry removal
+    // and production answers the setup with an error rather than a dead handle: the call must not
+    // survive as a stale entry, and the end must still be observable.
     #[tokio::test]
     async fn cleanup_during_connect_gap_aborts_the_spawned_task() {
         let client = make_client().await;
-        let (gate_tx, gate_rx) = async_channel::bounded::<()>(1);
+        let (_gate_tx, gate_rx) = async_channel::bounded::<()>(1);
         let (_relay_tx, relay_rx) = async_channel::unbounded();
         let factory = GatedFactory {
             gate: gate_rx,
@@ -7675,15 +9314,14 @@ mod tests {
         let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
         let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
 
-        // spawn_call registers the entry, then parks inside the gated connect().
-        let spawn = tokio::spawn({
+        // The bridge registers the entry, then the production open parks inside the gated connect().
+        let drive = tokio::spawn({
             let client = client.clone();
             async move {
-                spawn_call(
+                spawn_call_via_backend(
                     &client,
                     mk_session(),
-                    engine(),
-                    &factory,
+                    Arc::new(factory),
                     pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
                     None,
                 )
@@ -7692,7 +9330,9 @@ mod tests {
         });
 
         // Wait until the entry is registered (proves register-before-connect), then simulate the
-        // disconnect that removes it while connect is still parked.
+        // disconnect that removes it while connect is still parked. Subscribe the session stream
+        // first: with the drive done the session drops, and the stream closing is the end signal
+        // a handle would have read through wait_ended.
         for _ in 0..100 {
             if client.call_registry().active_count() == 1 {
                 break;
@@ -7704,26 +9344,42 @@ mod tests {
             1,
             "the call must be registered before the relay connect"
         );
+        let generation = poll_generation(&client).await;
+        let stream = {
+            let session = client
+                .call_registry()
+                .media_session("CID-FACADE", generation)
+                .expect("registered session");
+            session.subscribe()
+        };
         assert_eq!(client.call_registry().abort_all(), 1, "cleanup removes it");
 
-        // Release the gate so connect returns; set_media_task now finds no entry and aborts the task.
-        gate_tx.send(()).await.unwrap();
-        let handle = spawn.await.expect("spawn task").expect("spawn_call");
+        // The gate is never released: a passing test proves the dial was aborted (not awaited).
+        let res = drive.await.expect("drive task");
+        assert!(
+            matches!(
+                res,
+                Err(CallError::Connect(_) | CallError::CallEndedDuringSetup)
+            ),
+            "cleanup during the connect gap must fail the setup, not hand out a dead handle"
+        );
 
         assert_eq!(
             client.call_registry().active_count(),
             0,
-            "the spawned task must not resurrect a stale entry after cleanup"
+            "the drive must not resurrect a stale entry after cleanup"
         );
-        tokio::time::timeout(Duration::from_secs(2), handle.wait_ended())
-            .await
-            .expect("an aborted-before-poll task must still notify ended via the drop-guard");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while stream.recv().await.is_ok() {}
+        })
+        .await
+        .expect("a cleanup in the connect gap must still end the session stream");
     }
 
-    // Finding T: the pre-connect re-check inside attach_engine. The entry is registered, then a
-    // disconnect clears is_connected while the gated connect is parked. attach_engine re-checks
+    // Finding T: the disconnected refusal inside the backend's open. The entry is registered, then a
+    // disconnect clears is_connected while the gated connect is parked. The open refuses
     // is_connected AFTER the insert but BEFORE connect returns -- here the gate is never released, so
-    // the connect would block forever; the re-check must instead self-clean (remove the just-registered
+    // the connect would block forever; the refusal must instead self-clean (remove the just-registered
     // entry, notify `ended`) and return a Connect error, so the entry can't leak and wait_ended resolves.
     #[tokio::test]
     async fn cleanup_before_connect_self_cleans_via_preconnect_recheck() {
@@ -7743,11 +9399,10 @@ mod tests {
         // Disconnect clears is_connected before the connect path runs.
         client.set_connected_for_test(false);
 
-        let res = spawn_call(
+        let res = spawn_call_via_backend(
             &client,
             mk_session(),
-            engine(),
-            &factory,
+            Arc::new(factory),
             pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
             None,
         )
@@ -7763,8 +9418,8 @@ mod tests {
         );
     }
 
-    // Codex window: hangup landing while attach_engine is parked in the relay dial -- registry entry
-    // present, media task not registered yet, PendingOutgoing already consumed -- must wake
+    // Codex window: hangup landing while the backend's open is parked in the relay dial -- registry
+    // entry present, media task not registered yet, PendingOutgoing already consumed -- must wake
     // wait_ended() promptly and abort the dial, not park until the dial succeeds or times out. The
     // gate is NEVER released, so a passing test proves the dial was aborted (not awaited).
     #[tokio::test]
@@ -7780,50 +9435,25 @@ mod tests {
         let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
         let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
 
-        // The registry entry exists (as it would by the time the relay arrives); the handle is already
-        // out (as for an outgoing call), sharing the engine's `ended`/`muted`/events state.
-        let generation = client.call_registry().insert(mk_session());
-        let muted = Arc::new(AtomicBool::new(false));
-        let ended = Arc::new(EndedFlag::default());
-        let (ev_tx, ev_rx) = async_channel::unbounded::<CallEvent>();
-        let handle = CallHandle {
-            call_id: "CID-FACADE".into(),
-            generation,
-            peer_jid: caller(),
-            call_creator: caller(),
-            client_registry: client.call_registry(),
-            pending_outgoing_calls: client.voip_state().pending_outgoing_calls.clone(),
-            client: std::sync::Weak::new(),
-            muted: muted.clone(),
-            video: Arc::new(VideoShared::new()),
-            events: ev_rx,
-            ended: ended.clone(),
-        };
-
-        // Drive attach_engine in the background; it parks in the gated connect.
-        let attach = tokio::spawn({
+        // Drive the production open in the background; it parks in the gated connect.
+        let drive = tokio::spawn({
             let client = client.clone();
             let factory = factory.clone();
             async move {
-                attach_engine(
+                spawn_call_via_backend(
                     &client,
-                    "CID-FACADE",
-                    generation,
-                    FailureCleanup::Here,
-                    engine(),
-                    &*factory,
+                    mk_session(),
+                    factory,
                     pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
-                    None,
-                    Arc::new(VideoShared::new()),
-                    muted,
-                    ended,
-                    ev_tx,
                     None,
                 )
                 .await
             }
         });
-        // Let attach_engine reach the gated connect before hanging up.
+        // The bridge registers before dialing; resolve the generation for the trigger handle.
+        let generation = poll_generation(&client).await;
+        let handle = registry_handle(&client, generation);
+        // Let the drive reach the gated connect before hanging up.
         tokio::time::sleep(Duration::from_millis(30)).await;
 
         handle.hangup_local().await;
@@ -7834,10 +9464,10 @@ mod tests {
                 "hangup in the connect window must wake wait_ended without the dial completing",
             );
 
-        let res = tokio::time::timeout(Duration::from_secs(2), attach)
+        let res = tokio::time::timeout(Duration::from_secs(2), drive)
             .await
-            .expect("attach_engine must return once hangup aborts the dial")
-            .expect("attach task");
+            .expect("the drive must return once hangup aborts the dial")
+            .expect("drive task");
         assert!(
             matches!(res, Err(CallError::Connect(_))),
             "an aborted dial surfaces a Connect error"
@@ -7866,61 +9496,54 @@ mod tests {
         let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
         let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
 
-        let generation = client.call_registry().insert(mk_session());
-        let muted = Arc::new(AtomicBool::new(false));
-        let ended = Arc::new(EndedFlag::default());
-        // place_call/spawn_call wire this hook; replicate it so removing the entry wakes `ended`.
-        client
-            .call_registry()
-            .set_ended_notify("CID-FACADE", generation, {
-                let ended = ended.clone();
-                move || ended.notify()
-            });
-        let (ev_tx, _ev_rx) = async_channel::unbounded::<CallEvent>();
-
-        let attach = tokio::spawn({
+        // Drive the production open in the background; it parks in the gated connect.
+        let drive = tokio::spawn({
             let client = client.clone();
             let factory = factory.clone();
-            let ended = ended.clone();
             async move {
-                attach_engine(
+                spawn_call_via_backend(
                     &client,
-                    "CID-FACADE",
-                    generation,
-                    FailureCleanup::Here,
-                    engine(),
-                    &*factory,
+                    mk_session(),
+                    factory,
                     pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
-                    None,
-                    Arc::new(VideoShared::new()),
-                    muted,
-                    ended,
-                    ev_tx,
                     None,
                 )
                 .await
             }
         });
-        // Let attach_engine park in the gated connect.
+        // The bridge registers before dialing; subscribe the session stream before the trigger
+        // so its end is observable. The internal registration owns the entry-wired hook now;
+        // the architecture's public end-signal is the session stream closing.
+        let generation = poll_generation(&client).await;
+        let stream = {
+            let session = client
+                .call_registry()
+                .media_session("CID-FACADE", generation)
+                .expect("registered session");
+            session.subscribe()
+        };
+        // Let the drive park in the gated connect.
         tokio::time::sleep(Duration::from_millis(30)).await;
 
-        // A disconnect clears the task-less registry entry, whose on_terminal hook wakes `ended`.
+        // A disconnect clears the task-less registry entry, whose on_terminal hook wakes the
+        // drive's ended race.
         client.call_registry().abort_all();
 
-        tokio::time::timeout(Duration::from_secs(2), ended.wait())
+        let res = tokio::time::timeout(Duration::from_secs(2), drive)
             .await
-            .expect(
-                "a disconnect in the connect window must wake `ended` without the dial completing",
-            );
-
-        let res = tokio::time::timeout(Duration::from_secs(2), attach)
-            .await
-            .expect("attach_engine must return once the disconnect aborts the dial")
-            .expect("attach task");
+            .expect("the drive must return once the disconnect aborts the dial")
+            .expect("drive task");
         assert!(
             matches!(res, Err(CallError::Connect(_))),
             "an aborted dial surfaces a Connect error"
         );
+        // With the drive done the session drops, closing the public stream: that close is the
+        // ended signal, and it must arrive without the dial completing.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while stream.recv().await.is_ok() {}
+        })
+        .await
+        .expect("a disconnect in the connect window must end the session stream");
     }
 
     // A peer <terminate>/<reject> during the connect window removes the task-less registry entry via
@@ -7939,55 +9562,50 @@ mod tests {
         let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
         let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
 
-        let generation = client.call_registry().insert(mk_session());
-        let muted = Arc::new(AtomicBool::new(false));
-        let ended = Arc::new(EndedFlag::default());
-        client
-            .call_registry()
-            .set_ended_notify("CID-FACADE", generation, {
-                let ended = ended.clone();
-                move || ended.notify()
-            });
-        let (ev_tx, _ev_rx) = async_channel::unbounded::<CallEvent>();
-
-        let attach = tokio::spawn({
+        // Drive the production open in the background; it parks in the gated connect.
+        let drive = tokio::spawn({
             let client = client.clone();
             let factory = factory.clone();
-            let ended = ended.clone();
             async move {
-                attach_engine(
+                spawn_call_via_backend(
                     &client,
-                    "CID-FACADE",
-                    generation,
-                    FailureCleanup::Here,
-                    engine(),
-                    &*factory,
+                    mk_session(),
+                    factory,
                     pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
-                    None,
-                    Arc::new(VideoShared::new()),
-                    muted,
-                    ended,
-                    ev_tx,
                     None,
                 )
                 .await
             }
         });
+        // The bridge registers before dialing; subscribe the session stream before the trigger
+        // so its end is observable. The internal registration owns the entry-wired hook now;
+        // the architecture's public end-signal is the session stream closing.
+        let generation = poll_generation(&client).await;
+        let stream = {
+            let session = client
+                .call_registry()
+                .media_session("CID-FACADE", generation)
+                .expect("registered session");
+            session.subscribe()
+        };
         tokio::time::sleep(Duration::from_millis(30)).await;
 
         // The peer terminal-stanza path (no pending entry; entry has no media task yet).
         terminate_call(&client, "CID-FACADE");
 
-        tokio::time::timeout(Duration::from_secs(2), ended.wait())
+        let res = tokio::time::timeout(Duration::from_secs(2), drive)
             .await
-            .expect("a peer terminate in the connect window must wake `ended`");
-
-        let res = tokio::time::timeout(Duration::from_secs(2), attach)
-            .await
-            .expect("attach_engine must return once the terminate aborts the dial")
-            .expect("attach task");
+            .expect("the drive must return once the terminate aborts the dial")
+            .expect("drive task");
         assert!(matches!(res, Err(CallError::Connect(_))));
         assert_eq!(client.call_registry().active_count(), 0);
+        // With the drive done the session drops, closing the public stream: that close is the
+        // ended signal, and it must arrive without the dial completing.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while stream.recv().await.is_ok() {}
+        })
+        .await
+        .expect("a peer terminate in the connect window must end the session stream");
     }
 
     // A pending-outgoing call with no matching call-id leaves attach_outgoing_relay a no-op (returns
@@ -8001,7 +9619,7 @@ mod tests {
         assert!(!attached, "no pending call → no attach");
     }
 
-    /// A factory whose connect() always fails, to exercise attach_engine's connect-error cleanup.
+    /// A factory whose connect() always fails, to exercise the backend open's connect-error cleanup.
     struct FailingFactory;
     #[async_trait]
     impl RelayTransportFactory for FailingFactory {
@@ -8016,21 +9634,20 @@ mod tests {
     }
 
     // Finding G: a relay connect() failure must reap the (already-registered) call and wake any
-    // wait_ended() waiter. spawn_call inserts the registry entry before connect, so without cleanup the
-    // call would leak in the registry and an outgoing handle's wait_ended() would hang. Driven here via
-    // the incoming spawn_call path (registry-insert before connect); the outgoing path shares the same
-    // attach_engine.
+    // wait_ended() waiter. The bridge inserts the registry entry before connect, so without cleanup
+    // the call would leak in the registry and an outgoing handle's wait_ended() would hang. Driven
+    // here via the incoming bridge path (registry-insert before connect); the outgoing path shares
+    // the same backend open.
     #[tokio::test]
     async fn connect_failure_reaps_registry_and_resolves_wait_ended() {
         let client = make_client().await;
         let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
         let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
         // CallHandle has no Debug, so match on the Result rather than expect_err.
-        let res = spawn_call(
+        let res = spawn_call_via_backend(
             &client,
             mk_session(),
-            engine(),
-            &FailingFactory,
+            Arc::new(FailingFactory),
             pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
             None,
         )
@@ -8055,12 +9672,11 @@ mod tests {
         let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
         let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
 
-        let result = spawn_answered_call(
+        let result = spawn_answered_via_backend(
             &client,
             &mut registration,
             teardown,
-            engine(),
-            &FailingFactory,
+            Arc::new(FailingFactory),
             pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
             None,
         )
@@ -8084,7 +9700,7 @@ mod tests {
         let (client, _sent_count) = make_sending_client().await;
         let call_id = "GROUP-OFFER-FAILED";
         let creator = Jid::new("111111111111111", Server::Lid);
-        let mut session = wacore::voip::CallSession::new_outgoing(
+        let mut session = wacore::voip_control::CallSession::new_outgoing(
             call_id,
             Jid::new(call_id, Server::Call),
             creator,
@@ -8282,7 +9898,7 @@ mod tests {
                     .participants(vec![participant])
                     .build(),
             ),
-            wacore::voip::GroupStateApply::Applied
+            wacore::voip_control::group::GroupStateApply::Applied
         );
         tokio::time::timeout(Duration::from_secs(2), async {
             while client.call_registry().phase_if_current(call_id, generation)
@@ -8336,7 +9952,7 @@ mod tests {
                     .participants(vec![participant])
                     .build(),
             ),
-            wacore::voip::GroupStateApply::Applied
+            wacore::voip_control::group::GroupStateApply::Applied
         );
         assert_eq!(
             client.call_registry().phase_if_current(call_id, generation),
@@ -8410,8 +10026,8 @@ mod tests {
         for target in &targets {
             client
                 .update_device_list(DeviceListRecord {
-                    user: target.user.to_string(),
-                    devices: vec![DeviceInfo::new(0, None)],
+                    user: target.user.as_str().into(),
+                    devices: [DeviceInfo::new(0, None)].into(),
                     timestamp: wacore::time::now_secs(),
                     phash: None,
                     raw_id: None,
@@ -8480,8 +10096,8 @@ mod tests {
         for target in &targets {
             client
                 .update_device_list(DeviceListRecord {
-                    user: target.user.to_string(),
-                    devices: vec![DeviceInfo::new(0, None)],
+                    user: target.user.as_str().into(),
+                    devices: [DeviceInfo::new(0, None)].into(),
                     timestamp: wacore::time::now_secs(),
                     phash: None,
                     raw_id: None,
@@ -8533,7 +10149,7 @@ mod tests {
             client
                 .call_registry()
                 .apply_group_update_if_current(overtaking, generation,),
-            wacore::voip::GroupStateApply::Applied,
+            wacore::voip_control::group::GroupStateApply::Applied,
             "a group update that overtakes the ACK must be retained"
         );
 
@@ -8571,7 +10187,7 @@ mod tests {
                 .participants(Vec::new())
                 .build()
         };
-        let mut session = wacore::voip::CallSession::new_outgoing(
+        let mut session = wacore::voip_control::CallSession::new_outgoing(
             call_id,
             Jid::new(call_id, Server::Call),
             creator.clone(),
@@ -8622,7 +10238,7 @@ mod tests {
             .rekey_requested(true)
             .participants(Vec::new())
             .build();
-        let mut session = wacore::voip::CallSession::new_outgoing(
+        let mut session = wacore::voip_control::CallSession::new_outgoing(
             call_id,
             Jid::new(call_id, Server::Call),
             creator,
@@ -8693,12 +10309,11 @@ mod tests {
         let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
         let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
 
-        let spawn = spawn_answered_call(
+        let spawn = spawn_answered_via_backend(
             &client,
             &mut registration,
             teardown,
-            engine(),
-            &factory,
+            Arc::new(factory),
             pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
             None,
         );
@@ -8789,12 +10404,11 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_millis(20),
-            spawn_answered_call(
+            spawn_answered_via_backend(
                 &client,
                 &mut registration,
                 teardown,
-                engine(),
-                &factory,
+                Arc::new(factory),
                 pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
                 None,
             ),
@@ -8927,6 +10541,63 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), handle.wait_ended())
             .await
             .expect("a setup error must resolve the handle's wait_ended, not hang it");
+    }
+
+    /// A refusing transport provider reaches the handle, not only the log.
+    ///
+    /// The regression this pins is subtle and was live: publishing the reason from
+    /// `fail_pending_outgoing_with` looks right and cannot work, because `attach_outgoing_relay`
+    /// takes the pending entry out of the map on its way in -- so by the time the relay waiter
+    /// tries, the `ev_tx` it needs has already been dropped with the entry. The event has to be
+    /// sent from inside `attach_outgoing_relay`, which is the last place that still holds it.
+    ///
+    /// It matters most on the path this whole feature exists for: a browser with no
+    /// `RTCPeerConnection` refuses here on *every* outgoing call, and without the event a caller
+    /// cannot tell that from the peer hanging up.
+    #[tokio::test]
+    async fn a_refused_transport_provider_reaches_the_handle() {
+        struct Refuses;
+        #[async_trait]
+        impl wacore::voip_control::transport::RelayTransportProvider for Refuses {
+            async fn factory(
+                &self,
+                _relay: &wacore::voip_control::transport::RelayEndpointParams,
+            ) -> anyhow::Result<Arc<dyn RelayTransportFactory>> {
+                anyhow::bail!("this browser has no WebRTC")
+            }
+        }
+
+        let (client, _count) = make_sending_client().await;
+        let (handle, call_id) = place_dormant_outgoing(&client).await;
+        client.set_relay_transport_provider(Arc::new(Refuses));
+
+        let res = attach_outgoing_relay(&client, &call_id, &sample_relay()).await;
+        assert!(
+            matches!(res, Err(CallError::Setup(_))),
+            "a refusing provider must surface as a Setup error, got {res:?}"
+        );
+
+        let event = tokio::time::timeout(Duration::from_secs(2), handle.events().recv())
+            .await
+            .expect("the reason must reach the handle rather than only the log")
+            .expect("the event stream must carry it before it closes");
+        match event {
+            CallEvent::MediaSetupFailed(reason) => {
+                assert!(
+                    reason.contains("this browser has no WebRTC"),
+                    "the provider's own reason has to survive to the caller, got: {reason}"
+                );
+                assert!(
+                    !reason.contains("call setup failed: media session setup failed"),
+                    "the reason must not stack error types inside each other, got: {reason}"
+                );
+            }
+            other => panic!("expected MediaSetupFailed, got {other:?}"),
+        }
+
+        tokio::time::timeout(Duration::from_secs(2), handle.wait_ended())
+            .await
+            .expect("and the call must still end rather than hang");
     }
 
     // Finding M: if hangup() races the relay ack -- removing the registry entry while
@@ -9163,11 +10834,10 @@ mod tests {
         };
         let (_mic_tx, mic_rx) = async_channel::unbounded::<Vec<i16>>();
         let (spk_tx, _spk_rx) = async_channel::unbounded::<Vec<i16>>();
-        let handle = spawn_call(
+        let handle = spawn_call_via_backend(
             &client,
             mk_session(),
-            engine(),
-            &factory,
+            Arc::new(factory),
             pcm_audio(Arc::new(mic_rx), Arc::new(spk_tx)),
             None,
         )
@@ -9210,6 +10880,20 @@ mod tests {
         timestamp_stride: u32,
     }
 
+    struct TimedCaptureSource {
+        frames: async_channel::Receiver<TimedVideoFrame>,
+    }
+
+    impl VideoSource for TimedCaptureSource {
+        fn frames(&self) -> async_channel::Receiver<Vec<u8>> {
+            async_channel::bounded(1).1
+        }
+
+        fn timed_frames(&self) -> Option<async_channel::Receiver<TimedVideoFrame>> {
+            Some(self.frames.clone())
+        }
+    }
+
     impl VideoSource for TimedVideoSource {
         fn frames(&self) -> async_channel::Receiver<Vec<u8>> {
             self.frames.clone()
@@ -9223,6 +10907,16 @@ mod tests {
     struct DropTrackedVideoSource {
         frames: async_channel::Receiver<Vec<u8>>,
         drops: Arc<AtomicUsize>,
+    }
+
+    struct ChannelVideoSink {
+        playout: async_channel::Sender<VideoFrame>,
+    }
+
+    impl VideoSink for ChannelVideoSink {
+        fn playout(&self) -> async_channel::Sender<VideoFrame> {
+            self.playout.clone()
+        }
     }
 
     impl VideoSource for DropTrackedVideoSource {
@@ -9330,22 +11024,20 @@ mod tests {
         };
 
         let (f1, mic1, spk1) = spawn(&client);
-        let stale = spawn_call(
+        let stale = spawn_call_via_backend(
             &client,
             mk_session(),
-            engine(),
-            &f1,
+            Arc::new(f1),
             pcm_audio(mic1, spk1),
             None,
         )
         .await
         .expect("first spawn_call");
         let (f2, mic2, spk2) = spawn(&client);
-        let live = spawn_call(
+        let live = spawn_call_via_backend(
             &client,
             mk_session(),
-            engine(),
-            &f2,
+            Arc::new(f2),
             pcm_audio(mic2, spk2),
             None,
         )
@@ -9546,6 +11238,57 @@ mod tests {
         handle.hangup_local().await;
     }
 
+    // Re-request path: identical stanza shape under a fresh epoch.
+    #[tokio::test]
+    async fn re_request_video_upgrade_resends_request_shape_on_live_video() {
+        let (client, _sent, handle, _relay_keepalive) = sending_handle().await;
+        let (vsrc, vsink) = video_endpoints();
+        handle.start_video(vsrc, vsink).await.expect("start_video");
+        let waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        handle
+            .re_request_video_upgrade()
+            .await
+            .expect("re-request on live video");
+        let node = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("re-request must be sent")
+            .expect("waiter");
+        let r = node.as_node_ref();
+        assert!(
+            r.attrs()
+                .optional_string("id")
+                .is_some_and(|id| !id.is_empty()),
+            "the <call> wrapper needs an id so the peer's typed video ack correlates"
+        );
+        let action = call_action_of(&node);
+        let ar = action.as_node_ref();
+        assert_eq!(ar.tag, "video");
+        assert_eq!(ar.attrs().optional_string("state").as_deref(), Some("11"));
+        assert_eq!(ar.attrs().optional_string("dec").as_deref(), Some("H264"));
+        assert_eq!(
+            ar.attrs().optional_string("device_orientation").as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            ar.attrs().optional_string("voip_settings").as_deref(),
+            Some("video"),
+            "the re-request must carry the marker attr like the initial request"
+        );
+        handle.hangup_local().await;
+    }
+
+    // Audio-only calls stay on the begin path: with no video state there is
+    // nothing to re-request.
+    #[tokio::test]
+    async fn re_request_video_upgrade_refuses_audio_only_call() {
+        let (_client, _sent, handle, _relay_keepalive) = sending_handle().await;
+        assert!(
+            handle.re_request_video_upgrade().await.is_err(),
+            "audio-only call must refuse the re-request"
+        );
+        handle.hangup_local().await;
+    }
+
     #[tokio::test]
     async fn start_video_rejects_zero_timestamp_stride() {
         let (_client, _sent, handle, _relay_keepalive) = sending_handle().await;
@@ -9584,7 +11327,7 @@ mod tests {
             .build();
         assert_eq!(
             client.call_registry().apply_group_update(update),
-            wacore::voip::GroupStateApply::Applied
+            wacore::voip_control::group::GroupStateApply::Applied
         );
         let sent_before = sent_count.load(Ordering::SeqCst);
         let (source, sink) = video_endpoints();
@@ -9623,7 +11366,7 @@ mod tests {
             .build();
         assert_eq!(
             client.call_registry().apply_group_update(update.clone()),
-            wacore::voip::GroupStateApply::Applied
+            wacore::voip_control::group::GroupStateApply::Applied
         );
         let group_transition_lock = client
             .call_registry()
@@ -9648,7 +11391,7 @@ mod tests {
         downgrade.media = "audio".to_string();
         assert_eq!(
             client.call_registry().apply_group_update(downgrade),
-            wacore::voip::GroupStateApply::Applied
+            wacore::voip_control::group::GroupStateApply::Applied
         );
         drop(group_transition_guard);
 
@@ -9672,7 +11415,7 @@ mod tests {
 
     #[test]
     fn audio_call_links_are_not_video_upgradable() {
-        let mut group = wacore::voip::GroupCallState::new("CALL-LINK", caller());
+        let mut group = wacore::voip_control::group::GroupCallState::new("CALL-LINK", caller());
         assert_eq!(
             group.apply_waiting_room(
                 wacore::types::group_call::WaitingRoom::builder()
@@ -9686,7 +11429,7 @@ mod tests {
                     .users(Vec::new())
                     .build(),
             ),
-            wacore::voip::GroupStateApply::Applied
+            wacore::voip_control::group::GroupStateApply::Applied
         );
         assert!(!group_video_upgrade_allowed(&group));
     }
@@ -9720,6 +11463,7 @@ mod tests {
             video: video_shared.clone(),
             events: ev_rx,
             ended: Arc::new(EndedFlag::default()),
+            media: None,
         };
 
         let (vsrc, vsink) = video_endpoints();
@@ -9800,6 +11544,7 @@ mod tests {
             video: video.clone(),
             events,
             ended: Arc::new(EndedFlag::default()),
+            media: None,
         };
 
         let request = peer_upgrade_request(&handle).await;
@@ -9890,6 +11635,7 @@ mod tests {
             video: video.clone(),
             events,
             ended: Arc::new(EndedFlag::default()),
+            media: None,
         };
 
         let drops = Arc::new(AtomicUsize::new(0));
@@ -9934,8 +11680,375 @@ mod tests {
         handle.hangup_local().await;
     }
 
+    async fn apply_paused_peer(handle: &CallHandle) {
+        let transition_lock = handle
+            .client_registry
+            .video_transition_lock(&handle.call_id, handle.generation)
+            .expect("active call");
+        let _guard = transition_lock.lock().await;
+        assert!(matches!(
+            handle.client_registry.apply_peer_video_state(
+                &handle.call_id,
+                handle.generation,
+                VideoState::Paused,
+            ),
+            wacore::voip::PeerVideoTransition::Applied { .. }
+        ));
+    }
+
+    // An upgrade asked of a peer that is already video is unanswerable, so
+    // the begin refuses and names the re-add instead of arming the kill-timer.
     #[tokio::test]
-    async fn stop_video_sends_stopped_and_releases_endpoints() {
+    async fn start_video_refuses_when_peer_video_is_up() {
+        let (client, sends, handle, _relay_keepalive) = sending_handle().await;
+        apply_paused_peer(&handle).await;
+        let (vsrc, vsink) = video_endpoints();
+        let err = handle
+            .start_video(vsrc, vsink)
+            .await
+            .expect_err("an upgrade the peer would ignore must be refused");
+        assert!(
+            matches!(err, CallError::Media(msg) if msg.contains("resume_video")),
+            "the refusal must name the re-add, got: {err}"
+        );
+        assert_eq!(sends.load(Ordering::SeqCst), 0, "refusal sends nothing");
+        assert!(
+            handle.video.sink_slot.lock().unwrap().is_none(),
+            "refusal attaches nothing"
+        );
+        assert_eq!(
+            client
+                .call_registry()
+                .video_states(&handle.call_id, handle.generation),
+            Some((VideoState::Disabled, VideoState::Paused)),
+            "the refusal must not disturb the negotiation"
+        );
+        handle.hangup_local().await;
+    }
+
+    // The retry of an unanswerable upgrade is unanswerable too.
+    #[tokio::test]
+    async fn re_request_refuses_when_peer_went_video_mid_handshake() {
+        let (_client, _sent, handle, _relay_keepalive) = sending_handle().await;
+        let (vsrc, vsink) = video_endpoints();
+        handle.start_video(vsrc, vsink).await.expect("start_video");
+        apply_paused_peer(&handle).await;
+        assert!(
+            handle.re_request_video_upgrade().await.is_err(),
+            "re-asking an active peer must be refused like asking"
+        );
+        handle.hangup_local().await;
+    }
+
+    // The timeout's direction-local half end to end: our upgrade goes
+    // unanswered against a peer that stayed video, so the timer stands our
+    // direction down with `Stopped` instead of killing both with `9`.
+    #[tokio::test(start_paused = true)]
+    async fn unanswered_upgrade_against_an_active_peer_stands_down_locally() {
+        let (client, sends) = make_sending_client().await;
+        let registry = client.call_registry();
+        let generation = registry.insert(mk_session());
+        let video = Arc::new(VideoShared::new());
+        let (event_tx, events) = async_channel::unbounded::<CallEvent>();
+        registry.set_video_channels(
+            "CID-FACADE",
+            generation,
+            event_tx,
+            video.ctl_tx.clone(),
+            video_teardown_hook(&video),
+        );
+        let handle = CallHandle {
+            call_id: "CID-FACADE".into(),
+            generation,
+            peer_jid: caller(),
+            call_creator: caller(),
+            client_registry: registry.clone(),
+            pending_outgoing_calls: client.voip_state().pending_outgoing_calls.clone(),
+            client: Arc::downgrade(&client),
+            muted: Arc::new(AtomicBool::new(false)),
+            video: video.clone(),
+            events,
+            ended: Arc::new(EndedFlag::default()),
+            media: None,
+        };
+
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (_frames_tx, frames) = async_channel::unbounded();
+        let source = DropTrackedVideoSource {
+            frames,
+            drops: drops.clone(),
+        };
+        let (sink_tx, _sink_rx) = async_channel::unbounded::<VideoFrame>();
+        let sink = ChannelVideoSink { playout: sink_tx };
+        std::mem::forget(_sink_rx);
+        handle
+            .start_video(source, sink)
+            .await
+            .expect("request sent");
+        assert_eq!(sends.load(Ordering::SeqCst), 1);
+        apply_paused_peer(&handle).await;
+
+        let timeout_waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        tokio::task::yield_now().await;
+        tokio::time::advance(VIDEO_UPGRADE_TIMEOUT).await;
+        for _ in 0..10 {
+            if drops.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(sends.load(Ordering::SeqCst), 2);
+        let timeout_node = timeout_waiter.await.expect("timeout stanza");
+        let timeout_action = call_action_of(&timeout_node);
+        assert_eq!(
+            timeout_action
+                .as_node_ref()
+                .attrs()
+                .optional_string("state")
+                .as_deref(),
+            Some("6"),
+            "an unanswered upgrade against an active peer stands down locally, it does not cancel both"
+        );
+        assert!(
+            registry.snapshot("CID-FACADE").unwrap().is_video,
+            "the peer's direction keeps the call video"
+        );
+        assert_eq!(
+            registry.video_states("CID-FACADE", generation),
+            Some((VideoState::Stopped, VideoState::Paused))
+        );
+        assert!(
+            handle.video.sink_slot.lock().unwrap().is_some(),
+            "a direction-local abort must not drop the peer's picture"
+        );
+        handle.hangup_local().await;
+    }
+
+    async fn apply_upgrade_accept(handle: &CallHandle) {
+        let transition_lock = handle
+            .client_registry
+            .video_transition_lock(&handle.call_id, handle.generation)
+            .expect("active call");
+        let _guard = transition_lock.lock().await;
+        assert!(matches!(
+            handle.client_registry.apply_peer_video_state(
+                &handle.call_id,
+                handle.generation,
+                VideoState::UpgradeAccept,
+            ),
+            wacore::voip::PeerVideoTransition::Applied {
+                enable_plane: true,
+                ..
+            }
+        ));
+    }
+
+    // The mute-path re-add end to end: a stopped direction inside an
+    // already-video call returns ungated with a bare `Enabled` (no handshake,
+    // no marker, no timeout), and both directions read enabled afterwards.
+    #[tokio::test]
+    async fn resume_video_re_adds_a_stopped_direction_ungated() {
+        let (client, sends, handle, _relay_keepalive) = sending_handle().await;
+        let (vsrc, vsink) = video_endpoints();
+        handle.start_video(vsrc, vsink).await.expect("start_video");
+        apply_upgrade_accept(&handle).await;
+        handle.stop_video().await.expect("stop_video");
+        assert_eq!(
+            client
+                .call_registry()
+                .video_states(&handle.call_id, handle.generation),
+            Some((VideoState::Stopped, VideoState::Enabled))
+        );
+
+        let waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        let (vsrc, vsink) = video_endpoints();
+        handle
+            .resume_video(vsrc, vsink)
+            .await
+            .expect("resume_video");
+        assert_eq!(sends.load(Ordering::SeqCst), 3);
+        let node = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("re-add must be announced")
+            .expect("waiter");
+        let action = call_action_of(&node);
+        let ar = action.as_node_ref();
+        assert_eq!(ar.tag, "video");
+        assert_eq!(ar.attrs().optional_string("state").as_deref(), Some("1"));
+        assert_eq!(ar.attrs().optional_string("dec").as_deref(), Some("H264"));
+        assert_eq!(
+            ar.attrs().optional_string("device_orientation").as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            ar.attrs().optional_string("voip_settings"),
+            None,
+            "a re-add is not an upgrade request and must not carry the marker"
+        );
+        assert!(
+            handle.video.sink_slot.lock().unwrap().is_some(),
+            "resume_video attaches the sink"
+        );
+        assert_eq!(
+            client
+                .call_registry()
+                .video_states(&handle.call_id, handle.generation),
+            Some((VideoState::Enabled, VideoState::Enabled))
+        );
+        assert!(
+            client
+                .call_registry()
+                .snapshot(&handle.call_id)
+                .expect("session")
+                .is_video
+        );
+        handle.hangup_local().await;
+    }
+
+    // A fresh upgrade is not a re-add.
+    #[tokio::test]
+    async fn resume_video_refuses_an_audio_call() {
+        let (_client, sends, handle, _relay_keepalive) = sending_handle().await;
+        let (vsrc, vsink) = video_endpoints();
+        let err = handle
+            .resume_video(vsrc, vsink)
+            .await
+            .expect_err("an audio call has no direction to re-add");
+        assert!(
+            matches!(err, CallError::Media(msg) if msg.contains("start_video")),
+            "the refusal must point at the upgrade path, got: {err}"
+        );
+        assert_eq!(sends.load(Ordering::SeqCst), 0, "refusal sends nothing");
+        assert!(
+            handle.video.sink_slot.lock().unwrap().is_none(),
+            "refusal attaches nothing"
+        );
+        handle.hangup_local().await;
+    }
+
+    // A pending peer request is answered explicitly, not consumed implicitly.
+    #[tokio::test]
+    async fn resume_video_refuses_a_pending_peer_request() {
+        let (_client, _sent, handle, _relay_keepalive) = sending_handle().await;
+        let _token = peer_upgrade_request(&handle).await;
+        let (vsrc, vsink) = video_endpoints();
+        let err = handle
+            .resume_video(vsrc, vsink)
+            .await
+            .expect_err("a peer request belongs on accept_video");
+        assert!(
+            matches!(err, CallError::Media(msg) if msg.contains("accept_video")),
+            "the refusal must point at the accept path, got: {err}"
+        );
+        handle.hangup_local().await;
+    }
+
+    // The previously stuck cell end to end: a paused peer keeps the call
+    // video, so the begin path refuses and the re-add must take it. A bare
+    // `Enabled` is what an already-video peer answers.
+    #[tokio::test]
+    async fn resume_video_re_adds_against_a_paused_peer() {
+        let (client, sends, handle, _relay_keepalive) = sending_handle().await;
+        apply_paused_peer(&handle).await;
+        let waiter = client.wait_for_sent_node(crate::client::NodeFilter::tag("call"));
+        let (vsrc, vsink) = video_endpoints();
+        handle
+            .resume_video(vsrc, vsink)
+            .await
+            .expect("a paused peer still holds the call video");
+        assert_eq!(sends.load(Ordering::SeqCst), 1);
+        let node = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("re-add must be announced")
+            .expect("waiter");
+        assert_eq!(
+            call_action_of(&node)
+                .as_node_ref()
+                .attrs()
+                .optional_string("state")
+                .as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            client
+                .call_registry()
+                .video_states(&handle.call_id, handle.generation),
+            Some((VideoState::Enabled, VideoState::Paused))
+        );
+        handle.hangup_local().await;
+    }
+
+    // A re-add whose stanza never reaches the peer releases the plane and
+    // restores the stopped direction, so a retry stays a resume.
+    #[tokio::test]
+    async fn resume_video_send_failure_restores_stopped_and_releases() {
+        let (client, _sent) = make_sending_client_with_failure_after(Some(0)).await;
+        let registry = client.call_registry();
+        let generation = registry.insert(mk_session());
+        let video = Arc::new(VideoShared::new());
+        let (event_tx, events) = async_channel::unbounded::<CallEvent>();
+        registry.set_video_channels(
+            "CID-FACADE",
+            generation,
+            event_tx,
+            video.ctl_tx.clone(),
+            video_teardown_hook(&video),
+        );
+        let handle = CallHandle {
+            call_id: "CID-FACADE".into(),
+            generation,
+            peer_jid: caller(),
+            call_creator: caller(),
+            client_registry: registry.clone(),
+            pending_outgoing_calls: client.voip_state().pending_outgoing_calls.clone(),
+            client: Arc::downgrade(&client),
+            muted: Arc::new(AtomicBool::new(false)),
+            video: video.clone(),
+            events,
+            ended: Arc::new(EndedFlag::default()),
+            media: None,
+        };
+        assert!(registry.stop_local_video("CID-FACADE", generation));
+        {
+            let transition_lock = registry
+                .video_transition_lock("CID-FACADE", generation)
+                .expect("active call");
+            let _guard = transition_lock.lock().await;
+            assert!(matches!(
+                registry.apply_peer_video_state("CID-FACADE", generation, VideoState::Enabled,),
+                wacore::voip::PeerVideoTransition::Applied { .. }
+            ));
+        }
+
+        let (source, sink) = video_endpoints();
+        assert!(handle.resume_video(source, sink).await.is_err());
+        assert!(video.sink_slot.lock().unwrap().is_none());
+        assert_eq!(
+            registry.video_states("CID-FACADE", generation),
+            Some((VideoState::Stopped, VideoState::Enabled))
+        );
+        assert!(registry.snapshot("CID-FACADE").unwrap().is_video);
+        handle.hangup_local().await;
+    }
+
+    // A caller stopping its camera must not lose the picture it is
+    // watching: the peer is still sending, so only the local feed goes.
+    #[tokio::test]
+    async fn stop_video_keeps_the_incoming_sink_attached() {
+        let (_client, _sent, handle, _relay_keepalive) = sending_handle().await;
+        let (vsrc, vsink) = video_endpoints();
+        handle.start_video(vsrc, vsink).await.expect("start_video");
+        handle.stop_video().await.expect("stop_video");
+        assert!(
+            handle.video.sink_slot.lock().unwrap().is_some(),
+            "the remote picture must keep flowing after our camera stops"
+        );
+        handle.hangup_local().await;
+    }
+
+    #[tokio::test]
+    async fn stop_video_sends_stopped_and_keeps_the_remote_sink() {
         let (client, _sent, handle, _relay_keepalive) = sending_handle().await;
         let (vsrc, vsink) = video_endpoints();
         handle.start_video(vsrc, vsink).await.expect("start_video");
@@ -9960,8 +12073,17 @@ mod tests {
             "a downgrade must NOT carry the marker (it re-arms the peer's video)"
         );
         assert!(
-            handle.video.sink_slot.lock().unwrap().is_none(),
-            "stop_video releases the sink"
+            handle.video.sink_slot.lock().unwrap().is_some(),
+            "stopping our camera must not drop the peer's picture"
+        );
+        assert!(
+            handle
+                .video
+                .feed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_none(),
+            "stopping our camera must stop the local capture feed"
         );
         assert!(
             !client
@@ -10028,7 +12150,7 @@ mod tests {
     async fn video_feed_forwards_and_stops_on_ended() {
         let client = make_client().await;
         let shared = VideoShared::new();
-        let (in_rx, ctl_rx) = shared.take_receivers();
+        let (in_rx, _timed_rx, ctl_rx) = shared.take_receivers();
         let (src_tx, src_rx) = async_channel::unbounded::<Vec<u8>>();
         let sink: Arc<dyn VideoSink> = {
             let (vout_tx, _vout_rx) = async_channel::unbounded::<VideoFrame>();
@@ -10042,6 +12164,10 @@ mod tests {
         let ended = Arc::new(EndedFlag::default());
         shared.attach_endpoints(&client, &source, &sink, ended.clone());
 
+        assert_eq!(
+            ctl_rx.recv().await.unwrap(),
+            VideoControl::SetInputGeneration(1)
+        );
         assert_eq!(
             ctl_rx.recv().await.unwrap(),
             VideoControl::SetTimestampStride(4500)
@@ -10065,6 +12191,93 @@ mod tests {
             after.is_err(),
             "an AU sent after ended must not be forwarded (feed stopped)"
         );
+    }
+
+    #[tokio::test]
+    async fn timed_video_feed_forwards_capture_timestamp() {
+        let client = make_client().await;
+        let shared = VideoShared::new();
+        let (_legacy_rx, timed_rx, ctl_rx) = shared.take_receivers();
+        let (src_tx, src_rx) = async_channel::unbounded::<TimedVideoFrame>();
+        let (vout_tx, _vout_rx) = async_channel::unbounded::<VideoFrame>();
+        let source_impl = Arc::new(TimedCaptureSource { frames: src_rx });
+        assert!(
+            source_impl.frames().is_closed(),
+            "timed sources may leave legacy input closed"
+        );
+        let source: Arc<dyn VideoSource> = source_impl;
+        let sink: Arc<dyn VideoSink> = Arc::new(vout_tx);
+        shared.attach_endpoints(&client, &source, &sink, Arc::new(EndedFlag::default()));
+        assert_eq!(
+            ctl_rx.recv().await.unwrap(),
+            VideoControl::SetInputGeneration(1)
+        );
+        assert_eq!(
+            ctl_rx.recv().await.unwrap(),
+            VideoControl::SetTimestampStride(6000)
+        );
+        src_tx
+            .send(
+                TimedVideoFrame::builder()
+                    .data(vec![1, 2, 3])
+                    .timestamp(12_000)
+                    .build(),
+            )
+            .await
+            .unwrap();
+        let forwarded = timed_rx.recv().await.unwrap();
+        assert_eq!(forwarded.data, vec![1, 2, 3]);
+        assert_eq!(forwarded.timestamp, 12_000);
+        assert_eq!(forwarded.generation, 1);
+    }
+
+    #[tokio::test]
+    async fn legacy_video_reattach_keeps_new_first_au_before_disable_is_consumed() {
+        let client = make_client().await;
+        let shared = VideoShared::new();
+        let (in_rx, _timed_rx, ctl_rx) = shared.take_receivers();
+        let (old_tx, old_rx) = async_channel::unbounded::<Vec<u8>>();
+        let (new_tx, new_rx) = async_channel::unbounded::<Vec<u8>>();
+        let (vout_tx, _vout_rx) = async_channel::unbounded::<VideoFrame>();
+        let sink: Arc<dyn VideoSink> = Arc::new(vout_tx);
+        let old: Arc<dyn VideoSource> = Arc::new(TimedVideoSource {
+            frames: old_rx,
+            timestamp_stride: 6000,
+        });
+        let new: Arc<dyn VideoSource> = Arc::new(TimedVideoSource {
+            frames: new_rx,
+            timestamp_stride: 6000,
+        });
+        let ended = Arc::new(EndedFlag::default());
+        shared.attach_endpoints(&client, &old, &sink, ended.clone());
+        assert_eq!(
+            ctl_rx.recv().await.unwrap(),
+            VideoControl::SetInputGeneration(1)
+        );
+        assert_eq!(
+            ctl_rx.recv().await.unwrap(),
+            VideoControl::SetTimestampStride(6000)
+        );
+        shared.attach_endpoints(&client, &new, &sink, ended);
+        new_tx.send(vec![7, 7, 7]).await.unwrap();
+        assert_eq!(
+            ctl_rx.recv().await.unwrap(),
+            VideoControl::DisableKeepLegacy
+        );
+        assert_eq!(
+            ctl_rx.recv().await.unwrap(),
+            VideoControl::SetInputGeneration(2)
+        );
+        assert_eq!(
+            ctl_rx.recv().await.unwrap(),
+            VideoControl::SetTimestampStride(6000)
+        );
+        let got = tokio::time::timeout(Duration::from_secs(2), in_rx.recv())
+            .await
+            .expect("new AU must not be drained")
+            .expect("channel open");
+        assert_eq!(got, vec![7, 7, 7]);
+        drop(old_tx);
     }
 
     /// Runs a caller-supplied hook inline on `abort()`, standing in for a `Runtime` that
@@ -10181,7 +12394,7 @@ mod tests {
     fn video_shared_second_take_yields_closed_channels() {
         let shared = VideoShared::new();
         let _live = shared.take_receivers();
-        let (in_rx, ctl_rx) = shared.take_receivers();
+        let (in_rx, _timed_rx, ctl_rx) = shared.take_receivers();
         assert!(in_rx.is_closed());
         assert!(ctl_rx.is_closed());
     }
@@ -10189,7 +12402,7 @@ mod tests {
     #[test]
     fn video_control_queue_preserves_state_and_coalesces_orientation() {
         let shared = VideoShared::new();
-        let (_in_rx, ctl_rx) = shared.take_receivers();
+        let (_in_rx, _timed_rx, ctl_rx) = shared.take_receivers();
         shared.send_control(VideoControl::Disable);
         for orientation in 0..100u8 {
             shared.send_control(VideoControl::SetOrientation(orientation % 4));
@@ -10200,5 +12413,764 @@ mod tests {
         assert_eq!(ctl_rx.try_recv(), Ok(VideoControl::Enable));
         assert_eq!(ctl_rx.try_recv(), Ok(VideoControl::SetOrientation(3)));
         assert_eq!(ctl_rx.try_recv(), Err(async_channel::TryRecvError::Empty));
+    }
+}
+
+/// The control-plane vertical slice: a real `Client` with an injected `FakeMediaBackend`, compiled
+/// **without** the resident engine. This is the architectural gate for the seam — if any production
+/// path it exercises reached for `CallEngine` or the engine feature, this module would not build.
+#[cfg(all(test, feature = "voip-control", not(feature = "voip-engine-wacore")))]
+mod control_only_tests {
+    use super::*;
+    use wacore::voip_control::fake_backend::FakeMediaBackend;
+    use wacore::voip_control::{
+        CallDirection, MediaCommand, MediaEvent, MediaOpenContext, MediaSessionKey,
+        MediaSessionSpec, MediaSetupError, VoipMediaBackend, VoipMediaSession,
+    };
+
+    async fn client_with_fake_backend() -> (Arc<Client>, Arc<FakeMediaBackend>) {
+        let backend = Arc::new(FakeMediaBackend::new());
+        let client = crate::test_utils::create_test_client_with_voip_backend(backend.clone()).await;
+        client.set_connected_for_test(true);
+        (client, backend)
+    }
+
+    /// A sending client with the fake backend: the offer path needs our LID, an ADV account for
+    /// pkmsg devices, a NoiseSocket over an always-ok transport, and a seeded peer session —
+    /// the same recipe the engine-gated `make_sending_client` uses, minus the engine.
+    async fn sending_client_with_fake_backend() -> (Arc<Client>, Arc<FakeMediaBackend>) {
+        use wacore::handshake::NoiseCipher;
+
+        let (client, backend) = client_with_fake_backend().await;
+        let pm = client.persistence_manager();
+        pm.process_command(crate::store::commands::DeviceCommand::SetLid(Some(
+            Jid::new("111111111111111", Server::Lid),
+        )))
+        .await;
+        pm.process_command(crate::store::commands::DeviceCommand::SetAccount(Some(
+            wa::ADVSignedDeviceIdentity {
+                details: Some(vec![0u8; 32]),
+                account_signature_key: Some(vec![0u8; 32]),
+                account_signature: Some(vec![0u8; 64]),
+                device_signature: Some(vec![0u8; 64]),
+            },
+        )))
+        .await;
+        let peer = Jid::new("333333333333333", Server::Lid).with_device(0);
+        crate::test_utils::seed_peer_session(&client, &peer).await;
+        // Publish the peer's device list locally so the public `call()` builder resolves its
+        // devices from the registry instead of the network (which the mock never answers).
+        client
+            .update_device_list(wacore::store::traits::DeviceListRecord {
+                user: Arc::from("333333333333333"),
+                devices: vec![wacore::store::traits::DeviceInfo::new(0, None)].into_boxed_slice(),
+                timestamp: wacore::time::now_utc().timestamp(),
+                phash: None,
+                raw_id: None,
+            })
+            .await
+            .expect("device list");
+        struct OkTransport;
+        #[async_trait::async_trait]
+        impl crate::transport::Transport for OkTransport {
+            async fn send(&self, _data: bytes::Bytes) -> Result<(), anyhow::Error> {
+                Ok(())
+            }
+            async fn disconnect(&self) {}
+        }
+        let key = [0u8; 32];
+        let noise_socket = crate::socket::NoiseSocket::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            Arc::new(OkTransport),
+            NoiseCipher::new(&key).expect("key"),
+            NoiseCipher::new(&key).expect("key"),
+        );
+        *client.noise_socket.lock().unwrap() = Some(Arc::new(noise_socket));
+        (client, backend)
+    }
+
+    /// A backend whose `open` parks until the test releases it, so the test can end or
+    /// supersede the call mid-open. Everything else delegates to the fake.
+    struct StalledOpenBackend {
+        inner: Arc<FakeMediaBackend>,
+        entered: async_channel::Sender<()>,
+        release: async_channel::Receiver<()>,
+    }
+
+    #[async_trait::async_trait]
+    impl VoipMediaBackend for StalledOpenBackend {
+        fn reserve(
+            &self,
+            key: &MediaSessionKey,
+            direction: CallDirection,
+        ) -> Arc<dyn VoipMediaSession> {
+            self.inner.reserve(key, direction)
+        }
+
+        async fn open(
+            &self,
+            spec: MediaSessionSpec,
+            ctx: MediaOpenContext,
+        ) -> Result<(), MediaSetupError> {
+            let _ = self.entered.send(()).await;
+            self.release
+                .recv()
+                .await
+                .map_err(|_| MediaSetupError::Backend("open released".into()))?;
+            self.inner.open(spec, ctx).await
+        }
+    }
+
+    fn sample_relay() -> wacore::voip_control::relay_parse::RelayData {
+        use wacore::voip_control::relay_parse::{RelayAddress, RelayData, RelayEndpoint};
+        RelayData {
+            relay_key_ascii: Some(b"relay-key".to_vec()),
+            warp_mi_tag_len: Some(4),
+            relay_tokens: vec![vec![0xAB; 16]],
+            endpoints: vec![RelayEndpoint {
+                relay_id: 1,
+                relay_name: "gru1c02".into(),
+                token_id: 0,
+                auth_token_id: 1,
+                addresses: vec![RelayAddress {
+                    protocol: 0,
+                    ipv4: Some("203.0.113.7".into()),
+                    ipv6: None,
+                    port: 3478,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn session(id: &str) -> wacore::voip_control::CallSession {
+        wacore::voip_control::CallSession::new_outgoing(
+            id,
+            Jid::new("222222222222222", Server::Lid),
+            Jid::new("111111111111111", Server::Lid),
+        )
+    }
+
+    /// Injecting a backend through the builder means the registry reserves a fake session, the
+    /// control plane can drive it, publish events into its stream, read its stats, and close it —
+    /// all with the engine feature off.
+    #[tokio::test]
+    async fn a_fake_backend_drives_the_control_plane_end_to_end() {
+        let (client, backend) = client_with_fake_backend().await;
+        let registry = client.call_registry();
+        assert_eq!(
+            registry
+                .backend()
+                .reserve(
+                    &MediaSessionKey::builder()
+                        .call_id("SEAM".into())
+                        .generation(0)
+                        .build(),
+                    CallDirection::Outgoing,
+                )
+                .stats(),
+            wacore::voip_control::MediaStats::default(),
+            "the injected backend is the one the registry reserves from"
+        );
+
+        let generation = registry.insert(session("SEAM-VERTICAL"));
+        let key = MediaSessionKey::builder()
+            .call_id("SEAM-VERTICAL".into())
+            .generation(generation)
+            .build();
+        let media = backend
+            .session(&key)
+            .expect("the fake backend reserved a session");
+
+        // The public event stream the `CallHandle` reads is the session's: a backend event reaches
+        // a subscriber, and a signaling event published through the registry lands there too.
+        let events = media.subscribe();
+        assert!(registry.send_call_event("SEAM-VERTICAL", MediaEvent::RelayAllocated));
+        assert_eq!(events.try_recv(), Ok(MediaEvent::RelayAllocated));
+
+        // A command the control plane submits reaches the session.
+        assert!(media.submit(MediaCommand::RequireVideoKeyframe));
+        assert!(
+            media
+                .record()
+                .commands
+                .iter()
+                .any(|(c, _)| matches!(c, MediaCommand::RequireVideoKeyframe))
+        );
+
+        // Stats flow through the seam and outlive the registry entry.
+        media.set_stats(
+            wacore::voip_control::MediaStats::builder()
+                .rtp_received(42)
+                .build(),
+        );
+        let handle_stats = registry.media_session("SEAM-VERTICAL", generation);
+        assert_eq!(handle_stats.expect("session held").stats().rtp_received, 42);
+
+        // Terminal close runs through the session and records its reason.
+        client.call_registry().set_close_reason(
+            "SEAM-VERTICAL",
+            generation,
+            wacore::voip_control::MediaCloseReason::Local,
+        );
+        assert!(registry.remove_if_current("SEAM-VERTICAL", generation));
+        assert_eq!(
+            media.record().closed,
+            Some(wacore::voip_control::MediaCloseReason::Local)
+        );
+    }
+
+    /// Starting media with no backend injected is the typed refusal the control-only build promises,
+    /// never a panic or a silent no-op.
+    #[tokio::test]
+    async fn starting_media_without_a_backend_is_a_typed_refusal() {
+        let client = crate::test_utils::create_test_client().await;
+        client.set_connected_for_test(true);
+        let registry = client.call_registry();
+        let generation = registry.insert(session("NO-BACKEND"));
+        registry
+            .media_session("NO-BACKEND", generation)
+            .expect("the default registry still reserves a session");
+        assert_eq!(
+            registry
+                .backend()
+                .open(
+                    MediaSessionSpec::builder()
+                        .key(
+                            MediaSessionKey::builder()
+                                .call_id("NO-BACKEND".into())
+                                .generation(generation)
+                                .build()
+                        )
+                        .direction(CallDirection::Outgoing)
+                        .self_lid("1:0@lid".into())
+                        .peer_lid("2:0@lid".into())
+                        .call_key(vec![0u8; 32])
+                        .ssrc(1)
+                        .audio(
+                            wacore::voip_control::MediaAudioSpec::builder()
+                                .format(wacore::voip_control::MediaAudioFormat::MLOW_16KHZ_60MS)
+                                .io(wacore::voip_control::MediaAudioIo::Pcm)
+                                .build()
+                        )
+                        .relay_token(vec![])
+                        .auth_token(vec![])
+                        .relay_ip("127.0.0.1".into())
+                        .relay_port(3478)
+                        .integrity_key(vec![])
+                        .warp_mi_tag_len(4)
+                        .enable_media(false)
+                        .enable_video(false)
+                        .enable_sframe(false)
+                        .build(),
+                    wacore::voip_control::MediaOpenContext::for_test(),
+                )
+                .await,
+            Err(MediaSetupError::NoBackend)
+        );
+    }
+
+    /// ABA: two generations of the same call-id do not cross. A command for the superseded
+    /// generation is refused, and the old session is closed while the live one stays open.
+    #[tokio::test]
+    async fn a_superseded_generation_does_not_cross_into_the_live_one() {
+        let (client, backend) = client_with_fake_backend().await;
+        let registry = client.call_registry();
+
+        let old = registry.insert(session("ABA"));
+        backend
+            .session(
+                &MediaSessionKey::builder()
+                    .call_id("ABA".into())
+                    .generation(old)
+                    .build(),
+            )
+            .expect("old reserved");
+
+        let live = registry.insert(session("ABA"));
+        assert_ne!(old, live);
+        let live_media = backend
+            .session(
+                &MediaSessionKey::builder()
+                    .call_id("ABA".into())
+                    .generation(live)
+                    .build(),
+            )
+            .expect("live reserved");
+
+        // A late command/close for the old generation must not reach the live session.
+        registry.set_close_reason(
+            "ABA",
+            old,
+            wacore::voip_control::MediaCloseReason::SendFailed("stale".into()),
+        );
+        assert!(registry.remove_if_current("ABA", live));
+        assert_eq!(
+            live_media.record().closed,
+            Some(wacore::voip_control::MediaCloseReason::Local),
+            "the live generation closed with its own reason"
+        );
+        assert!(
+            backend
+                .session(
+                    &MediaSessionKey::builder()
+                        .call_id("ABA".into())
+                        .generation(old)
+                        .build()
+                )
+                .is_some(),
+            "the old session is not confused with the live one"
+        );
+    }
+
+    /// A real outgoing call on the fake backend, engine off: `place_call` sends the offer,
+    /// `attach_outgoing_relay` opens the fake through the production path, and the dormant
+    /// handle then steers video, reads signaling events and stats, and tears down — proving the
+    /// whole control flow reaches the handle without ever naming the engine.
+    #[tokio::test]
+    async fn a_real_outgoing_call_runs_on_the_fake_backend_end_to_end() {
+        use wacore::types::call::VideoState;
+
+        let (client, backend) = sending_client_with_fake_backend().await;
+        let peer = Jid::new("333333333333333", Server::Lid);
+        let (_mic_tx, mic_rx) = async_channel::bounded::<Vec<i16>>(1);
+        let (spk_tx, _spk_rx) = async_channel::bounded::<Vec<i16>>(1);
+        let handle = client
+            .voip()
+            .call(&peer)
+            .audio(mic_rx, spk_tx)
+            .start()
+            .await
+            .expect("place_call sends the offer");
+        let call_id = handle.call_id.clone();
+        let generation = handle.generation;
+        assert!(
+            super::attach_outgoing_relay(&client, &call_id, &sample_relay())
+                .await
+                .expect("attach_outgoing_relay runs the production open"),
+            "the relay attaches through the production path"
+        );
+
+        // Steering video attaches the endpoints and asks the peer; the fake owns no video plane,
+        // so this only proves the dormant handle drives the flow without the engine present.
+        let (_video_tx, video_rx) = async_channel::bounded::<Vec<u8>>(1);
+        let (sink_tx, _sink_rx) = async_channel::bounded::<VideoFrame>(1);
+        handle
+            .start_video(video_rx, sink_tx)
+            .await
+            .expect("start_video steers the dormant call");
+        let key = MediaSessionKey::builder()
+            .call_id(call_id.clone())
+            .generation(generation)
+            .build();
+        let media = backend.session(&key).expect("the fake reserved a session");
+
+        // Commands cross through the registry's production translation — the same
+        // `send_video_ctl` the signaling handler calls once `voip-runtime` accepts the peer's
+        // upgrade (that handler path is covered by the fixture suite, which runs with the
+        // runtime on; here there is no runtime, only the seam).
+        client.call_registry().send_video_ctl(
+            &call_id,
+            generation,
+            wacore::voip_control::control::VideoControl::Enable,
+        );
+        assert!(
+            media
+                .record()
+                .commands
+                .iter()
+                .any(|(c, _)| matches!(c, MediaCommand::EnableVideo { .. })),
+            "a control-plane command crossed into the backend"
+        );
+
+        // Signaling published through the registry lands on the handle's own stream.
+        let peer_video = MediaEvent::PeerVideoStateChanged {
+            source: peer.clone().with_device(2),
+            call_creator: client.lid().expect("own lid"),
+            state: VideoState::Stopped,
+            orientation: None,
+            upgrade_token: None,
+        };
+        assert!(client.call_registry().send_call_event_if_current(
+            &call_id,
+            generation,
+            peer_video.clone()
+        ));
+        assert_eq!(handle.events().try_recv(), Ok(peer_video));
+
+        // Counters the backend sets are what the handle reports.
+        media.set_stats(
+            wacore::voip_control::MediaStats::builder()
+                .rtp_received(42)
+                .build(),
+        );
+        assert_eq!(handle.media_stats().rtp_received, 42);
+
+        // Terminal close records its reason on the session and ends the handle's stream, so a
+        // lingering `recv` ends instead of parking; the entry is gone afterwards.
+        handle.hangup_local().await;
+        tokio::time::timeout(Duration::from_secs(2), handle.wait_ended())
+            .await
+            .expect("hangup resolves wait_ended");
+        assert_eq!(
+            media.record().closed,
+            Some(wacore::voip_control::MediaCloseReason::Local)
+        );
+        assert!(
+            matches!(
+                handle.events().try_recv(),
+                Err(async_channel::TryRecvError::Closed)
+            ),
+            "the closed stream ends the consumer instead of parking it"
+        );
+        assert!(
+            !client
+                .call_registry()
+                .send_call_event(&call_id, MediaEvent::RelayAllocated),
+            "a removed entry publishes nothing"
+        );
+    }
+
+    /// Registration plus an open spec for the mid-open race tests: the backend parks inside
+    /// `open` until the test releases it.
+    async fn stalled_open_setup(
+        call_id: &str,
+    ) -> (
+        Arc<Client>,
+        Arc<FakeMediaBackend>,
+        async_channel::Receiver<()>,
+        async_channel::Sender<()>,
+        super::RegisteredCall,
+    ) {
+        let (entered_tx, entered_rx) = async_channel::bounded::<()>(1);
+        let (release_tx, release_rx) = async_channel::bounded::<()>(1);
+        let inner = Arc::new(FakeMediaBackend::new());
+        let stalled: Arc<dyn VoipMediaBackend> = Arc::new(StalledOpenBackend {
+            inner: inner.clone(),
+            entered: entered_tx,
+            release: release_rx,
+        });
+        let client = crate::test_utils::create_test_client_with_voip_backend(stalled).await;
+        let peer = Jid::new("333333333333333", Server::Lid);
+        let session = wacore::voip_control::CallSession::new_incoming(call_id, peer.clone(), peer);
+        let registration = super::RegisteredCall::new(&client, session).await;
+        (client, inner, entered_rx, release_tx, registration)
+    }
+
+    fn open_spec(key: MediaSessionKey) -> MediaSessionSpec {
+        MediaSessionSpec::builder()
+            .key(key)
+            .direction(CallDirection::Incoming)
+            .self_lid("111111111111111:0@lid".into())
+            .peer_lid("333333333333333:0@lid".into())
+            .call_key(vec![0u8; 32])
+            .ssrc(1)
+            .audio(
+                wacore::voip_control::MediaAudioSpec::builder()
+                    .format(wacore::voip_control::MediaAudioFormat::MLOW_16KHZ_60MS)
+                    .io(wacore::voip_control::MediaAudioIo::Pcm)
+                    .build(),
+            )
+            .relay_token(vec![])
+            .auth_token(vec![])
+            .relay_ip("127.0.0.1".into())
+            .relay_port(3478)
+            .integrity_key(vec![])
+            .warp_mi_tag_len(4)
+            .enable_media(false)
+            .enable_video(false)
+            .enable_sframe(false)
+            .build()
+    }
+
+    fn pcm_endpoints() -> AudioEndpoints {
+        let (_mic_tx, mic_rx) = async_channel::bounded::<Vec<i16>>(1);
+        let (spk_tx, _spk_rx) = async_channel::bounded::<Vec<i16>>(1);
+        AudioEndpoints::Pcm {
+            source: Arc::new(mic_rx),
+            sink: Arc::new(spk_tx),
+        }
+    }
+
+    /// Terminating the call while `open` awaits the relay dial must not hand out a handle: the
+    /// generation check after the await closes what open started and reports the end.
+    #[tokio::test]
+    async fn terminate_during_open_ends_without_a_handle() {
+        let (client, inner, entered_rx, release_tx, registration) =
+            stalled_open_setup("RACE-CALL").await;
+        let call_id = registration.call_id.clone();
+        let generation = registration.generation;
+        let key = MediaSessionKey::builder()
+            .call_id(call_id.clone())
+            .generation(generation)
+            .build();
+        let spec = open_spec(key.clone());
+        let open = tokio::spawn({
+            let client = client.clone();
+            async move {
+                super::open_registered_media(
+                    &client,
+                    &registration,
+                    spec,
+                    pcm_endpoints(),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+            }
+        });
+        entered_rx
+            .recv()
+            .await
+            .expect("the backend parks inside open");
+        client
+            .call_registry()
+            .remove_if_current(&call_id, generation);
+        release_tx.send(()).await.expect("release the open");
+        let result = open.await.expect("open task joins");
+        assert!(
+            matches!(result, Err(CallError::CallEndedDuringSetup)),
+            "a call terminated mid-open ends in setup"
+        );
+        assert_eq!(
+            inner
+                .session(&key)
+                .expect("the session outlives the entry")
+                .record()
+                .closed,
+            Some(wacore::voip_control::MediaCloseReason::Local),
+            "the mid-open session is closed, not leaked running"
+        );
+        assert_eq!(
+            client.call_registry().generation_of(&call_id),
+            None,
+            "the terminated entry stays reaped"
+        );
+    }
+
+    /// Superseding the call while `open` awaits must retire the old generation without touching
+    /// the replacement: same stale-handle refusal, and the live generation stays current.
+    #[tokio::test]
+    async fn replacement_during_open_retires_only_the_stale_generation() {
+        let (client, inner, entered_rx, release_tx, registration) =
+            stalled_open_setup("RACE-CALL").await;
+        let call_id = registration.call_id.clone();
+        let generation = registration.generation;
+        let key = MediaSessionKey::builder()
+            .call_id(call_id.clone())
+            .generation(generation)
+            .build();
+        let spec = open_spec(key.clone());
+        let open = tokio::spawn({
+            let client = client.clone();
+            async move {
+                super::open_registered_media(
+                    &client,
+                    &registration,
+                    spec,
+                    pcm_endpoints(),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+            }
+        });
+        entered_rx
+            .recv()
+            .await
+            .expect("the backend parks inside open");
+        let peer = Jid::new("333333333333333", Server::Lid);
+        let replacement_session =
+            wacore::voip_control::CallSession::new_incoming(&call_id, peer.clone(), peer);
+        let replacement = super::RegisteredCall::new(&client, replacement_session).await;
+        let live_generation = replacement.generation;
+        assert_ne!(live_generation, generation);
+        release_tx.send(()).await.expect("release the open");
+        let result = open.await.expect("open task joins");
+        assert!(
+            matches!(result, Err(CallError::CallEndedDuringSetup)),
+            "a superseded mid-open ends in setup"
+        );
+        assert_eq!(
+            inner
+                .session(&key)
+                .expect("the stale session outlives the entry")
+                .record()
+                .closed,
+            Some(wacore::voip_control::MediaCloseReason::Local),
+            "the stale mid-open session is closed"
+        );
+        assert_eq!(
+            client.call_registry().generation_of(&call_id),
+            Some(live_generation),
+            "the replacement generation stays current"
+        );
+    }
+
+    /// An outgoing registration plus parked relay-attach material for the dormant-path
+    /// mid-open race tests: the backend parks inside `open` until the test releases it.
+    async fn stalled_outgoing_setup(
+        call_id: &str,
+    ) -> (
+        Arc<Client>,
+        Arc<FakeMediaBackend>,
+        async_channel::Receiver<()>,
+        async_channel::Sender<()>,
+    ) {
+        let inner = Arc::new(FakeMediaBackend::new());
+        let (entered_tx, entered_rx) = async_channel::bounded::<()>(1);
+        let (release_tx, release_rx) = async_channel::bounded::<()>(1);
+        let stalled: Arc<dyn VoipMediaBackend> = Arc::new(StalledOpenBackend {
+            inner: inner.clone(),
+            entered: entered_tx,
+            release: release_rx,
+        });
+        let client = crate::test_utils::create_test_client_with_voip_backend(stalled).await;
+        client.set_connected_for_test(true);
+        let peer = Jid::new("333333333333333", Server::Lid);
+        let generation =
+            client
+                .call_registry()
+                .insert(wacore::voip_control::CallSession::new_outgoing(
+                    call_id,
+                    peer.clone(),
+                    peer,
+                ));
+        let media = client
+            .call_registry()
+            .media_session(call_id, generation)
+            .expect("insert reserves the session");
+        let video_shared = Arc::new(VideoShared::new());
+        let (_mic_tx, mic_rx) = async_channel::bounded::<Vec<i16>>(1);
+        let (spk_tx, _spk_rx) = async_channel::bounded::<Vec<i16>>(1);
+        let pending = super::PendingOutgoing {
+            generation,
+            self_lid: "111111111111111:0@lid".into(),
+            peer_lid: "333333333333333:0@lid".into(),
+            call_key: vec![0u8; 32],
+            audio: super::AudioEndpoints::Pcm {
+                source: Arc::new(mic_rx),
+                sink: Arc::new(spk_tx),
+            },
+            video: None,
+            video_shared: video_shared.clone(),
+            video_teardown: super::video_teardown_hook(&video_shared),
+            muted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ended: Arc::new(super::EndedFlag::default()),
+            media,
+        };
+        client
+            .voip_state()
+            .pending_outgoing_calls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(call_id.into(), pending);
+        (client, inner, entered_rx, release_tx)
+    }
+
+    /// Terminating an outgoing call while `open` awaits the relay dial must not leave a live
+    /// drive task behind a stale handle: the post-open generation check closes what open
+    /// started and reports the end, mirroring `open_registered_media`.
+    #[tokio::test]
+    async fn outgoing_terminate_during_open_ends_in_setup() {
+        let (client, inner, entered_rx, release_tx) = stalled_outgoing_setup("RACE-OUT").await;
+        let call_id = "RACE-OUT".to_string();
+        let generation = client
+            .call_registry()
+            .generation_of(&call_id)
+            .expect("registered");
+        let key = MediaSessionKey::builder()
+            .call_id(call_id.clone())
+            .generation(generation)
+            .build();
+        let attaching = tokio::spawn({
+            let client = client.clone();
+            let call_id = call_id.clone();
+            async move { super::attach_outgoing_relay(&client, &call_id, &sample_relay()).await }
+        });
+        entered_rx
+            .recv()
+            .await
+            .expect("the backend parks inside open");
+        client
+            .call_registry()
+            .remove_if_current(&call_id, generation);
+        release_tx.send(()).await.expect("release the open");
+        let result = attaching.await.expect("attach task joins");
+        assert!(
+            matches!(result, Err(CallError::CallEndedDuringSetup)),
+            "an outgoing call terminated mid-open ends in setup, got {result:?}"
+        );
+        assert_eq!(
+            inner
+                .session(&key)
+                .expect("the session outlives the entry")
+                .record()
+                .closed,
+            Some(wacore::voip_control::MediaCloseReason::Local),
+            "the mid-open session is closed, not leaked running"
+        );
+        assert_eq!(
+            client.call_registry().generation_of(&call_id),
+            None,
+            "the terminated entry stays reaped"
+        );
+    }
+
+    /// Superseding an outgoing call while `open` awaits must retire the old generation without
+    /// touching the replacement: same stale-handle refusal, and the live generation stays
+    /// current. No removal here would be a second bug: reaping would end the wrong call.
+    #[tokio::test]
+    async fn outgoing_replacement_during_open_retires_only_the_stale_generation() {
+        let (client, inner, entered_rx, release_tx) = stalled_outgoing_setup("RACE-OUT").await;
+        let call_id = "RACE-OUT".to_string();
+        let generation = client
+            .call_registry()
+            .generation_of(&call_id)
+            .expect("registered");
+        let key = MediaSessionKey::builder()
+            .call_id(call_id.clone())
+            .generation(generation)
+            .build();
+        let attaching = tokio::spawn({
+            let client = client.clone();
+            let call_id = call_id.clone();
+            async move { super::attach_outgoing_relay(&client, &call_id, &sample_relay()).await }
+        });
+        entered_rx
+            .recv()
+            .await
+            .expect("the backend parks inside open");
+        let peer = Jid::new("333333333333333", Server::Lid);
+        let replacement = super::RegisteredCall::new(
+            &client,
+            wacore::voip_control::CallSession::new_incoming(&call_id, peer.clone(), peer),
+        )
+        .await;
+        let live_generation = replacement.generation;
+        assert_ne!(live_generation, generation);
+        release_tx.send(()).await.expect("release the open");
+        let result = attaching.await.expect("attach task joins");
+        assert!(
+            matches!(result, Err(CallError::CallEndedDuringSetup)),
+            "an outgoing call superseded mid-open ends in setup, got {result:?}"
+        );
+        assert_eq!(
+            inner
+                .session(&key)
+                .expect("the stale session outlives the entry")
+                .record()
+                .closed,
+            Some(wacore::voip_control::MediaCloseReason::Local),
+            "the stale mid-open session is closed"
+        );
+        assert_eq!(
+            client.call_registry().generation_of(&call_id),
+            Some(live_generation),
+            "the replacement generation stays current"
+        );
     }
 }

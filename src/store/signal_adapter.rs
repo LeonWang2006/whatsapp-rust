@@ -139,6 +139,18 @@ impl SessionStore for SessionAdapter {
             .map_err(signal_err("backend"))
     }
 
+    async fn prefetch_sessions(
+        &self,
+        addresses: &[ProtocolAddress],
+    ) -> Result<(), SignalProtocolError> {
+        let device = self.0.device();
+        self.0
+            .cache
+            .prefetch_sessions(addresses, &*device.backend)
+            .await
+            .map_err(signal_err("backend"))
+    }
+
     async fn load_session_for_update(
         &self,
         address: &ProtocolAddress,

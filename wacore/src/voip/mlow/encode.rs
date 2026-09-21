@@ -31,9 +31,10 @@ pub enum MlowError {
     BufferOverflow,
 }
 
-/// Stateful pure-Rust MLow encoder: 60 ms PCM (960 f32 @16 kHz, ~[-1,1]) -> a wire MLow frame the
-/// WhatsApp peer decodes. Emits active config=0 (`0x50`) frames, choosing voiced (LTP) or unvoiced
-/// per internal frame via analysis-by-synthesis.
+/// Stateful pure-Rust MLow encoder for 60 ms mono PCM frames at 16 kHz.
+/// Accepts normalized `f32` samples through [`Self::encode`] or [`Self::encode_into`],
+/// and signed 16-bit samples through [`Self::encode_i16_into`]. Emits active config=0
+/// (`0x50`) wire frames, choosing voiced or unvoiced per internal frame via analysis-by-synthesis.
 pub struct MlowEncoder {
     state: SmplEncoderState,
     clean: Vec<f32>,
@@ -83,7 +84,39 @@ impl MlowEncoder {
             pcm.iter()
                 .map(|&s| if s.is_nan() { 0.0 } else { s.clamp(-1.0, 1.0) }),
         );
-        let fp = smpl_analyze_frame_st(&mut self.state, &self.clean);
+        self.encode_clean(None, output)
+    }
+
+    /// Encode exactly 960 signed 16-bit mono samples at 16 kHz.
+    ///
+    /// Normalizes each sample as `sample as f32 / 32768.0` in encoder-owned scratch.
+    /// VAD reads the original samples, avoiding an exact but redundant conversion back to i16.
+    /// Success replaces `output`, reusing its capacity and removing any previous tail.
+    /// An error leaves `output` unchanged. A frame-length error also leaves codec state
+    /// unchanged; a range-buffer overflow advances analysis state as in [`Self::encode_into`].
+    /// Successive calls carry analysis history until [`Self::reset`].
+    pub fn encode_i16_into(&mut self, pcm: &[i16], output: &mut Vec<u8>) -> Result<(), MlowError> {
+        if pcm.len() != OPUS_FRAME_SAMPS {
+            return Err(MlowError::FrameLength {
+                expected: OPUS_FRAME_SAMPS,
+                got: pcm.len(),
+            });
+        }
+        self.clean.clear();
+        self.clean.extend(pcm.iter().map(|&s| s as f32 / 32768.0));
+        self.encode_clean(Some(pcm), output)
+    }
+
+    /// Consume exactly one frame of normalized PCM already staged in `self.clean`.
+    /// Both input APIs validate and fill that scratch before entering here.
+    /// Analysis advances before entropy encoding, so an encoding error does not
+    /// roll back history, although the caller's output remains unchanged.
+    fn encode_clean(
+        &mut self,
+        original_pcm: Option<&[i16]>,
+        output: &mut Vec<u8>,
+    ) -> Result<(), MlowError> {
+        let fp = smpl_analyze_frame_st(&mut self.state, &self.clean, original_pcm);
         encode_smpl_frame_into(&fp, &mut self.range, output)
     }
 }
@@ -432,6 +465,93 @@ mod tests {
     use super::super::decoder::MlowDecoder;
     use super::*;
 
+    #[test]
+    fn i16_encoding_matches_normalized_pcm_with_reused_output() {
+        let mut normalized = MlowEncoder::new();
+        let mut integer = MlowEncoder::new();
+        let mut output = vec![0xaa; 2048];
+        let mut expected = Vec::new();
+        for frame in 0..72 {
+            if frame == 68 {
+                normalized.reset();
+                integer.reset();
+            }
+            let pcm: Vec<i16> = (0..OPUS_FRAME_SAMPS)
+                .map(|i| (frame * OPUS_FRAME_SAMPS + i) as i16)
+                .collect();
+            let floats: Vec<f32> = pcm.iter().map(|&s| s as f32 / 32768.0).collect();
+            normalized.encode_into(&floats, &mut expected).unwrap();
+            integer.encode_i16_into(&pcm, &mut output).unwrap();
+            assert_eq!(output, expected, "frame {frame}");
+            assert_eq!(integer.clean, floats);
+            let before = output.clone();
+            assert!(matches!(
+                integer.encode_i16_into(&pcm[..959], &mut output),
+                Err(MlowError::FrameLength { got: 959, .. })
+            ));
+            assert_eq!(output, before);
+            output.resize(2048, 0xaa);
+        }
+    }
+
+    #[test]
+    fn alternating_input_apis_preserves_vad_and_encoder_state() {
+        let mut reference = MlowEncoder::new();
+        let mut mixed = MlowEncoder::new();
+        let mut expected = Vec::new();
+        let mut output = Vec::new();
+        for frame in 0..96 {
+            if frame == 48 {
+                reference.reset();
+                mixed.reset();
+            }
+            let pcm: Vec<i16> = (0..OPUS_FRAME_SAMPS)
+                .map(|i| {
+                    if frame % 11 < 3 {
+                        0
+                    } else {
+                        (frame * OPUS_FRAME_SAMPS + i) as i16
+                    }
+                })
+                .collect();
+            let normalized: Vec<f32> = pcm.iter().map(|&s| s as f32 / 32768.0).collect();
+            reference.encode_into(&normalized, &mut expected).unwrap();
+            if frame % 2 == 0 {
+                mixed.encode_i16_into(&pcm, &mut output).unwrap();
+            } else {
+                mixed.encode_into(&normalized, &mut output).unwrap();
+            }
+            assert_eq!(output, expected, "frame {frame}");
+        }
+    }
+
+    #[test]
+    fn i16_long_stream_matches_float_encoding() {
+        let mut normalized = MlowEncoder::new();
+        let mut integer = MlowEncoder::new();
+        let mut decoder = MlowDecoder::new();
+        let mut output = Vec::new();
+        let mut expected = Vec::new();
+        for frame in 0..2048 {
+            let pcm: Vec<i16> = (0..OPUS_FRAME_SAMPS)
+                .map(|i| {
+                    if frame % 97 < 5 {
+                        0
+                    } else {
+                        (((frame * OPUS_FRAME_SAMPS + i) as f32 * 0.07).sin() * 10000.0) as i16
+                    }
+                })
+                .collect();
+            let floats: Vec<f32> = pcm.iter().map(|&s| s as f32 / 32768.0).collect();
+            normalized.encode_into(&floats, &mut expected).unwrap();
+            integer.encode_i16_into(&pcm, &mut output).unwrap();
+            assert_eq!(output, expected, "frame {frame}");
+            let decoded = decoder.decode(&output);
+            assert_eq!(decoded.len(), OPUS_FRAME_SAMPS);
+            assert!(decoded.iter().all(|s| s.is_finite()));
+        }
+    }
+
     // Isolated voiced pitch-block round-trip: encode the gains + the estimator contour
     // (`blockseg_idx`/`laginds`) then decode them back; the decoder's `block_lags` must equal the
     // encoded `laginds`, proving the wire encode is the inverse of `decode_smpl_pitch`.
@@ -660,6 +780,7 @@ mod tests {
                     &mut lstate,
                     config,
                     f,
+                    true,
                 );
                 let pulses = super::super::smpl_pulse::decode_smpl_pulses(
                     &mut dec,

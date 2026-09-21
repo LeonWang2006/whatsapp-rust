@@ -19,7 +19,11 @@ use wacore_binary::jid::Jid;
 /// A phash is 10 bytes ("2:" + 8 base64 chars), inline in `CompactString`:
 /// serving a warm send costs a pointer-free copy, no allocation.
 pub struct ResolvedGroupDevices {
-    devices: Vec<Jid>,
+    /// Frozen at construction: the set never changes afterwards (a topology
+    /// change produces a new memo entry, not a mutation), so the boxed slice
+    /// hands back the growth capacity the fan-out build over-reserved instead
+    /// of parking it for the life of the group.
+    devices: Box<[Jid]>,
     /// `(sending jid, phash)`. The jid pins the only other input, so a
     /// change of sending identity (PN/LID mode flip, re-pair) can never be
     /// served a stale hash; it recomputes without overwriting.
@@ -28,7 +32,7 @@ pub struct ResolvedGroupDevices {
 
 impl crate::stats::HeapSize for ResolvedGroupDevices {
     fn heap_bytes(&self) -> usize {
-        self.devices.capacity() * size_of::<Jid>()
+        self.devices.len() * size_of::<Jid>()
             + self.devices.iter().map(|j| j.heap_bytes()).sum::<usize>()
             + self
                 .phash
@@ -40,7 +44,7 @@ impl crate::stats::HeapSize for ResolvedGroupDevices {
 impl ResolvedGroupDevices {
     pub fn new(devices: Vec<Jid>) -> Self {
         Self {
-            devices,
+            devices: devices.into_boxed_slice(),
             phash: OnceLock::new(),
         }
     }
@@ -92,11 +96,67 @@ impl ResolvedGroupDevices {
 pub struct ResolvedDmDevices {
     partitioned: super::dm::PartitionedDmDevices,
     phash: OnceLock<CompactString>,
+    /// Resolved once per memo entry, like the phash, and under the same
+    /// contract: a PN→LID mapping learned for any member of this fan-out
+    /// bumps the topology generation the entry is stamped with, so the entry
+    /// (and this cell with it) is rebuilt rather than served stale.
+    signal: OnceLock<DmSignalAddressing>,
+}
+
+/// The Signal addresses of one DM fan-out.
+///
+/// A device is encrypted to under its LID whenever the mapping is known (WA
+/// Web's `SignalAddress.toString()`), and a warm send resolved that mapping
+/// three times per device on its way to the wire: once for the session
+/// pre-check, once for the lock keys, once in the encrypt fan-out. Each was a
+/// cache lookup plus a `Jid` clone. Resolving once and memoizing beside the
+/// device set removes the repeats and the per-send sort of the lock keys.
+pub struct DmSignalAddressing {
+    /// Parallel to [`ResolvedDmDevices::devices`]: the address device `i`
+    /// encrypts under, which is the device itself when no upgrade applies.
+    encryption: Box<[Jid]>,
+    /// [`Self::encryption`] sorted and deduplicated in lock order, the one
+    /// order every session-lock acquisition must use.
+    lock_keys: Box<[Jid]>,
+}
+
+impl DmSignalAddressing {
+    /// `encryption` must be parallel to the device set this is memoized on;
+    /// [`ResolvedDmDevices::signal_addressing_or_init`] refuses any other
+    /// length, and a consumer treats one as "not memoized".
+    pub fn new(encryption: Vec<Jid>, lock_keys: Vec<Jid>) -> Self {
+        Self {
+            encryption: encryption.into_boxed_slice(),
+            lock_keys: lock_keys.into_boxed_slice(),
+        }
+    }
+
+    pub fn encryption(&self) -> &[Jid] {
+        &self.encryption
+    }
+
+    pub fn lock_keys(&self) -> &[Jid] {
+        &self.lock_keys
+    }
+}
+
+impl crate::stats::HeapSize for DmSignalAddressing {
+    fn heap_bytes(&self) -> usize {
+        (self.encryption.len() + self.lock_keys.len()) * size_of::<Jid>()
+            + self
+                .encryption
+                .iter()
+                .chain(self.lock_keys.iter())
+                .map(|j| j.heap_bytes())
+                .sum::<usize>()
+    }
 }
 
 impl crate::stats::HeapSize for ResolvedDmDevices {
     fn heap_bytes(&self) -> usize {
-        self.partitioned.heap_bytes() + self.phash.get().map_or(0, |p| p.heap_bytes())
+        self.partitioned.heap_bytes()
+            + self.phash.get().map_or(0, |p| p.heap_bytes())
+            + self.signal.get().map_or(0, |s| s.heap_bytes())
     }
 }
 
@@ -108,7 +168,31 @@ impl ResolvedDmDevices {
         Self {
             partitioned: super::dm::partition_dm_devices(all_devices, own_jid, own_lid),
             phash: OnceLock::new(),
+            signal: OnceLock::new(),
         }
+    }
+
+    /// The memoized Signal addressing, if a send has resolved it.
+    pub fn signal_addressing(&self) -> Option<&DmSignalAddressing> {
+        self.signal.get()
+    }
+
+    /// Memoize `addressing`, or return what an earlier send memoized. The
+    /// caller resolved it from this same immutable device set, so whichever
+    /// racer wins the cell holds the same answer.
+    ///
+    /// Refused, and handed back, when `addressing` does not carry one address
+    /// per device: such a list cannot be indexed by device, and a memo entry
+    /// lives across sends, so a malformed one must never be installed. The
+    /// caller may still use the returned value for its own send.
+    pub fn signal_addressing_or_init(
+        &self,
+        addressing: DmSignalAddressing,
+    ) -> Result<&DmSignalAddressing, DmSignalAddressing> {
+        if addressing.encryption().len() != self.devices().len() {
+            return Err(addressing);
+        }
+        Ok(self.signal.get_or_init(|| addressing))
     }
 
     /// Every device the stanza encrypts for, in partition order.
@@ -116,11 +200,13 @@ impl ResolvedDmDevices {
         self.partitioned.valid_devices()
     }
 
-    pub(crate) fn recipient_devices(&self) -> &[Jid] {
+    /// The recipient partition, preceding own companions in [`Self::devices`].
+    pub fn recipient_devices(&self) -> &[Jid] {
         self.partitioned.recipient_devices()
     }
 
-    pub(crate) fn own_other_devices(&self) -> &[Jid] {
+    /// Our PN/LID companions, excluding the sending device itself.
+    pub fn own_other_devices(&self) -> &[Jid] {
         self.partitioned.own_other_devices()
     }
 

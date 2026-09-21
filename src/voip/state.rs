@@ -94,7 +94,7 @@ impl Subsystem for Voip {
 /// Everything one client retains for VoIP.
 pub(crate) struct VoipState {
     /// Active calls and their media-task abort handles.
-    pub(crate) call_registry: Arc<wacore::voip::CallRegistry>,
+    pub(crate) call_registry: Arc<wacore::voip_control::registry::CallRegistry>,
     /// Admission snapshots that can race a call-link join ACK before its call id is registered.
     /// Kept client-side so `wacore` never has to authorize a call it does not know.
     pub(crate) pending_call_link_joins:
@@ -107,22 +107,37 @@ pub(crate) struct VoipState {
     /// Serializes incoming-answer registration with generation-aware teardown. A failed answer
     /// holds its call-id lane until `<terminate>` has been written, so a same-call-id re-offer
     /// cannot become current in the removal-before-send window.
-    pub(crate) answer_transition_locks: [Arc<Mutex<()>>; ANSWER_TRANSITION_LANES],
+    /// Allocate the lanes only on first use; clients that never answer a call
+    /// need none. Once initialized, lane identity survives every reconnect.
+    pub(crate) answer_transition_locks:
+        std::sync::OnceLock<[Arc<Mutex<()>>; ANSWER_TRANSITION_LANES]>,
     /// Outgoing calls awaiting their relay. The initiator's relay is not in the offer; it arrives
     /// from the server AFTER it, so each `voip().call()` parks the material needed to spawn the
     /// engine here, keyed by call-id, until a `<call>` carrying a `<relay>` for that id arrives.
     pub(crate) pending_outgoing_calls:
         Arc<std::sync::Mutex<HashMap<String, super::facade::PendingOutgoing>>>,
+    /// How a relay endpoint becomes a media transport, when the platform supplies its own.
+    ///
+    /// `None` means "use whatever this build has": the UDP/DTLS/SCTP dialer on a `voip-relay-native`
+    /// build, and nothing at all anywhere else -- a page that has not installed one gets a call
+    /// that fails at setup with a reason, rather than a crate that would not compile.
+    ///
+    /// A `std` lock over one `Option`, taken for the length of a clone. It is written once during
+    /// assembly in every use anyone has, but making it a constructor argument would put a VoIP type
+    /// in `ClientBuilder` for every consumer that never places a call.
+    pub(crate) relay_transport_provider:
+        std::sync::Mutex<Option<Arc<dyn wacore::voip_control::transport::RelayTransportProvider>>>,
 }
 
 impl Default for VoipState {
     fn default() -> Self {
         Self {
-            call_registry: Arc::new(wacore::voip::CallRegistry::new()),
+            call_registry: Arc::new(wacore::voip_control::registry::CallRegistry::new()),
             pending_call_link_joins: Arc::new(std::sync::Mutex::new(Default::default())),
             pending_call_link_join_lane: Mutex::new(()),
-            answer_transition_locks: std::array::from_fn(|_| Arc::new(Mutex::new(()))),
+            answer_transition_locks: std::sync::OnceLock::new(),
             pending_outgoing_calls: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            relay_transport_provider: std::sync::Mutex::new(None),
         }
     }
 }

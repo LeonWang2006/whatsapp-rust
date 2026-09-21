@@ -1,6 +1,6 @@
 use crate::client::Client;
 use crate::lid_pn_cache::LearningSource;
-use crate::types::events::Event;
+use crate::types::events::{Event, EventKind};
 use log::{debug, info, warn};
 use std::sync::Arc;
 use wacore::stanza::devices::DeviceNotification;
@@ -20,7 +20,30 @@ pub(crate) async fn handle_encrypt_notification(client: &Arc<Client>, nr: &NodeR
             .children()
             .and_then(|c| c.first().map(|n| n.tag.as_ref()));
         match first_child_tag {
-            Some("count") => handle_prekey_low(client).await,
+            // WA Web's stanza router sends BOTH `count` and `pq_count` to
+            // `WAWebHandlePreKeyLow` (`case"count":case"pq_count"` in
+            // `Comms.handleStanza`), and that handler then decides what to
+            // refill by *tag*, not by position: `hasLegacyCount =
+            // maybeChild("count") != null` drives the classic one-time-prekey
+            // upload, while `hasPqCount` drives a separate Kyber upload that is
+            // additionally gated on `isPqKeysUploadEnabled()`.
+            //
+            // Matching only `count` here dropped the whole notification
+            // whenever the server put `<pq_count>` first — including when the
+            // same stanza also carried `<count>`, so the one-time prekey pool
+            // never refilled and peers eventually could not fetch a bundle to
+            // start a session with this device.
+            Some("count" | "pq_count") => {
+                if nr.get_optional_child("count").is_some() {
+                    handle_prekey_low(client).await;
+                } else {
+                    // PQ-only: this client uploads no Kyber prekeys, so there
+                    // is nothing to refill. The stanza is still acked by the
+                    // router, which is what WA Web does when its own PQ gate
+                    // is off.
+                    debug!("encrypt notification carried only <pq_count>; no PQ prekeys to upload");
+                }
+            }
             Some("digest") => handle_digest_key(client),
             other => warn!("Unhandled encrypt notification child: {:?}", other),
         }
@@ -36,6 +59,40 @@ pub(crate) async fn handle_account_sync_notification(client: &Arc<Client>, nr: &
     }
     if let Some(devices_node) = nr.get_optional_child_by_tag(&["devices"]) {
         handle_account_sync_devices(client, nr, devices_node).await;
+    }
+    // WA Web's account_sync parser reads a `<disappearing_mode>` child
+    // alongside `<devices>`, and both arms end at the same place the standalone
+    // `type="disappearing_mode"` notification does —
+    // `updateDisappearingModeForContact({contactId: from, ...})` — so the
+    // difference is only whose setting it is: `from` on an account_sync is our
+    // own account.
+    //
+    // The two arms are mutually exclusive, and the parser makes that explicit:
+    //
+    //     h.hasAttr("action") ? y = h.attrString("action")
+    //                         : (C = h.attrInt("duration"), b = h.attrInt("t"))
+    //
+    // With `action` present the stanza carries no duration/`t` at all, and WA
+    // Web answers `action === "modify"` by re-querying the server
+    // (`getDisappearingMode(from, DM_FORCE_REFRESH)`) and applying the answer.
+    // That needs a `disappearing_mode` *get* this client does not have — only
+    // `SetDefaultDisappearingModeSpec`, the set — so the action arm is logged
+    // rather than guessed at.
+    //
+    // Splitting the arms changes no outcome: the parser below already declines
+    // an action-only stanza, because it requires `t`. What it does is stop that
+    // decline being announced as `warn!("… missing or invalid 't' …")` on a
+    // stanza that is perfectly well formed, which is a false lead for whoever
+    // reads the log next.
+    if let Some(dm) = nr.get_optional_child("disappearing_mode") {
+        if dm.attrs().optional_string("action").is_some() {
+            debug!(
+                "account_sync disappearing_mode carried an action and no duration; \
+                 re-querying the account default is not implemented"
+            );
+        } else {
+            super::groups::handle_disappearing_mode_notification(client, nr);
+        }
     }
 }
 
@@ -297,13 +354,18 @@ pub(crate) async fn handle_identity_change(client: &Arc<Client>, node: &NodeRef<
     }
 
     // = addSecurityCodeChangedNotifications, which WA Web fires inside the gate.
-    client.core.event_bus.dispatch(Event::IdentityChange(
-        crate::types::events::IdentityChange::builder()
-            .user(from_jid.clone())
-            .maybe_lid_user(stanza_lid)
-            .implicit(false)
-            .build(),
-    ));
+    client
+        .core
+        .event_bus
+        .dispatch_with(EventKind::IdentityChange, || {
+            Event::IdentityChange(
+                crate::types::events::IdentityChange::builder()
+                    .user(from_jid.clone())
+                    .maybe_lid_user(stanza_lid)
+                    .implicit(false)
+                    .build(),
+            )
+        });
 
     // Re-establish the session eagerly so the next send is fast (WA Web does this
     // inside the gate too). Skip only while the offline backlog is still draining,
@@ -393,13 +455,18 @@ pub(crate) async fn handle_local_identity_change(client: &Arc<Client>, sender: J
         client.reissue_tc_token_after_identity_change(&sender).await;
     }
 
-    client.core.event_bus.dispatch(Event::IdentityChange(
-        crate::types::events::IdentityChange::builder()
-            .user(sender)
-            .maybe_lid_user(None)
-            .implicit(true)
-            .build(),
-    ));
+    client
+        .core
+        .event_bus
+        .dispatch_with(EventKind::IdentityChange, || {
+            Event::IdentityChange(
+                crate::types::events::IdentityChange::builder()
+                    .user(sender)
+                    .maybe_lid_user(None)
+                    .implicit(true)
+                    .build(),
+            )
+        });
 }
 
 /// Refresh the device list of the contact a hash-only `<update>` names.
@@ -505,27 +572,31 @@ pub(crate) async fn handle_devices_notification(client: &Arc<Client>, node: &Nod
     }
 
     // Dispatch event to notify application layer
-    let event = Event::DeviceListUpdate(
-        DeviceListUpdate::builder()
-            .user(notification.from.clone())
-            .maybe_lid_user(notification.lid_user.clone())
-            .update_type(op.operation_type.into())
-            .devices(
-                op.devices
-                    .iter()
-                    .map(|d| {
-                        DeviceNotificationInfo::builder()
-                            .device_id(d.device_id())
-                            .maybe_key_index(d.key_index)
-                            .build()
-                    })
-                    .collect(),
+    client
+        .core
+        .event_bus
+        .dispatch_with(EventKind::DeviceListUpdate, || {
+            Event::DeviceListUpdate(
+                DeviceListUpdate::builder()
+                    .user(notification.from.clone())
+                    .maybe_lid_user(notification.lid_user.clone())
+                    .update_type(op.operation_type.into())
+                    .devices(
+                        op.devices
+                            .iter()
+                            .map(|d| {
+                                DeviceNotificationInfo::builder()
+                                    .device_id(d.device_id())
+                                    .maybe_key_index(d.key_index)
+                                    .build()
+                            })
+                            .collect(),
+                    )
+                    .maybe_key_index(op.key_index.clone())
+                    .maybe_contact_hash(op.contact_hash.clone())
+                    .build(),
             )
-            .maybe_key_index(op.key_index.clone())
-            .maybe_contact_hash(op.contact_hash.clone())
-            .build(),
-    );
-    client.core.event_bus.dispatch(event);
+        });
 }
 
 /// Parsed device info from account_sync notification
@@ -633,16 +704,15 @@ pub(crate) async fn handle_account_sync_devices(
     // Build DeviceListRecord for storage
     // Note: update_device_list() will automatically store under LID if mapping is known
     let device_list = DeviceListRecord {
-        user: from_jid.user.to_string(),
+        user: Arc::from(from_jid.user.as_str()),
         devices: devices
             .iter()
             .map(|d| {
-                DeviceInfo::new(d.jid.device as u32, d.key_index)
-                    .with_hosting(JidExt::is_hosted(&d.jid))
+                DeviceInfo::new(d.jid.device, d.key_index).with_hosting(JidExt::is_hosted(&d.jid))
             })
             .collect(),
         timestamp,
-        phash: dhash,
+        phash: dhash.map(Box::<str>::from),
         raw_id: existing_raw_id,
     };
 

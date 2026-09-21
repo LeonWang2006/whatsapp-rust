@@ -270,7 +270,7 @@ impl Client {
         self.pair_code_state
             .lock()
             .await
-            .is_outstanding(wacore::time::now_secs())
+            .is_outstanding(wacore::time::Instant::now())
     }
 
     async fn pair_with_code_inner(
@@ -321,20 +321,19 @@ impl Client {
         // WA Web also starts before the request (`startAltLinkingFlow` sets
         // `codeGenerationTs` before sending), so the ~180s window covers the
         // round trip rather than starting after it.
-        let code_generation_ts = wacore::time::now_secs();
+        let requested_at = wacore::time::Instant::now();
+        let code_expires_at = requested_at + PairCodeUtils::code_validity();
         let claim = wacore::pair_code::PairCodeClaim::next();
         {
             let mut state = self.pair_code_state.lock().await;
-            if state.is_outstanding(code_generation_ts) {
+            if state.is_outstanding(requested_at) {
                 return Err(PairCodeError::CodeAlreadyOutstanding {
-                    remaining: state
-                        .live_flow_remaining(code_generation_ts)
-                        .unwrap_or_default(),
+                    remaining: state.live_flow_remaining(requested_at).unwrap_or_default(),
                 }
                 .into());
             }
             *state = PairCodeState::RequestingCode {
-                code_generation_ts,
+                code_expires_at,
                 claim,
             };
         }
@@ -489,22 +488,17 @@ impl Client {
                 phone_jid: phone_number,
                 pair_code: code.clone(),
                 ephemeral_keypair: Box::new(ephemeral_keypair),
-                code_generation_ts,
+                code_expires_at,
                 primary_hello_attempt_count: 0,
             };
             claim_guard.armed = false;
         }
 
         // Dispatch event for the user to display the code. The validity clock
-        // started at `code_generation_ts` (before stage 1), so advertise the
-        // *remaining* window — otherwise a consumer's countdown would outlast the
-        // server's (and our own `handle_primary_hello`) expiry by the stage-1
-        // elapsed time.
-        let elapsed = wacore::time::now_secs()
-            .saturating_sub(code_generation_ts)
-            .max(0) as u64;
-        let remaining =
-            PairCodeUtils::code_validity().saturating_sub(std::time::Duration::from_secs(elapsed));
+        // started before stage 1, so advertise the *remaining* window — otherwise
+        // a consumer's countdown would outlast the server's (and our own
+        // `handle_primary_hello`) expiry by the stage-1 elapsed time.
+        let remaining = code_expires_at.saturating_duration_since(wacore::time::Instant::now());
         self.core.event_bus.dispatch(Event::PairingCode(
             crate::types::events::PairingCode::builder()
                 .code(code.clone())
@@ -688,7 +682,7 @@ async fn handle_primary_hello(client: &Arc<Client>, reg_node: &NodeRef<'_>) -> b
             phone_jid,
             pair_code,
             ephemeral_keypair,
-            code_generation_ts,
+            code_expires_at,
             primary_hello_attempt_count,
         } => {
             // Validate before counting: only a genuine, in-window attempt
@@ -702,11 +696,12 @@ async fn handle_primary_hello(client: &Arc<Client>, reg_node: &NodeRef<'_>) -> b
                 );
                 return false;
             }
-            let age = wacore::time::now_secs() - *code_generation_ts;
-            if age > PairCodeUtils::code_validity().as_secs() as i64 {
+            let now = wacore::time::Instant::now();
+            if now > *code_expires_at {
                 warn!(
                     target: "Client/PairCode",
-                    "primary_hello arrived for an expired code ({age}s old); ignoring"
+                    "primary_hello arrived {}s after the code expired; ignoring",
+                    now.saturating_duration_since(*code_expires_at).as_secs()
                 );
                 return false;
             }
@@ -1131,9 +1126,8 @@ mod tests {
         client.subscribe_handler(collector.clone()).detach();
 
         // Park a live code in the slot so the next request is the duplicate.
-        let now = wacore::time::now_secs();
         *client.pair_code_state.lock().await = PairCodeState::RequestingCode {
-            code_generation_ts: now,
+            code_expires_at: live_window(),
             claim: wacore::pair_code::PairCodeClaim::next(),
         };
 
@@ -1276,7 +1270,7 @@ mod tests {
         client.subscribe_handler(collector.clone()).detach();
 
         *client.pair_code_state.lock().await = PairCodeState::RequestingCode {
-            code_generation_ts: wacore::time::now_secs(),
+            code_expires_at: live_window(),
             claim: wacore::pair_code::PairCodeClaim::next(),
         };
 
@@ -1507,7 +1501,25 @@ mod tests {
             .build()
     }
 
-    async fn set_waiting(client: &Arc<Client>, pairing_ref: Vec<u8>, ts: i64, count: u32) {
+    /// A code minted now: its window closes one validity period out.
+    fn live_window() -> wacore::time::Instant {
+        wacore::time::Instant::now() + PairCodeUtils::code_validity()
+    }
+
+    /// A window that has already closed. The clock's origin, not a subtraction
+    /// from `now`: a monotonic clock has no history before the process started,
+    /// so `now - validity` in a young test binary saturates back to a deadline
+    /// that is still in the future.
+    fn closed_window() -> wacore::time::Instant {
+        wacore::time::Instant::ZERO
+    }
+
+    async fn set_waiting(
+        client: &Arc<Client>,
+        pairing_ref: Vec<u8>,
+        expires_at: wacore::time::Instant,
+        count: u32,
+    ) {
         *client.pair_code_state.lock().await = PairCodeState::WaitingForPhoneConfirmation {
             pairing_ref,
             phone_jid: "15551234567".to_string(),
@@ -1515,7 +1527,7 @@ mod tests {
             ephemeral_keypair: Box::new(KeyPair::generate(
                 &mut rand::make_rng::<rand::rngs::StdRng>(),
             )),
-            code_generation_ts: ts,
+            code_expires_at: expires_at,
             primary_hello_attempt_count: count,
         };
     }
@@ -1551,7 +1563,7 @@ mod tests {
     #[tokio::test]
     async fn primary_hello_rejects_mismatched_ref() {
         let client = create_test_client().await;
-        set_waiting(&client, vec![1, 2, 3, 4], wacore::time::now_secs(), 0).await;
+        set_waiting(&client, vec![1, 2, 3, 4], live_window(), 0).await;
         let adv_before = adv(&client);
 
         let notif = primary_hello_notif(&[9, 9, 9, 9]);
@@ -1581,7 +1593,7 @@ mod tests {
     async fn stale_mismatched_hellos_do_not_block_the_valid_one() {
         let client = create_test_client().await;
         let pairing_ref = vec![1, 2, 3, 4];
-        set_waiting(&client, pairing_ref.clone(), wacore::time::now_secs(), 0).await;
+        set_waiting(&client, pairing_ref.clone(), live_window(), 0).await;
         let adv_before = adv(&client);
 
         // More mismatched hellos than the cap would allow if they counted.
@@ -1610,9 +1622,7 @@ mod tests {
     async fn primary_hello_rejects_expired_code() {
         let client = create_test_client().await;
         let pairing_ref = vec![1, 2, 3, 4];
-        let stale_ts =
-            wacore::time::now_secs() - (PairCodeUtils::code_validity().as_secs() as i64 + 20);
-        set_waiting(&client, pairing_ref.clone(), stale_ts, 0).await;
+        set_waiting(&client, pairing_ref.clone(), closed_window(), 0).await;
         let adv_before = adv(&client);
 
         let notif = primary_hello_notif(&pairing_ref);
@@ -1643,7 +1653,7 @@ mod tests {
         set_waiting(
             &client,
             pairing_ref.clone(),
-            wacore::time::now_secs(),
+            live_window(),
             PairCodeUtils::max_primary_hello_attempts(),
         )
         .await;
@@ -1674,7 +1684,7 @@ mod tests {
         let client = create_test_client().await;
         let pairing_ref = vec![1, 2, 3, 4];
         // count = 2 → this is the 3rd attempt, still within the cap of 3.
-        set_waiting(&client, pairing_ref.clone(), wacore::time::now_secs(), 2).await;
+        set_waiting(&client, pairing_ref.clone(), live_window(), 2).await;
         let adv_before = adv(&client);
 
         let notif = primary_hello_notif(&pairing_ref);
@@ -1696,7 +1706,7 @@ mod tests {
         client.subscribe_handler(collector.clone()).detach();
 
         let pairing_ref = vec![5, 6, 7, 8];
-        set_waiting(&client, pairing_ref.clone(), wacore::time::now_secs(), 0).await;
+        set_waiting(&client, pairing_ref.clone(), live_window(), 0).await;
 
         let notif = refresh_code_notif(&pairing_ref, Some(true));
         let handled = handle_pair_code_notification(&client, &notif.as_node_ref()).await;
@@ -1721,7 +1731,7 @@ mod tests {
         client.subscribe_handler(collector.clone()).detach();
 
         let pairing_ref = vec![5, 6, 7, 8];
-        set_waiting(&client, pairing_ref.clone(), wacore::time::now_secs(), 0).await;
+        set_waiting(&client, pairing_ref.clone(), live_window(), 0).await;
 
         let notif = refresh_code_notif(&pairing_ref, None);
         let handled = handle_pair_code_notification(&client, &notif.as_node_ref()).await;
@@ -1744,7 +1754,7 @@ mod tests {
         let collector = Arc::new(crate::test_utils::TestEventCollector::default());
         client.subscribe_handler(collector.clone()).detach();
 
-        set_waiting(&client, vec![5, 6, 7, 8], wacore::time::now_secs(), 0).await;
+        set_waiting(&client, vec![5, 6, 7, 8], live_window(), 0).await;
 
         let notif = refresh_code_notif(&[1, 1, 1, 1], None);
         let handled = handle_pair_code_notification(&client, &notif.as_node_ref()).await;
@@ -1842,7 +1852,7 @@ mod tests {
         transport: &Arc<crate::transport::mock::CapturingMockTransport>,
         pairing_ref: &[u8],
     ) {
-        set_waiting(client, pairing_ref.to_vec(), wacore::time::now_secs(), 0).await;
+        set_waiting(client, pairing_ref.to_vec(), live_window(), 0).await;
         let notif = primary_hello_notif(pairing_ref);
         assert!(handle_pair_code_notification(client, &notif.as_node_ref()).await);
         poll_until("companion_finish to reach the transport", || {
@@ -1948,7 +1958,7 @@ mod tests {
         client.subscribe_handler(collector.clone()).detach();
 
         // The replacement holds the slot by the time the answer lands.
-        set_waiting(&client, vec![9, 9, 9, 9], wacore::time::now_secs(), 0).await;
+        set_waiting(&client, vec![9, 9, 9, 9], live_window(), 0).await;
         let adv_of_replacement = adv(&client);
         report_stage_two_failure(
             &client,
@@ -1975,7 +1985,7 @@ mod tests {
         // The guard's other half: same ref, but a retry has since opened its own
         // attempt. Covered here because a ref mismatch alone would let a
         // regression that drops the attempt comparison pass unnoticed.
-        set_waiting(&client, vec![1, 2, 3, 4], wacore::time::now_secs(), 2).await;
+        set_waiting(&client, vec![1, 2, 3, 4], live_window(), 2).await;
         let adv_of_retry = adv(&client);
         report_stage_two_failure(
             &client,
@@ -2061,7 +2071,7 @@ mod tests {
     #[tokio::test]
     async fn cancelling_leaves_a_secret_stage_two_never_touched() {
         let (client, _transport) = create_iq_test_client().await;
-        set_waiting(&client, vec![1, 2, 3, 4], wacore::time::now_secs(), 0).await;
+        set_waiting(&client, vec![1, 2, 3, 4], live_window(), 0).await;
         let before = adv(&client);
         client.cancel_pair_code().await;
         assert_eq!(adv(&client), before, "no stage 2 ran, so nothing rotated");
@@ -2079,7 +2089,7 @@ mod tests {
     #[tokio::test]
     async fn pair_with_code_refuses_to_supersede_a_live_code() {
         let (client, _transport) = create_iq_test_client().await;
-        set_waiting(&client, vec![1, 2, 3, 4], wacore::time::now_secs(), 0).await;
+        set_waiting(&client, vec![1, 2, 3, 4], live_window(), 0).await;
 
         let err = client
             .pair_with_code(options())
@@ -2100,7 +2110,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_pair_code_lets_a_replacement_be_requested() {
         let (client, transport) = create_iq_test_client().await;
-        set_waiting(&client, vec![1, 2, 3, 4], wacore::time::now_secs(), 0).await;
+        set_waiting(&client, vec![1, 2, 3, 4], live_window(), 0).await;
 
         client.cancel_pair_code().await;
 
@@ -2121,9 +2131,7 @@ mod tests {
     #[tokio::test]
     async fn an_expired_code_does_not_block_a_new_one() {
         let (client, transport) = create_iq_test_client().await;
-        let stale =
-            wacore::time::now_secs() - (PairCodeUtils::code_validity().as_secs() as i64 + 1);
-        set_waiting(&client, vec![1, 2, 3, 4], stale, 0).await;
+        set_waiting(&client, vec![1, 2, 3, 4], closed_window(), 0).await;
 
         let pending = {
             let client = client.clone();
@@ -2143,7 +2151,7 @@ mod tests {
     async fn refresh_code_clears_the_flow_it_asks_to_replace() {
         let client = create_test_client().await;
         let pairing_ref = vec![5, 6, 7, 8];
-        set_waiting(&client, pairing_ref.clone(), wacore::time::now_secs(), 0).await;
+        set_waiting(&client, pairing_ref.clone(), live_window(), 0).await;
 
         let notif = refresh_code_notif(&pairing_ref, Some(true));
         assert!(handle_pair_code_notification(&client, &notif.as_node_ref()).await);
@@ -2305,8 +2313,8 @@ mod tests {
     #[tokio::test]
     async fn a_pending_pair_success_still_owns_the_slot() {
         let (client, _transport) = create_iq_test_client().await;
-        let expired =
-            wacore::time::now_secs() - (PairCodeUtils::code_validity().as_secs() as i64 + 1);
+        let expired = wacore::time::Instant::now()
+            - (PairCodeUtils::code_validity() + std::time::Duration::from_secs(1));
         // Stage 2 ran: companion_finish is out, pair-success is pending.
         set_waiting(&client, vec![1, 2, 3, 4], expired, 1).await;
 
@@ -2332,7 +2340,7 @@ mod tests {
         let collector = Arc::new(crate::test_utils::TestEventCollector::default());
         client.subscribe_handler(collector.clone()).detach();
         let pairing_ref = vec![1, 2, 3, 4];
-        set_waiting(&client, pairing_ref.clone(), wacore::time::now_secs(), 0).await;
+        set_waiting(&client, pairing_ref.clone(), live_window(), 0).await;
 
         let notif = primary_hello_notif(&pairing_ref);
         assert!(handle_pair_code_notification(&client, &notif.as_node_ref()).await);
@@ -2377,7 +2385,7 @@ mod tests {
     #[tokio::test]
     async fn a_teardown_does_not_leave_the_slot_claimed() {
         let (client, _transport) = create_iq_test_client().await;
-        set_waiting(&client, vec![1, 2, 3, 4], wacore::time::now_secs(), 0).await;
+        set_waiting(&client, vec![1, 2, 3, 4], live_window(), 0).await;
 
         client.cleanup_connection_state().await;
 
@@ -2449,7 +2457,7 @@ mod tests {
         let (client, _transport) = create_iq_test_client().await;
         let claim = wacore::pair_code::PairCodeClaim::next();
         *client.pair_code_state.lock().await = PairCodeState::RequestingCode {
-            code_generation_ts: wacore::time::now_secs(),
+            code_expires_at: live_window(),
             claim,
         };
 
@@ -2462,7 +2470,7 @@ mod tests {
 
         // Nor does a replacement's claim answer for the one it superseded.
         *client.pair_code_state.lock().await = PairCodeState::RequestingCode {
-            code_generation_ts: wacore::time::now_secs(),
+            code_expires_at: live_window(),
             claim: wacore::pair_code::PairCodeClaim::next(),
         };
         assert!(!client.owns_code_claim(claim).await);
@@ -2481,7 +2489,7 @@ mod tests {
     async fn primary_hello_returns_before_stage_two_reaches_the_wire() {
         let (client, transport) = create_iq_test_client().await;
         let pairing_ref = vec![1, 2, 3, 4];
-        set_waiting(&client, pairing_ref.clone(), wacore::time::now_secs(), 0).await;
+        set_waiting(&client, pairing_ref.clone(), live_window(), 0).await;
 
         let notif = primary_hello_notif(&pairing_ref);
         let handled = handle_pair_code_notification(&client, &notif.as_node_ref()).await;
@@ -2539,7 +2547,7 @@ mod tests {
     async fn a_stage_two_task_does_not_answer_for_the_flow_that_replaced_it() {
         let (client, transport) = create_iq_test_client().await;
         // The replacement: a live flow, but not the one stage 2 was spawned for.
-        set_waiting(&client, vec![9, 9, 9, 9], wacore::time::now_secs(), 0).await;
+        set_waiting(&client, vec![9, 9, 9, 9], live_window(), 0).await;
         let adv_before = adv(&client);
 
         run_stage_two(
@@ -2578,7 +2586,7 @@ mod tests {
         let collector = Arc::new(crate::test_utils::TestEventCollector::default());
         client.subscribe_handler(collector.clone()).detach();
         let pairing_ref = vec![1, 2, 3, 4];
-        set_waiting(&client, pairing_ref.clone(), wacore::time::now_secs(), 0).await;
+        set_waiting(&client, pairing_ref.clone(), live_window(), 0).await;
 
         let notif = primary_hello_notif(&pairing_ref);
         assert!(handle_pair_code_notification(&client, &notif.as_node_ref()).await);
@@ -2613,7 +2621,7 @@ mod tests {
         let collector = Arc::new(crate::test_utils::TestEventCollector::default());
         client.subscribe_handler(collector.clone()).detach();
         let pairing_ref = vec![1, 2, 3, 4];
-        set_waiting(&client, pairing_ref.clone(), wacore::time::now_secs(), 0).await;
+        set_waiting(&client, pairing_ref.clone(), live_window(), 0).await;
 
         let notif = primary_hello_notif(&pairing_ref);
         assert!(handle_pair_code_notification(&client, &notif.as_node_ref()).await);
@@ -2639,7 +2647,7 @@ mod tests {
         let collector = Arc::new(crate::test_utils::TestEventCollector::default());
         client.subscribe_handler(collector.clone()).detach();
         let pairing_ref = vec![1, 2, 3, 4];
-        set_waiting(&client, pairing_ref.clone(), wacore::time::now_secs(), 0).await;
+        set_waiting(&client, pairing_ref.clone(), live_window(), 0).await;
 
         let notif = primary_hello_notif(&pairing_ref);
         assert!(handle_pair_code_notification(&client, &notif.as_node_ref()).await);
@@ -2671,7 +2679,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_stage_is_ignored_and_preserves_state() {
         let client = create_test_client().await;
-        set_waiting(&client, vec![1, 2, 3, 4], wacore::time::now_secs(), 0).await;
+        set_waiting(&client, vec![1, 2, 3, 4], live_window(), 0).await;
 
         let notif = NodeBuilder::new("notification")
             .attr("type", "link_code_companion_reg")

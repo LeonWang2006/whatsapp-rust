@@ -18,9 +18,7 @@ use crate::client::Client;
 use crate::types::message::MessageInfo;
 use log::{debug, info, warn};
 use std::sync::Arc;
-use wacore::types::message::{
-    ChatMessageId, EditAttribute, MessageCategory, MessageSource, MsgMetaInfo,
-};
+use wacore::types::message::{ChatMessageId, EditAttribute, MessageCategory, MessageSource};
 use wacore_binary::{Jid, JidExt};
 use waproto::whatsapp as wa;
 
@@ -179,7 +177,7 @@ impl Client {
         let message_key = wa::MessageKey {
             remote_jid: Some(resolved_jid.to_string()),
             from_me: Some(info.source.is_from_me),
-            id: Some(info.id.clone()),
+            id: Some(info.id.to_string()),
             participant: participant.map(|p| p.to_string()),
         };
 
@@ -294,6 +292,143 @@ impl Client {
         self.send_peer_message(peer_target, &msg).await
     }
 
+    /// Ask the primary device for a collection this side could not validate.
+    ///
+    /// Sent when a snapshot's MAC does not match the one we compute over it.
+    /// There is no way forward through the server after that -- the same bytes
+    /// arrive on every retry and fail the same way -- so the collection would
+    /// otherwise stay at version 0 for ever, and every mutation this client
+    /// tries to write to it (a chat marked read, a mute, an archive) is refused
+    /// with a conflict it can never resolve.
+    ///
+    /// Fire-and-forget, like every other PDO here: the answer arrives later as
+    /// an ordinary peer message and is applied then. Nothing waits, so a phone
+    /// that is off simply means the collection stays as it was.
+    pub async fn request_syncd_snapshot_recovery(
+        self: &Arc<Self>,
+        collection: &str,
+    ) -> Result<String, anyhow::Error> {
+        // Both gates are enforced here as well as at the escalation, because this
+        // is public and takes a name.
+        //
+        // A name this client has no rules for is refused outright: the reply
+        // side rejects `Unknown` *before* spending the marker, and an
+        // outstanding request only ever expires when the same name is asked for
+        // again -- so one typo would sit in the map for the life of the process,
+        // having been sent to the phone for nothing.
+        let patch_name = collection
+            .parse::<wacore::appstate::patch_decode::WAPatchName>()
+            .unwrap_or(wacore::appstate::patch_decode::WAPatchName::Unknown);
+        if patch_name == wacore::appstate::patch_decode::WAPatchName::Unknown {
+            return Err(anyhow::anyhow!(
+                "{collection} is not an app-state collection this client knows"
+            ));
+        }
+        // And the block list is refused because a caller asking for it would
+        // otherwise mark it pending and send, and the reply passes the
+        // known-collection check and applies. Rebuilding a block list from a
+        // device that may itself be behind is the one collection where being
+        // wrong means talking to somebody who was blocked.
+        if patch_name == wacore::appstate::patch_decode::WAPatchName::CriticalBlock {
+            return Err(anyhow::anyhow!(
+                "the block list is not recovered from the primary"
+            ));
+        }
+
+        // And the rollout gate, for the same reason the two above are here: an
+        // explicit `0` is the account being told its primary cannot do this, and
+        // a caller reaching past the escalation would spend a whole-collection
+        // request on a device that will ignore it. Silence still proceeds --
+        // this client is not on WhatsApp's rollout and may simply never be sent
+        // the prop, and reading that as a refusal would disable the escalation
+        // for everyone it exists to help.
+        if self
+            .ab_props()
+            .get(wacore::iq::abprops::web::ENABLE_PEER_SNAPSHOT_RECOVERY)
+            .await
+            .is_some_and(|value| value == "0" || value.eq_ignore_ascii_case("false"))
+        {
+            return Err(anyhow::anyhow!(
+                "the account has peer snapshot recovery turned off"
+            ));
+        }
+
+        let device_snapshot = self.persistence_manager.get_device_snapshot();
+        let peer_target = self_peer_target(&device_snapshot)?;
+
+        let pdo_request = wa::message::PeerDataOperationRequestMessage {
+            peer_data_operation_request_type: Some(
+                wa::message::PeerDataOperationRequestType::COMPANION_SYNCD_SNAPSHOT_FATAL_RECOVERY,
+            ),
+            syncd_collection_fatal_recovery_request: buffa::MessageField::some(
+                wa::message::peer_data_operation_request_message::SyncDCollectionFatalRecoveryRequest {
+                    collection_name: Some(collection.to_string()),
+                    timestamp: Some(wacore::time::now_secs() as i64),
+                },
+            ),
+            ..Default::default()
+        };
+
+        let protocol_message = wa::message::ProtocolMessage {
+            r#type: Some(wa::message::protocol_message::Type::PEER_DATA_OPERATION_REQUEST_MESSAGE),
+            peer_data_operation_request_message: buffa::MessageField::some(pdo_request),
+            ..Default::default()
+        };
+
+        let msg = wa::Message {
+            protocol_message: buffa::MessageField::some(protocol_message),
+            ..Default::default()
+        };
+
+        info!(
+            "Asking {} to send back the {} collection after a snapshot we could not validate",
+            peer_target.observe(),
+            collection
+        );
+
+        self.ensure_e2e_sessions(std::slice::from_ref(&peer_target))
+            .await?;
+
+        // Marked before the send, not after. The reply is handled on the inbound
+        // path by a different task, and a primary that answers quickly can be
+        // read before a mark placed afterwards is visible -- which would drop a
+        // perfectly good recovery for a request that really was made. Marking
+        // first cannot lose one; the only cost is a marker to take back if the
+        // send never happened, which is what the failure arm does.
+        // Generated here, not inside the send: the answer is identified by this
+        // id, and a reply that beats the send's return would otherwise find the
+        // request recorded with no id at all -- unrecognisable, and so unable to
+        // free the ask it answers.
+        let request_id = self.generate_message_id();
+
+        let proc = self.get_app_state_processor();
+        if !proc.mark_recovery_requested(collection).await {
+            // One is already outstanding, and the reply that is coming answers
+            // this ask too. Suppressing the duplicate is also what keeps the
+            // marker honest: a second send that failed would otherwise withdraw
+            // the first request's only record of itself.
+            debug!("A recovery for {collection} is already outstanding; not asking again");
+            return Ok(String::new());
+        }
+        proc.note_recovery_request_id(collection, &request_id).await;
+        match self
+            .send_peer_message_with_id(peer_target, &msg, &request_id)
+            .await
+        {
+            Ok(()) => Ok(request_id),
+            Err(e) => {
+                // By id, not by name. The window this marker holds is shorter
+                // than a send can take, so by now another ask for the same
+                // collection may have replaced this entry -- and withdrawing by
+                // name would take *its* marker, leaving a request that really is
+                // on the wire with nothing to recognise its answer. Taking by id
+                // withdraws this ask or nothing.
+                proc.take_recovery_request_by_id(&request_id).await;
+                Err(e)
+            }
+        }
+    }
+
     /// Sends a peer message (message to our own devices).
     /// This is used for PDO requests and similar device-to-device communication.
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.pdo.send_peer_message", level = "debug", skip_all, fields(to = %to.observe()), err(Debug)))]
@@ -303,20 +438,32 @@ impl Client {
         msg: &wa::Message,
     ) -> Result<String, anyhow::Error> {
         let msg_id = self.generate_message_id();
+        self.send_peer_message_with_id(to, msg, &msg_id).await?;
+        Ok(msg_id)
+    }
 
+    /// [`Self::send_peer_message`] for a caller that has to know the id before
+    /// the send, because it records something against it that an answer can
+    /// arrive and look up before this returns.
+    async fn send_peer_message_with_id(
+        self: &Arc<Self>,
+        to: Jid,
+        msg: &wa::Message,
+        msg_id: &str,
+    ) -> Result<(), anyhow::Error> {
         // Send with peer category and high priority
         self.send_message_impl(
             to,
             msg,
             crate::send::SendPipelineOptions {
-                request_id: Some(&msg_id),
+                request_id: Some(msg_id),
                 peer: true,
                 ..Default::default()
             },
         )
         .await?;
 
-        Ok(msg_id)
+        Ok(())
     }
 
     /// Handles a PDO response message from our primary phone.
@@ -355,6 +502,282 @@ impl Client {
                     .await;
             }
         }
+
+        // One response can carry several recovery results, and they all answer
+        // the one ask this stanza id was made about -- so exactly one of them is
+        // handled, and a populated one wins. Taking them in order would let an
+        // empty result arriving first spend the request the good one still
+        // needs; an empty one is answered only when nothing here carries a
+        // collection at all.
+        let recoveries: Vec<_> = response
+            .peer_data_operation_result
+            .iter()
+            .filter_map(|result| result.syncd_snapshot_fatal_recovery_response.as_option())
+            .collect();
+        if let Some(recovery) = recoveries
+            .iter()
+            // Present and non-empty. A zero-length field is a result that
+            // carries nothing -- an empty payload decodes to a default recovery
+            // naming no collection, which would then spend the request in the
+            // mismatch path and leave a usable sibling unconsidered.
+            .find(|recovery| {
+                recovery
+                    .collection_snapshot
+                    .as_deref()
+                    .is_some_and(|blob| !blob.is_empty())
+            })
+            .or(recoveries.first())
+        {
+            self.handle_syncd_snapshot_recovery_response(recovery, request_id)
+                .await;
+        } else {
+            // A response under this id carrying no recovery result at all --
+            // an empty list, or only somebody else's result. It is still the
+            // answer to the ask that id was made about, so it spends it:
+            // leaving the request would suppress every retry for the rest of
+            // the window over a question already answered, badly.
+            //
+            // Claimed before it is spent, for the reason the absent-blob path
+            // is: a resultless response arriving beside one already being
+            // decoded must not delete the request that decoder will take at the
+            // end, or a usable recovery is dropped and the collection stays
+            // behind the MAC failure it started at.
+            let proc = self.get_app_state_processor();
+            if let Some(name) = proc.claim_recovery_request_by_id(request_id).await {
+                proc.take_recovery_request_by_id(request_id).await;
+                warn!(
+                    "Snapshot recovery response for {name} carries no result; it may be asked for again"
+                );
+            }
+        }
+    }
+
+    /// Apply a collection the primary sent back after a snapshot we refused.
+    ///
+    /// Logged rather than returned: this arrives on the inbound message path,
+    /// long after the sync that asked, and there is nobody left to hand an error
+    /// to. What a failure costs is the collection staying where it was, which is
+    /// where it already was.
+    async fn handle_syncd_snapshot_recovery_response(
+        &self,
+        response: &wa::message::peer_data_operation_request_response_message::peer_data_operation_result::SyncDSnapshotFatalRecoveryResponse,
+        request_id: &str,
+    ) {
+        // An empty byte field is a result carrying nothing, handled as the
+        // absent one: decoding it would produce a default recovery naming no
+        // collection, which is a mismatch against the ask and reads in the log
+        // as the primary having answered about something else.
+        let Some(blob) = response
+            .collection_snapshot
+            .as_deref()
+            .filter(|blob| !blob.is_empty())
+        else {
+            // Answered, with nothing. Leaving the marker would suppress every
+            // retry for the rest of the window over an ask already spent.
+            //
+            // Claimed first, though, rather than removed outright: one response
+            // can carry several results under one id, so an empty one arriving
+            // beside a good one would otherwise delete the request the good
+            // one's decoder is still working against -- and that task, finding
+            // no marker at the end, would drop a usable recovery.
+            let proc = self.get_app_state_processor();
+            let Some(name) = proc.claim_recovery_request_by_id(request_id).await else {
+                warn!(
+                    "Ignoring a snapshot recovery with no collection: nothing here is waiting on that ask"
+                );
+                return;
+            };
+            proc.take_recovery_request_by_id(request_id).await;
+            warn!(
+                "Snapshot recovery response for {name} carries no collection; it may be asked for again"
+            );
+            return;
+        };
+
+        // Which collection this id was asked about -- claimed, before a byte is
+        // cloned or inflated.
+        //
+        // Correlating here rather than after the decode is the difference
+        // between a map read and up to 64 MiB of inflate plus a record graph
+        // built for a reply that was never eligible to apply. Claiming rather
+        // than reading is what makes one ask cost one decode: a response that
+        // repeats the result, or a second copy arriving before the first is
+        // consumed, would otherwise each spawn a collection-sized job against
+        // the same request.
+        //
+        // The payload names a collection too, but that is the reply's claim
+        // about itself -- and with two recoveries outstanding, a reply carrying
+        // A's id and B's name would select B's marker and be checked against its
+        // own name, which always agrees. So the ask decides.
+        let Some(asked) = self
+            .get_app_state_processor()
+            .claim_recovery_request_by_id(request_id)
+            .await
+        else {
+            warn!("Ignoring a snapshot recovery nothing here asked for");
+            return;
+        };
+
+        // The whole continuation is detached, not just the CPU inside it.
+        // `receive.rs` awaits this handler inline and inbound processing is
+        // serialized per chat, so awaiting the decode -- even one that runs on
+        // the blocking pool -- keeps the self-chat lane closed behind it, and
+        // the primary's key shares queue behind a payload of the primary's own
+        // choosing. Nothing here has an answer to give back.
+        let Some(client) = self.self_weak.get().and_then(|w| w.upgrade()) else {
+            return;
+        };
+        let compressed = response.is_compressed.unwrap_or(false);
+
+        // Bounded before it is copied, not after. The ceiling was enforced
+        // inside the task, so a malformed gigabyte reply was still allocated and
+        // memcpy'd in full on the inbound lane before anything looked at its
+        // size -- on the self-chat lane, where the primary's key shares queue
+        // behind it.
+        //
+        // Both branches are bounded, by what each can legitimately be. An
+        // uncompressed reply is its own output, so the ceiling is the ceiling. A
+        // compressed one is measured against the largest a stream whose *output*
+        // fits can be on the wire: deflate stores what it cannot compress, at a
+        // cost of about a thousandth plus a small header, so anything past that
+        // could not have inflated to something this path would accept. The
+        // inflate still enforces the real ceiling on the way out; this only
+        // decides whether the bytes are worth copying.
+        let max_wire = if compressed {
+            wacore::history_sync::MAX_DECOMPRESSED
+                + wacore::history_sync::MAX_DECOMPRESSED / 1000
+                + 64
+        } else {
+            wacore::history_sync::MAX_DECOMPRESSED
+        };
+        if blob.len() as u64 > max_wire {
+            self.get_app_state_processor()
+                .take_recovery_request_by_id(request_id)
+                .await;
+            warn!(
+                "Snapshot recovery for {asked} is {} bytes on the wire, over the {max_wire} this path allows; refusing it",
+                blob.len()
+            );
+            return;
+        }
+        let payload = blob.to_vec();
+        let request_id = request_id.to_string();
+        let generation = self
+            .connection_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+
+        self.runtime.spawn_detached(Box::pin(async move {
+            // Up to 64 MiB of inflate plus a decode wide enough that `waproto`
+            // pins its instantiation: off the runtime's async workers either
+            // way.
+            let decoded = wacore::runtime::blocking(&*client.runtime, move || {
+                let bytes = if compressed {
+                    let mut reader = wacore_binary::zlib_pool::InflateReader::new(
+                        &payload,
+                        wacore::history_sync::MAX_DECOMPRESSED,
+                    );
+                    let mut plain = Vec::new();
+                    loop {
+                        match reader.ensure(1) {
+                            Ok(true) => {}
+                            // `ensure(1)` answers false only with nothing left.
+                            Ok(false) => break,
+                            Err(e) => return Err(format!("failed to decompress: {e}")),
+                        }
+                        let taken = {
+                            let chunk = reader.available();
+                            plain.extend_from_slice(chunk);
+                            chunk.len()
+                        };
+                        if taken == 0 {
+                            break;
+                        }
+                        reader.consume(taken);
+                    }
+                    // Running out is not ending. A payload cut short after a
+                    // parseable prefix would otherwise be applied as the whole
+                    // collection, and a short collection cannot be told from a
+                    // real one -- nothing here knows how many records to expect.
+                    if !reader.stream_ended() {
+                        return Err("is a truncated compressed stream".to_string());
+                    }
+                    // And ending is not all of it. A complete stream followed by
+                    // a second member or by trailing bytes leaves the reader
+                    // done with input to spare, and taking the first member for
+                    // the collection is the same silent short read the check
+                    // above refuses -- reached from the other direction.
+                    let (read, whole) = reader.compressed_progress();
+                    if read != whole {
+                        return Err(format!(
+                            "carries {} byte(s) after its compressed stream",
+                            whole - read
+                        ));
+                    }
+                    std::borrow::Cow::Owned(plain)
+                } else {
+                    // Already bounded: the raw blob was measured against the
+                    // same ceiling before it was copied, which is what an
+                    // uncompressed reply needs -- the decode allocates a record
+                    // graph from whatever arrives.
+                    std::borrow::Cow::Borrowed(&payload[..])
+                };
+                waproto::codec::syncd_snapshot_recovery_decode(&bytes)
+                    .map_err(|e| format!("failed to decode: {e}"))
+            })
+            .await;
+
+            let recovery = match decoded {
+                Ok(recovery) => recovery,
+                Err(e) => {
+                    // The request was answered, badly. Its collection name is
+                    // inside the payload that would not read, so the id the
+                    // answer carried is the only way to say which ask this was
+                    // -- and leaving the marker would suppress every retry for
+                    // the rest of the window over a question already answered.
+                    let proc = client.get_app_state_processor();
+                    match proc.take_recovery_request_by_id(&request_id).await {
+                        Some(name) => warn!(
+                            "Snapshot recovery response for {name} {e}; the collection may be asked for again"
+                        ),
+                        None => warn!("Snapshot recovery response {e}"),
+                    }
+                    return;
+                }
+            };
+
+            let proc = client.get_app_state_processor();
+
+            match recovery.collection_name.as_deref() {
+                Some(named) if named == asked => {}
+                other => {
+                    proc.take_recovery_request_by_id(&request_id).await;
+                    warn!(
+                        "Snapshot recovery answering the ask for {asked} names {}; refusing it",
+                        other.unwrap_or("nothing")
+                    );
+                    return;
+                }
+            }
+
+            // The reservation is a connection's, and a disconnect clears the
+            // registry wholesale -- so a task that started before one and
+            // applied after it would write beside the new connection's own sync
+            // and dispatch events for a session that has since been replaced.
+            if client.connection_generation.load(std::sync::atomic::Ordering::Acquire) != generation
+            {
+                // Spent, like every other ending that is not an apply. The ask
+                // was answered; dropping the answer because the connection went
+                // is this side's decision, and leaving the marker would have the
+                // next connection unable to ask again until the window ran out.
+                proc.take_recovery_request_by_id(&request_id).await;
+                debug!("Dropping the {asked} recovery: the connection it belongs to is gone");
+                return;
+            }
+
+            client
+                .apply_recovered_collection(&asked, &request_id, generation, recovery)
+                .await;
+        }));
     }
 
     async fn handle_placeholder_resend_response(
@@ -390,7 +813,7 @@ impl Client {
         let response_from_me = key.from_me.unwrap_or(false);
 
         let cache_key = match remote_jid_str.parse::<Jid>() {
-            Ok(jid) => ChatMessageId::new(jid, msg_id.to_owned()),
+            Ok(jid) => ChatMessageId::new(jid, msg_id.into()),
             Err(_) => {
                 warn!(
                     "PDO response has unparseable remote_jid: {}",
@@ -400,7 +823,19 @@ impl Client {
             }
         };
 
-        let pending = self.pdo_pending_requests.remove(&cache_key).await;
+        // The response's namespace can differ from the one used when the
+        // request was cached: a migrated 1:1 request may cross the PN/LID
+        // boundary between these two legs. Keep the response key primary, and
+        // only spend one alias lookup after that direct key misses. Groups do
+        // not have a PN/LID namespace and must never take this path.
+        let mut pending = self.pdo_pending_requests.remove(&cache_key).await;
+        if pending.is_none()
+            && !cache_key.chat.is_group()
+            && let Some(alias) = self.swap_pn_lid_namespace(&cache_key.chat).await
+        {
+            let alias_key = ChatMessageId::new(alias, msg_id.into());
+            pending = self.pdo_pending_requests.remove(&alias_key).await;
+        }
 
         // The pending map is keyed by `(chat, id)`, which does not name a
         // sender, and the slot expires and can be evicted while a request is
@@ -414,12 +849,15 @@ impl Client {
         // through to rebuilding from the response, which is the authority on
         // who sent what and is the same path a missing entry already takes.
         let pending = pending.filter(|entry| {
+            if response_from_me != entry.message_info.source.is_from_me {
+                return false;
+            }
             let Some(participant) = response_participant.as_deref() else {
                 // Legitimately absent for a DM and for anything `from_me`, so
                 // the only thing left to agree on is the direction. An incoming
                 // and an outgoing message of one DM can share an id, and both
                 // their responses omit the participant.
-                return response_from_me == entry.message_info.source.is_from_me;
+                return true;
             };
             let Ok(participant) = participant.parse::<Jid>() else {
                 return false;
@@ -473,17 +911,27 @@ impl Client {
             return;
         };
 
-        {
+        let ephemeral_expiration = {
             use wacore::proto_helpers::MessageExt;
-            let mi = Arc::make_mut(&mut message_info);
-            if mi.ephemeral_expiration.is_none() {
-                mi.ephemeral_expiration = message.get_base_message().get_ephemeral_expiration();
-            }
-            mi.unavailable_request_id = if request_id.is_empty() {
-                None
-            } else {
-                Some(request_id.to_owned())
-            };
+            message.get_base_message().get_ephemeral_expiration()
+        };
+        Arc::make_mut(&mut message_info).unavailable_request_id = if request_id.is_empty() {
+            None
+        } else {
+            Some(request_id.to_owned())
+        };
+
+        let claim = self.dispatch_gate_enabled()
+            && !crate::features::message_edit::carries_secret_encrypted(&message);
+        let fingerprint = claim.then(|| crate::message::MessageDispatch::fingerprint(&message));
+        let mut publication = crate::message::PublicationGuard::default();
+        let suppressed =
+            self.admit_message_dispatch(&message_info, true, fingerprint, false, &mut publication);
+        if suppressed {
+            self.duplicate_dispatch_suppressed
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            wacore::telemetry::recv("duplicate_resend");
+            return;
         }
 
         info!(
@@ -503,10 +951,12 @@ impl Client {
                     )
                     .message(Arc::from(message))
                     .info(message_info)
+                    .maybe_ephemeral_expiration(ephemeral_expiration)
                     .build()]))
                     .origin(wacore::types::events::BatchOrigin::Live)
                     .build(),
             ));
+        publication.complete();
     }
 
     /// Reconstructs a MessageInfo from a WebMessageInfo.
@@ -569,7 +1019,7 @@ impl Client {
             .unwrap_or_else(wacore::time::now_utc);
 
         Ok(MessageInfo {
-            id: id.unwrap_or_default().to_owned(),
+            id: id.unwrap_or_default().into(),
             server_id: 0,
             r#type: None,
             source: MessageSource {
@@ -584,23 +1034,21 @@ impl Client {
                 recipient: None,
             },
             timestamp,
-            push_name: push_name.unwrap_or_default().to_owned(),
+            push_name: push_name.unwrap_or_default().into(),
             category: MessageCategory::default(),
             multicast: false,
             media_type: None,
             edit: EditAttribute::default(),
             bot_info: None,
-            meta_info: MsgMetaInfo::default(),
+            meta_info: None,
             verified_name: None,
             device_sent_meta: None,
-            ephemeral_expiration: None,
             is_offline: false,
             unavailable_request_id: None,
             server_timestamp_us: None,
             verified_level: None,
             verified_name_serial: None,
             peer_recipient_pn: None,
-            comment_target: None,
             bcl_participants: Vec::new(),
         })
     }
@@ -749,6 +1197,46 @@ mod tests {
         }
     }
 
+    fn make_placeholder_response(
+        remote_jid: &str,
+        from_me: bool,
+        id: &str,
+        participant: Option<&str>,
+    ) -> waproto::whatsapp::message::peer_data_operation_request_response_message::peer_data_operation_result::PlaceholderMessageResendResponse
+    {
+        use buffa::Message as _;
+        let mut web_msg = make_web_msg(remote_jid, from_me, id, participant);
+        web_msg.message = buffa::MessageField::some(waproto::whatsapp::Message {
+            conversation: Some("recovered by the phone".to_owned()),
+            ..Default::default()
+        });
+        waproto::whatsapp::message::peer_data_operation_request_response_message::peer_data_operation_result::PlaceholderMessageResendResponse {
+            web_message_info_bytes: Some(web_msg.encode_to_vec()),
+        }
+    }
+
+    fn make_dm_pending_info(
+        chat: &str,
+        sender_alt: &str,
+        id: &str,
+        addressing_mode: wacore::types::message::AddressingMode,
+    ) -> std::sync::Arc<wacore::types::message::MessageInfo> {
+        use wacore::types::message::{MessageInfo, MessageSource};
+        let chat: Jid = chat.parse().expect("chat jid");
+        std::sync::Arc::new(MessageInfo {
+            id: id.into(),
+            push_name: "pending metadata".into(),
+            source: MessageSource {
+                chat: chat.clone(),
+                sender: chat,
+                addressing_mode: Some(addressing_mode),
+                sender_alt: Some(sender_alt.parse().expect("sender alt jid")),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    }
+
     /// The reconstruction path preserves the real author for status
     /// broadcasts via `key.participant`. Using `remote_jid` as sender
     /// would surface `status@broadcast` and erase the author.
@@ -867,7 +1355,7 @@ mod tests {
     ) -> std::sync::Arc<wacore::types::message::MessageInfo> {
         use wacore::types::message::{MessageInfo, MessageSource};
         std::sync::Arc::new(MessageInfo {
-            id: id.to_owned(),
+            id: id.into(),
             source: MessageSource {
                 chat: chat.parse().expect("chat jid"),
                 sender: sender.parse().expect("sender jid"),
@@ -1063,7 +1551,7 @@ mod tests {
 
         let chat = "120363000000000001@g.us";
         let msg_id = "PDO_ATTRIBUTION";
-        let key = ChatMessageId::new(chat.parse().expect("chat jid"), msg_id.to_owned());
+        let key = ChatMessageId::new(chat.parse().expect("chat jid"), msg_id.into());
 
         // Whoever holds the slot when the response lands is not who it answers.
         client
@@ -1081,7 +1569,7 @@ mod tests {
             key: buffa::MessageField::some(waproto::whatsapp::MessageKey {
                 remote_jid: Some(chat.to_owned()),
                 from_me: Some(false),
-                id: Some(msg_id.to_owned()),
+                id: Some(msg_id.into()),
                 participant: Some("111222333444555@lid".to_owned()),
             }),
             message: buffa::MessageField::some(waproto::whatsapp::Message {
@@ -1139,7 +1627,7 @@ mod tests {
 
         let chat = "120363000000000001@g.us";
         let msg_id = "PDO_LID_ALIAS";
-        let key = ChatMessageId::new(chat.parse().expect("chat jid"), msg_id.to_owned());
+        let key = ChatMessageId::new(chat.parse().expect("chat jid"), msg_id.into());
 
         // What a LID-addressed group delivery leaves behind: LID in `sender`,
         // the PN the stanza carried in `sender_alt`.
@@ -1161,7 +1649,7 @@ mod tests {
             key: buffa::MessageField::some(waproto::whatsapp::MessageKey {
                 remote_jid: Some(chat.to_owned()),
                 from_me: Some(false),
-                id: Some(msg_id.to_owned()),
+                id: Some(msg_id.into()),
                 // The phone answers in PN.
                 participant: Some("15550001234@s.whatsapp.net".to_owned()),
             }),
@@ -1204,6 +1692,269 @@ mod tests {
         );
     }
 
+    /// A response in PN can recover a request cached in LID after migration.
+    /// The pending MessageInfo, including its addressing metadata, must win over
+    /// lossy reconstruction from the response.
+    #[tokio::test]
+    async fn a_pn_response_retries_the_lid_pending_key() {
+        use wacore::types::events::ChannelEventHandler;
+        use wacore::types::message::ChatMessageId;
+
+        let client = setup_reconstruct_client().await;
+        let pn = "5511999998888@s.whatsapp.net";
+        let lid = "236395184570386@lid";
+        let msg_id = "PDO_DM_PN_FROM_LID";
+        client
+            .lid_pn_cache
+            .add(&wacore::types::lid_pn::LidPnEntry {
+                lid: "236395184570386".into(),
+                phone_number: "5511999998888".into(),
+                created_at: 0,
+                learning_source: wacore::types::lid_pn::LearningSource::Usync,
+            })
+            .await;
+        let pending =
+            make_dm_pending_info(lid, pn, msg_id, wacore::types::message::AddressingMode::Lid);
+        client
+            .pdo_pending_requests
+            .insert(
+                ChatMessageId::new(lid.parse().expect("lid"), msg_id.into()),
+                super::PendingPdoRequest {
+                    message_info: pending,
+                    requested_at: wacore::time::Instant::now(),
+                },
+            )
+            .await;
+
+        let (handler, rx) = ChannelEventHandler::new();
+        client.core.event_bus.subscribe_handler(handler).detach();
+        let response = make_placeholder_response(pn, false, msg_id, None);
+        client
+            .handle_placeholder_resend_response(&response, "req-pn-alias")
+            .await;
+
+        assert!(
+            client
+                .pdo_pending_requests
+                .get(&ChatMessageId::new(lid.parse().unwrap(), msg_id.into()))
+                .await
+                .is_none()
+        );
+        let mut infos = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            infos.extend(event.messages().map(|message| message.info.clone()));
+        }
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].source.chat.to_string(), lid);
+        assert_eq!(
+            infos[0].source.addressing_mode,
+            Some(wacore::types::message::AddressingMode::Lid)
+        );
+        assert_eq!(infos[0].source.sender_alt.as_ref().unwrap().to_string(), pn);
+        assert_eq!(infos[0].push_name, "pending metadata");
+    }
+
+    /// The reverse migration spelling is also recovered, but only after the
+    /// response's direct key misses.
+    #[tokio::test]
+    async fn a_lid_response_retries_the_pn_pending_key() {
+        use wacore::types::events::ChannelEventHandler;
+        use wacore::types::message::ChatMessageId;
+
+        let client = setup_reconstruct_client().await;
+        let pn = "5511999998888@s.whatsapp.net";
+        let lid = "236395184570386@lid";
+        let msg_id = "PDO_DM_LID_FROM_PN";
+        client
+            .lid_pn_cache
+            .add(&wacore::types::lid_pn::LidPnEntry {
+                lid: "236395184570386".into(),
+                phone_number: "5511999998888".into(),
+                created_at: 0,
+                learning_source: wacore::types::lid_pn::LearningSource::Usync,
+            })
+            .await;
+        client
+            .pdo_pending_requests
+            .insert(
+                ChatMessageId::new(pn.parse().expect("pn"), msg_id.into()),
+                super::PendingPdoRequest {
+                    message_info: make_dm_pending_info(
+                        pn,
+                        lid,
+                        msg_id,
+                        wacore::types::message::AddressingMode::Pn,
+                    ),
+                    requested_at: wacore::time::Instant::now(),
+                },
+            )
+            .await;
+
+        let (handler, rx) = ChannelEventHandler::new();
+        client.core.event_bus.subscribe_handler(handler).detach();
+        let response = make_placeholder_response(lid, false, msg_id, None);
+        client
+            .handle_placeholder_resend_response(&response, "req-lid-alias")
+            .await;
+
+        assert!(
+            client
+                .pdo_pending_requests
+                .get(&ChatMessageId::new(pn.parse().unwrap(), msg_id.into()))
+                .await
+                .is_none()
+        );
+        let mut infos = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            infos.extend(event.messages().map(|message| message.info.clone()));
+        }
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].source.chat.to_string(), pn);
+        assert_eq!(
+            infos[0].source.addressing_mode,
+            Some(wacore::types::message::AddressingMode::Pn)
+        );
+        assert_eq!(
+            infos[0].source.sender_alt.as_ref().unwrap().to_string(),
+            lid
+        );
+        assert_eq!(infos[0].push_name, "pending metadata");
+    }
+
+    /// A direct hit remains primary: an alias entry is not consumed or allowed
+    /// to replace the metadata belonging to the response's direct key.
+    #[tokio::test]
+    async fn pdo_direct_pending_hit_does_not_consume_alias() {
+        use wacore::types::events::ChannelEventHandler;
+        use wacore::types::message::ChatMessageId;
+
+        let client = setup_reconstruct_client().await;
+        let pn = "5511999998888@s.whatsapp.net";
+        let lid = "236395184570386@lid";
+        let msg_id = "PDO_DM_DIRECT";
+        client
+            .lid_pn_cache
+            .add(&wacore::types::lid_pn::LidPnEntry {
+                lid: "236395184570386".into(),
+                phone_number: "5511999998888".into(),
+                created_at: 0,
+                learning_source: wacore::types::lid_pn::LearningSource::Usync,
+            })
+            .await;
+        client
+            .pdo_pending_requests
+            .insert(
+                ChatMessageId::new(pn.parse().unwrap(), msg_id.into()),
+                super::PendingPdoRequest {
+                    message_info: make_dm_pending_info(
+                        pn,
+                        lid,
+                        msg_id,
+                        wacore::types::message::AddressingMode::Pn,
+                    ),
+                    requested_at: wacore::time::Instant::now(),
+                },
+            )
+            .await;
+        client
+            .pdo_pending_requests
+            .insert(
+                ChatMessageId::new(lid.parse().unwrap(), msg_id.into()),
+                super::PendingPdoRequest {
+                    message_info: make_dm_pending_info(
+                        lid,
+                        pn,
+                        msg_id,
+                        wacore::types::message::AddressingMode::Lid,
+                    ),
+                    requested_at: wacore::time::Instant::now(),
+                },
+            )
+            .await;
+
+        let (handler, rx) = ChannelEventHandler::new();
+        client.core.event_bus.subscribe_handler(handler).detach();
+        let response = make_placeholder_response(pn, false, msg_id, None);
+        client
+            .handle_placeholder_resend_response(&response, "req-direct")
+            .await;
+
+        assert!(
+            client
+                .pdo_pending_requests
+                .get(&ChatMessageId::new(pn.parse().unwrap(), msg_id.into()))
+                .await
+                .is_none()
+        );
+        assert!(
+            client
+                .pdo_pending_requests
+                .get(&ChatMessageId::new(lid.parse().unwrap(), msg_id.into()))
+                .await
+                .is_some()
+        );
+        let mut infos = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            infos.extend(event.messages().map(|message| message.info.clone()));
+        }
+        assert_eq!(infos.len(), 1);
+        assert_eq!(
+            infos[0].source.addressing_mode,
+            Some(wacore::types::message::AddressingMode::Pn)
+        );
+    }
+
+    /// Without a mapping, a namespace mismatch still takes the existing
+    /// reconstruction path instead of guessing an alias.
+    #[tokio::test]
+    async fn pdo_alias_miss_without_mapping_reconstructs_response() {
+        use wacore::types::events::ChannelEventHandler;
+        use wacore::types::message::ChatMessageId;
+
+        let client = setup_reconstruct_client().await;
+        let pn = "5511999998888@s.whatsapp.net";
+        let lid = "236395184570386@lid";
+        let msg_id = "PDO_DM_NO_MAPPING";
+        client
+            .pdo_pending_requests
+            .insert(
+                ChatMessageId::new(pn.parse().unwrap(), msg_id.into()),
+                super::PendingPdoRequest {
+                    message_info: make_dm_pending_info(
+                        pn,
+                        lid,
+                        msg_id,
+                        wacore::types::message::AddressingMode::Pn,
+                    ),
+                    requested_at: wacore::time::Instant::now(),
+                },
+            )
+            .await;
+
+        let (handler, rx) = ChannelEventHandler::new();
+        client.core.event_bus.subscribe_handler(handler).detach();
+        let response = make_placeholder_response(lid, false, msg_id, None);
+        client
+            .handle_placeholder_resend_response(&response, "req-no-mapping")
+            .await;
+
+        assert!(
+            client
+                .pdo_pending_requests
+                .get(&ChatMessageId::new(pn.parse().unwrap(), msg_id.into()))
+                .await
+                .is_some()
+        );
+        let mut infos = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            infos.extend(event.messages().map(|message| message.info.clone()));
+        }
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].source.chat.to_string(), lid);
+        assert_eq!(infos[0].source.sender.to_string(), lid);
+        assert_eq!(infos[0].push_name, "");
+    }
+
     /// Two directions of one DM can share an id, and both their responses omit
     /// the participant — so direction is the only thing left to agree on.
     #[tokio::test]
@@ -1219,11 +1970,11 @@ mod tests {
 
         let peer = "5511999998888@s.whatsapp.net";
         let msg_id = "PDO_DIRECTION";
-        let key = ChatMessageId::new(peer.parse().expect("chat jid"), msg_id.to_owned());
+        let key = ChatMessageId::new(peer.parse().expect("chat jid"), msg_id.into());
 
         // The slot holds the outgoing half of the conversation.
         let outgoing = MessageInfo {
-            id: msg_id.to_owned(),
+            id: msg_id.into(),
             source: MessageSource {
                 chat: peer.parse().expect("chat jid"),
                 sender: peer.parse().expect("chat jid"),
@@ -1248,7 +1999,7 @@ mod tests {
             key: buffa::MessageField::some(waproto::whatsapp::MessageKey {
                 remote_jid: Some(peer.to_owned()),
                 from_me: Some(false),
-                id: Some(msg_id.to_owned()),
+                id: Some(msg_id.into()),
                 participant: None,
             }),
             message: buffa::MessageField::some(waproto::whatsapp::Message {
@@ -1337,11 +2088,11 @@ mod tests {
         let client = setup_reconstruct_client().await;
         let chat = "5511999998888@s.whatsapp.net";
         let msg_id = "PDO_ONCE_3";
-        let key = ChatMessageId::new(chat.parse().expect("chat jid"), msg_id.to_owned());
+        let key = ChatMessageId::new(chat.parse().expect("chat jid"), msg_id.into());
         // A DM: the chat jid is the sender, which is what the gate names.
         let gate_key = wacore::types::message::SenderMessageId::new(
             chat.parse().expect("chat jid"),
-            msg_id.to_owned(),
+            msg_id.into(),
             chat.parse().expect("chat jid"),
         );
 
@@ -1361,7 +2112,7 @@ mod tests {
             key: buffa::MessageField::some(waproto::whatsapp::MessageKey {
                 remote_jid: Some(chat.to_owned()),
                 from_me: Some(false),
-                id: Some(msg_id.to_owned()),
+                id: Some(msg_id.into()),
                 participant: None,
             }),
             ..Default::default()

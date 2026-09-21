@@ -37,11 +37,28 @@ fn setup_mutations(n: usize) -> Vec<wa::SyncdMutation> {
         .collect()
 }
 
-/// 10 = a typical incremental patch; 1000 = the resume-sync upper bound, where
-/// the quadratic scan does ~500k Vec<u8> compares.
+/// 10 and 1000 straddle `MAC_DEDUP_SCAN_LIMIT` (64): 10 takes the linear
+/// scan — distinct indices are its worst case, a full compare per element —
+/// while 1000 takes the sort+dedup path, the resume-sync upper bound.
 #[divan::bench(args = [10, 1000])]
 fn bench_collect_unique_index_macs(bencher: divan::Bencher, n: usize) {
     bencher
         .with_inputs(|| setup_mutations(n))
+        .bench_refs(|mutations| black_box(collect_unique_index_macs(black_box(mutations))));
+}
+
+/// Same widths over one repeated index: the dedup early-out on the scan path
+/// (10) and an already-sorted input on the sort path (1000). The delta
+/// against the distinct rows above is the best-vs-worst spread a swap
+/// (HashSet, sort) must beat on both ends before it lands.
+fn setup_duplicate_mutations(n: usize) -> Vec<wa::SyncdMutation> {
+    let one = setup_mutations(1).pop().expect("one mutation");
+    vec![one; n]
+}
+
+#[divan::bench(args = [10, 1000])]
+fn bench_collect_unique_index_macs_duplicates(bencher: divan::Bencher, n: usize) {
+    bencher
+        .with_inputs(|| setup_duplicate_mutations(n))
         .bench_refs(|mutations| black_box(collect_unique_index_macs(black_box(mutations))));
 }

@@ -733,6 +733,7 @@ mod tests {
     use wacore_binary::Server;
 
     use crate::lid_pn_cache::LearningSource;
+    #[cfg(not(target_arch = "wasm32"))]
     use crate::test_utils::seed_peer_session;
 
     async fn memory_client() -> (Arc<Client>, Arc<InMemoryBackend>) {
@@ -1293,14 +1294,15 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn participant_fanout_reuses_durable_session_leases() {
         let (client, backend) = memory_client().await;
         let recipient = Jid::new("15550002000", Server::Pn);
         client
             .update_device_list(DeviceListRecord {
-                user: recipient.user.to_string(),
-                devices: vec![DeviceInfo::new(0, None), DeviceInfo::new(1, None)],
+                user: recipient.user.as_str().into(),
+                devices: [DeviceInfo::new(0, None), DeviceInfo::new(1, None)].into(),
                 timestamp: wacore::time::now_secs(),
                 phash: None,
                 raw_id: None,

@@ -32,11 +32,11 @@ async fn test_community_create() -> anyhow::Result<()> {
     );
     assert_eq!(group_type(&result.metadata), GroupType::Community);
 
-    // Cross-check against a fresh `get_metadata` query.
+    // Cross-check against a fresh `fetch_metadata` query.
     let metadata = client
         .client
         .groups()
-        .get_metadata(&result.metadata.id)
+        .fetch_metadata(&result.metadata.id)
         .await?;
     assert!(metadata.is_parent_group, "should be a parent group");
     assert_eq!(group_type(&metadata), GroupType::Community);
@@ -305,7 +305,7 @@ async fn test_community_deactivate() -> anyhow::Result<()> {
     let metadata_result = client
         .client
         .groups()
-        .get_metadata(&community.metadata.id)
+        .fetch_metadata(&community.metadata.id)
         .await;
     match metadata_result {
         Ok(metadata) => {
@@ -360,10 +360,10 @@ async fn test_community_query_linked_group() -> anyhow::Result<()> {
         .await?;
 
     assert_eq!(metadata.id, group.metadata.id, "metadata JID should match");
-    assert_eq!(metadata.subject, "Queryable Sub");
+    assert_eq!(metadata.subject.as_deref(), Some("Queryable Sub"));
 
     info!(
-        "Queried linked group: {} (subject={})",
+        "Queried linked group: {} (subject={:?})",
         metadata.id, metadata.subject
     );
 

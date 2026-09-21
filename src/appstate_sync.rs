@@ -17,6 +17,7 @@ mod tests {
     use wacore::appstate::keys::{ExpandedAppStateKeys, expand_app_state_keys};
     use wacore::appstate::patch_decode::{CollectionSyncError, PatchList, WAPatchName};
     use wacore::appstate::processor::AppStateMutationMAC;
+    use wacore::appstate_sync::RecoveryOutcome;
     use wacore::libsignal::crypto::aes_256_cbc_encrypt_into;
     use wacore::store::error::Result as StoreResult;
     use wacore::store::traits::{
@@ -39,6 +40,9 @@ mod tests {
         // lookups, so tests can pin which path the processor takes.
         singular_mac_calls: Arc<portable_atomic::AtomicU64>,
         batch_mac_calls: Arc<portable_atomic::AtomicU64>,
+        // Counts key reads, so a test can tell "before the recovery started"
+        // from "part-way through it".
+        sync_key_calls: Arc<portable_atomic::AtomicU64>,
     }
 
     // Implement SignalStore - Signal protocol cryptographic operations
@@ -106,6 +110,8 @@ mod tests {
     #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
     impl AppSyncStore for MockBackend {
         async fn get_sync_key(&self, key_id: &[u8]) -> StoreResult<Option<AppStateSyncKey>> {
+            self.sync_key_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(self.keys.lock().await.get(key_id).cloned())
         }
         async fn set_sync_key(&self, key_id: &[u8], key: AppStateSyncKey) -> StoreResult<()> {
@@ -113,14 +119,12 @@ mod tests {
             *self.latest_key_id.lock().await = Some(key_id.to_vec());
             Ok(())
         }
-        async fn get_version(&self, name: &str) -> StoreResult<HashState> {
-            Ok(self
-                .versions
-                .lock()
-                .await
-                .get(name)
-                .cloned()
-                .unwrap_or_default())
+        async fn get_version(&self, name: &str) -> StoreResult<Option<HashState>> {
+            Ok(self.versions.lock().await.get(name).cloned())
+        }
+        async fn delete_version(&self, name: &str) -> StoreResult<()> {
+            self.versions.lock().await.remove(name);
+            Ok(())
         }
         async fn set_version(&self, name: &str, state: HashState) -> StoreResult<()> {
             self.versions.lock().await.insert(name.to_string(), state);
@@ -345,6 +349,479 @@ mod tests {
         }
     }
 
+    /// Builds the reply a primary device sends back, with one record per index.
+    fn recovery_of(
+        collection: &str,
+        version: u64,
+        lthash: [u8; 128],
+        key_id: &[u8],
+        records: &[(&str, [u8; 32])],
+    ) -> wa::SyncdSnapshotRecovery {
+        wa::SyncdSnapshotRecovery {
+            version: buffa::MessageField::some(wa::SyncdVersion {
+                version: Some(version),
+            }),
+            collection_name: Some(collection.to_string()),
+            collection_lthash: Some(lthash.to_vec()),
+            mutation_records: records
+                .iter()
+                .map(|(index_json, value_mac)| wa::SyncdPlainTextRecord {
+                    value: buffa::MessageField::some(wa::SyncActionData {
+                        index: Some(index_json.as_bytes().to_vec()),
+                        version: Some(version as i32),
+                        // Carried, because it is the whole point: every consumer
+                        // event is built from `action_value`, so a regression
+                        // that dropped it would pass a suite asserting only the
+                        // index and the operation.
+                        value: buffa::MessageField::some(wa::SyncActionValue {
+                            mute_action: buffa::MessageField::some(
+                                wa::sync_action_value::MuteAction {
+                                    muted: Some(true),
+                                    ..Default::default()
+                                },
+                            ),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    key_id: Some(key_id.to_vec()),
+                    mac: Some(value_mac.to_vec()),
+                })
+                .collect(),
+        }
+    }
+
+    /// The version and the ltHash are the primary's, written as given.
+    ///
+    /// Folding the records to check them would be this side recomputing the very
+    /// thing it just failed to agree about, which is the whole reason the phone
+    /// was asked. What is derived locally is only each index MAC, from the index
+    /// the record carries in the clear -- the same split WA Web makes.
+    #[tokio::test]
+    async fn snapshot_recovery_writes_what_the_primary_sent() {
+        let backend = Arc::new(MockBackend::default());
+        let processor =
+            AppStateProcessor::new(backend.clone(), Arc::new(crate::runtime_impl::TokioRuntime));
+        let key_id = b"test_key_id".to_vec();
+        let master_key = [7u8; 32];
+        let keys = expand_app_state_keys(&master_key);
+        backend
+            .set_sync_key(
+                &key_id,
+                AppStateSyncKey {
+                    key_data: master_key.to_vec(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // A collection this side had already given up on: stuck, and marked so.
+        backend
+            .set_version(
+                "regular_low",
+                HashState {
+                    version: 0,
+                    mac_mismatch_fatal: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let lthash = [0x5Au8; 128];
+        let recovery = recovery_of(
+            "regular_low",
+            253,
+            lthash,
+            &key_id,
+            &[(r#"["mute","1@s.whatsapp.net"]"#, [0x11; 32])],
+        );
+
+        let outcome = processor
+            .apply_snapshot_recovery(recovery, "regular_low", &|| true)
+            .await
+            .expect("a recovery for the collection that was asked for applies");
+        let RecoveryOutcome::Applied(mutations) = outcome else {
+            panic!("a collection stuck at v0 is not ahead of anything: {outcome:?}");
+        };
+
+        assert_eq!(mutations.len(), 1);
+        assert_eq!(mutations[0].index, vec!["mute", "1@s.whatsapp.net"]);
+        let action = mutations[0]
+            .action_value
+            .as_ref()
+            .expect("the record's payload survives into the mutation");
+        assert_eq!(
+            action.mute_action.as_option().and_then(|m| m.muted),
+            Some(true),
+            "every consumer event is built from this; losing it would ship silently"
+        );
+        assert_eq!(
+            mutations[0].operation,
+            wa::syncd_mutation::SyncdOperation::SET,
+            "a recovered collection is what exists; there is nothing left to remove"
+        );
+
+        let stored = backend
+            .get_version("regular_low")
+            .await
+            .unwrap()
+            .expect("the collection is written");
+        assert_eq!(
+            stored.version, 253,
+            "the primary's version, not a computed one"
+        );
+        assert_eq!(stored.hash, lthash, "and the primary's ltHash, verbatim");
+        assert!(stored.bootstrapped, "a recovered collection has a baseline");
+        assert!(
+            !stored.mac_mismatch_fatal,
+            "the snapshot that could not be validated is not the collection we now hold"
+        );
+
+        // The MAC store has to be repopulated, or the next patch that overwrites
+        // an index has nothing to subtract.
+        let expected_index_mac = wacore::appstate::hash::generate_index_mac(
+            br#"["mute","1@s.whatsapp.net"]"#,
+            &keys.index,
+        );
+        let got = backend
+            .get_mutation_mac("regular_low", &expected_index_mac)
+            .await
+            .unwrap();
+        assert_eq!(
+            got.as_deref(),
+            Some(&[0x11u8; 32][..]),
+            "the record's own MAC is the value MAC; nothing is re-encrypted to get one"
+        );
+    }
+
+    /// Nothing waits for the reply, so the collection can move on while the
+    /// phone is answering. A recovery that lands behind where this side already
+    /// is must be discarded, not applied: rolling the version back would undo
+    /// real state and leave the next patch conflicting with a baseline nobody
+    /// is at.
+    #[tokio::test]
+    async fn a_recovery_that_arrives_behind_the_collection_is_discarded() {
+        let backend = Arc::new(MockBackend::default());
+        let processor =
+            AppStateProcessor::new(backend.clone(), Arc::new(crate::runtime_impl::TokioRuntime));
+
+        // A later sync got through while the phone was answering.
+        let current = HashState {
+            version: 260,
+            hash: [0x77; 128],
+            ..Default::default()
+        };
+        backend
+            .set_version("regular_low", current.clone())
+            .await
+            .unwrap();
+
+        let recovery = recovery_of("regular_low", 253, [0x5A; 128], b"k", &[]);
+        let outcome = processor
+            .apply_snapshot_recovery(recovery, "regular_low", &|| true)
+            .await
+            .expect("a stale recovery is discarded, not an error");
+
+        assert!(
+            matches!(
+                outcome,
+                RecoveryOutcome::Stale {
+                    held: 260,
+                    offered: 253
+                }
+            ),
+            "{outcome:?}"
+        );
+
+        let stored = backend.get_version("regular_low").await.unwrap().unwrap();
+        assert_eq!(stored.version, 260, "the newer version stands");
+        assert_eq!(stored.hash, current.hash, "and so does its ltHash");
+    }
+
+    /// The name the payload claims, against the name the ask was made about.
+    /// The caller resolves the latter from the request id, so this comparison is
+    /// what stops a reply carrying one collection's id and another's name from
+    /// overwriting a collection nobody asked about. WA Web compares the two the
+    /// same way.
+    #[tokio::test]
+    async fn snapshot_recovery_for_another_collection_is_refused() {
+        let backend = Arc::new(MockBackend::default());
+        let processor =
+            AppStateProcessor::new(backend.clone(), Arc::new(crate::runtime_impl::TokioRuntime));
+
+        let recovery = recovery_of("regular", 5, [0u8; 128], b"k", &[]);
+        let err = processor
+            .apply_snapshot_recovery(recovery, "regular_low", &|| true)
+            .await
+            .expect_err("a recovery naming another collection must be refused");
+        assert!(err.to_string().contains("regular_low"), "{err}");
+
+        assert!(
+            backend.get_version("regular").await.unwrap().is_none(),
+            "and nothing is written for the collection it did name"
+        );
+    }
+
+    /// The MAC store keeps one value per index, so a collection that names an
+    /// index twice persists one of them. Dispatching the loser beside the winner
+    /// would hand a consumer state the persisted collection does not describe --
+    /// and delivery is concurrent, so it could be the one that sticks. The
+    /// snapshot path picks the last record per index; so does this.
+    #[tokio::test]
+    async fn a_repeated_index_in_a_recovery_dispatches_only_its_last_record() {
+        let backend = Arc::new(MockBackend::default());
+        let processor =
+            AppStateProcessor::new(backend.clone(), Arc::new(crate::runtime_impl::TokioRuntime));
+        let key_id = b"test_key_id".to_vec();
+        let master_key = [7u8; 32];
+        let keys = expand_app_state_keys(&master_key);
+        backend
+            .set_sync_key(
+                &key_id,
+                AppStateSyncKey {
+                    key_data: master_key.to_vec(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // A second key, so the test can also pin what "the same index" means.
+        let other_key_id = b"another_key_id".to_vec();
+        let other_master_key = [9u8; 32];
+        let other_keys = expand_app_state_keys(&other_master_key);
+        backend
+            .set_sync_key(
+                &other_key_id,
+                AppStateSyncKey {
+                    key_data: other_master_key.to_vec(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let index = r#"["mute","1@s.whatsapp.net"]"#;
+        let mut recovery = recovery_of(
+            "regular_low",
+            253,
+            [0x5A; 128],
+            &key_id,
+            // The same index twice, a second index that must survive, and the
+            // first index again under another key.
+            &[
+                (index, [0x11; 32]),
+                (index, [0x22; 32]),
+                (r#"["mute","2@s.whatsapp.net"]"#, [0x33; 32]),
+                (index, [0x44; 32]),
+            ],
+        );
+        // The loser carries a payload the winner does not, so a regression that
+        // dispatched the wrong one of the pair is visible rather than merely
+        // mis-ordered: without this the two differ only in a MAC the mutation
+        // does not carry.
+        recovery.mutation_records[0]
+            .value
+            .as_option_mut()
+            .and_then(|data| data.value.as_option_mut())
+            .and_then(|value| value.mute_action.as_option_mut())
+            .expect("the helper builds a mute action")
+            .muted = Some(false);
+        // Same index, different key -- so a different index MAC and a different
+        // row in the store. It is not the pair's duplicate and must survive.
+        recovery.mutation_records[3].key_id = Some(other_key_id.clone());
+
+        let outcome = processor
+            .apply_snapshot_recovery(recovery, "regular_low", &|| true)
+            .await
+            .expect("a recovery with a repeated index still applies");
+        let RecoveryOutcome::Applied(mutations) = outcome else {
+            panic!("{outcome:?}");
+        };
+
+        assert_eq!(
+            mutations.len(),
+            3,
+            "the losing record is dropped and the other-key record is kept: {mutations:?}"
+        );
+        assert_eq!(mutations[0].index, vec!["mute", "1@s.whatsapp.net"]);
+        assert_eq!(mutations[1].index, vec!["mute", "2@s.whatsapp.net"]);
+        assert_eq!(mutations[2].index, vec!["mute", "1@s.whatsapp.net"]);
+        assert_eq!(
+            mutations[0]
+                .action_value
+                .as_ref()
+                .and_then(|v| v.mute_action.as_option())
+                .and_then(|m| m.muted),
+            Some(true),
+            "the winner's payload is what reaches the consumer, not the loser's"
+        );
+
+        // And what the store kept is the winner's MAC, which is what the next
+        // patch overwriting this index has to subtract.
+        let index_mac = wacore::appstate::hash::generate_index_mac(index.as_bytes(), &keys.index);
+        let got = backend
+            .get_mutation_mac("regular_low", &index_mac)
+            .await
+            .unwrap();
+        assert_eq!(
+            got.as_deref(),
+            Some(&[0x22u8; 32][..]),
+            "the last record for the index is the one that stands"
+        );
+
+        // And the other key's record has its own row, which is why it is not a
+        // duplicate: collapsing the two would leave this one out of the ltHash
+        // the primary just handed over.
+        let other_index_mac =
+            wacore::appstate::hash::generate_index_mac(index.as_bytes(), &other_keys.index);
+        assert_ne!(
+            other_index_mac, index_mac,
+            "a different key, a different MAC"
+        );
+        assert_eq!(
+            backend
+                .get_mutation_mac("regular_low", &other_index_mac)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(&[0x44u8; 32][..]),
+            "the same index under another key keeps its own row"
+        );
+    }
+
+    /// The reservation this write runs under is a connection's, and a disconnect
+    /// drops the whole registry -- so a recovery that is still doing its key
+    /// lookups and its HMACs when one happens no longer excludes the new
+    /// connection's sync from the rows it is about to clear and rewrite.
+    #[tokio::test]
+    async fn a_recovery_whose_connection_goes_writes_nothing() {
+        let backend = Arc::new(MockBackend::default());
+        let processor =
+            AppStateProcessor::new(backend.clone(), Arc::new(crate::runtime_impl::TokioRuntime));
+        let key_id = b"test_key_id".to_vec();
+        let master_key = [7u8; 32];
+        backend
+            .set_sync_key(
+                &key_id,
+                AppStateSyncKey {
+                    key_data: master_key.to_vec(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // Where the collection stood when the recovery started: stuck, and the
+        // state the new connection's sync would be reading and moving.
+        let held = HashState {
+            version: 0,
+            mac_mismatch_fatal: true,
+            ..Default::default()
+        };
+        backend.set_version("regular_low", held).await.unwrap();
+
+        let recovery = recovery_of(
+            "regular_low",
+            253,
+            [0x5A; 128],
+            &key_id,
+            &[(r#"["mute","1@s.whatsapp.net"]"#, [0x11; 32])],
+        );
+
+        // True when the recovery starts and false by the time it is asked, which
+        // is the window this guard exists for -- a predicate that was already
+        // false would have been caught by the caller's own check and would say
+        // nothing about where inside the apply the second one happens. The key
+        // read is the first thing the apply does that reaches the store, so
+        // "a key has been fetched" is "we are past the reads and the record
+        // work".
+        let reads = Arc::clone(&backend.sync_key_calls);
+        let still_current = move || reads.load(std::sync::atomic::Ordering::Relaxed) == 0;
+        assert!(
+            still_current(),
+            "the connection is live when the recovery begins"
+        );
+
+        let outcome = processor
+            .apply_snapshot_recovery(recovery, "regular_low", &still_current)
+            .await
+            .expect("a retired recovery is dropped, not an error");
+        assert!(matches!(outcome, RecoveryOutcome::Retired), "{outcome:?}");
+
+        let stored = backend.get_version("regular_low").await.unwrap().unwrap();
+        assert_eq!(stored.version, 0, "the version is left where it was");
+        assert!(
+            stored.mac_mismatch_fatal,
+            "and so is the flag that will have it asked for again"
+        );
+        let keys = expand_app_state_keys(&master_key);
+        let index_mac = wacore::appstate::hash::generate_index_mac(
+            br#"["mute","1@s.whatsapp.net"]"#,
+            &keys.index,
+        );
+        assert!(
+            backend
+                .get_mutation_mac("regular_low", &index_mac)
+                .await
+                .unwrap()
+                .is_none(),
+            "nothing reached the MAC store either"
+        );
+    }
+
+    /// One reply per request, and none at all for a request nobody made.
+    #[tokio::test]
+    async fn a_recovery_request_is_taken_once() {
+        let backend = Arc::new(MockBackend::default());
+        let processor =
+            AppStateProcessor::new(backend.clone(), Arc::new(crate::runtime_impl::TokioRuntime));
+
+        assert!(
+            !processor.take_recovery_request("regular_low").await,
+            "an unsolicited reply is not one this side is waiting for"
+        );
+
+        assert!(
+            processor.mark_recovery_requested("regular_low").await,
+            "the first ask is a new one"
+        );
+        assert!(
+            !processor.mark_recovery_requested("regular_low").await,
+            "a second ask while one is outstanding is suppressed: the reply already coming answers it"
+        );
+        assert!(processor.take_recovery_request("regular_low").await);
+        assert!(
+            !processor.take_recovery_request("regular_low").await,
+            "a second reply to one request would apply a collection twice"
+        );
+
+        // And an answer is claimed, not merely recognised: a response repeating
+        // its result, or a second copy of it, would otherwise each inflate and
+        // decode a whole collection against the one ask.
+        assert!(processor.mark_recovery_requested("regular_low").await);
+        processor
+            .note_recovery_request_id("regular_low", "req-1")
+            .await;
+        assert_eq!(
+            processor.claim_recovery_request_by_id("req-1").await,
+            Some("regular_low".to_string()),
+            "the first copy of the answer takes the ask up"
+        );
+        assert_eq!(
+            processor.claim_recovery_request_by_id("req-1").await,
+            None,
+            "a repeat of it does not get a second decode"
+        );
+        assert_eq!(
+            processor.take_recovery_request_by_id("req-1").await,
+            Some("regular_low".to_string()),
+            "and the claim does not stop the answer from spending its request"
+        );
+    }
+
     #[tokio::test]
     async fn test_process_patch_list_handles_set_overwrite_correctly() {
         let backend = Arc::new(MockBackend::default());
@@ -481,6 +958,80 @@ mod tests {
         assert_eq!(
             final_state.version, 2,
             "The version should be updated to that of the patch."
+        );
+    }
+
+    /// The processor's key cache is bounded, so a patch list that references
+    /// more keys than it holds must still apply in full: the keys a list needs
+    /// come from the backend, and the cache only decides what the *next* list
+    /// gets to reuse.
+    #[tokio::test]
+    async fn a_patch_list_referencing_more_keys_than_the_cache_holds_still_applies() {
+        const KEYS: usize = 40;
+
+        let backend = Arc::new(MockBackend::default());
+        let processor =
+            AppStateProcessor::new(backend.clone(), Arc::new(crate::runtime_impl::TokioRuntime));
+
+        let mut patches = Vec::with_capacity(KEYS);
+        for i in 0..KEYS {
+            let key_id = format!("key-{i:02}").into_bytes();
+            let master_key = [i as u8; 32];
+            backend
+                .set_sync_key(
+                    &key_id,
+                    AppStateSyncKey {
+                        key_data: master_key.to_vec(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("test backend should accept sync key");
+            let keys = expand_app_state_keys(&master_key);
+            let plaintext = wa::SyncActionData {
+                value: buffa::MessageField::some(wa::SyncActionValue {
+                    timestamp: Some(1000 + i as i64),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+            .encode_to_vec();
+            let mutation = create_encrypted_mutation(
+                wa::syncd_mutation::SyncdOperation::SET,
+                &[i as u8; 32],
+                &plaintext,
+                &keys,
+                &key_id,
+            );
+            patches.push(wa::SyncdPatch {
+                mutations: vec![mutation],
+                version: buffa::MessageField::some(wa::SyncdVersion {
+                    version: Some(i as u64 + 1),
+                }),
+                key_id: buffa::MessageField::some(wa::KeyId { id: Some(key_id) }),
+                ..Default::default()
+            });
+        }
+        let patch_list = PatchList {
+            name: WAPatchName::Regular,
+            has_more_patches: false,
+            patches,
+            snapshot: None,
+            snapshot_ref: None,
+            error: None,
+        };
+
+        let (mutations, state, _) = processor
+            .process_patch_list(patch_list, false)
+            .await
+            .expect("every key is in the backend, so every patch applies");
+
+        assert_eq!(mutations.len(), KEYS);
+        assert_eq!(state.version, KEYS as u64);
+        assert!(
+            processor.cached_key_count().await < KEYS,
+            "the cache holds fewer keys than this list referenced; that eviction \
+             is what the list had to survive"
         );
     }
 
@@ -624,6 +1175,7 @@ mod tests {
                 .get_version(WAPatchName::Regular.as_str())
                 .await
                 .unwrap()
+                .expect("the collection has a version record")
                 .version,
             state.version,
             "the state handed back must be the state already persisted"
@@ -859,6 +1411,7 @@ mod tests {
                 .get_version(WAPatchName::Regular.as_str())
                 .await
                 .unwrap()
+                .expect("the collection has a version record")
                 .version,
             2
         );
@@ -880,6 +1433,7 @@ mod tests {
                 .get_version(WAPatchName::Regular.as_str())
                 .await
                 .unwrap()
+                .expect("the collection has a version record")
                 .version,
             1,
             "version must not advance when the MAC reset fails"
@@ -1013,7 +1567,8 @@ mod tests {
             error: None,
         };
 
-        let download = |_ext: &wa::ExternalBlobReference| -> anyhow::Result<Vec<u8>> {
+        let snapshot_bytes = bytes::Bytes::from(snapshot_bytes);
+        let download = |_ext: &wa::ExternalBlobReference| -> anyhow::Result<bytes::Bytes> {
             Ok(snapshot_bytes.clone())
         };
 
@@ -1194,7 +1749,8 @@ mod tests {
             let persisted = backend
                 .get_version(name.as_str())
                 .await
-                .expect("version readable");
+                .expect("version readable")
+                .expect("the collection has a version record");
             assert_eq!(
                 persisted.version, version,
                 "the collection must advance, or the next sync re-requests the same patch"
@@ -1292,6 +1848,7 @@ mod tests {
                 .get_version(name.as_str())
                 .await
                 .expect("version readable")
+                .expect("the collection has a version record")
                 .version,
             11,
             "the collection must pass the cut, or every later sync repeats the snapshot"

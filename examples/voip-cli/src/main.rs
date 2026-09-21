@@ -37,7 +37,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Result, anyhow, bail};
 #[cfg(feature = "voip-opus")]
@@ -53,6 +53,7 @@ use wacore::voip::MlowDecoder;
 use wacore::voip::rtp::RTP_PAYLOAD_TYPE_MLOW_RED;
 use whatsapp_rust::prelude::*;
 #[cfg(feature = "voip-opus")]
+use whatsapp_rust::voip::KeyframeUrgency;
 use whatsapp_rust::voip::audio::{WaOpusDecoder, WaOpusEncoder};
 #[cfg(feature = "voip-opus")]
 use whatsapp_rust::voip::session::{MediaPipeline, MediaPipelineParams};
@@ -1118,20 +1119,24 @@ async fn start_media(
     state: &Arc<Mutex<CallState>>,
 ) -> std::result::Result<Arc<CallHandle>, (InboundMediaFailureStage, anyhow::Error)> {
     let voip = client.voip();
-    let (builder, event_speaker) = async {
+    let (builder, event_speaker, video_recovery) = async {
         let mic = spawn_mic()?;
         let speaker = spawn_speaker()?;
         let event_speaker = speaker.clone();
         info!("🔌 connecting media via client.voip().accept(..)…");
-        let video_endpoints = if initial_video {
+        let (video_endpoints, video_recovery) = if initial_video {
             let opts = VideoOpts::from_env().await?;
             let cid = call.action.call_id();
-            Some((
-                video::spawn_video_source(&opts).await?,
-                video::spawn_video_sink(&opts, cid).await?,
-            ))
+            let (on_loss, slot) = deferred_keyframe_recovery();
+            (
+                Some((
+                    video::spawn_video_source(&opts).await?,
+                    video::spawn_video_sink(&opts, cid, Some(on_loss)).await?,
+                )),
+                Some(slot),
+            )
         } else {
-            None
+            (None, None)
         };
         if peer_terminated_during_startup(state, call.action.call_id()) {
             bail!("peer ended the call during media preparation");
@@ -1149,7 +1154,7 @@ async fn start_media(
         if let Some((source, sink)) = video_endpoints {
             builder = builder.video(source, sink);
         }
-        Ok::<_, anyhow::Error>((builder, event_speaker))
+        Ok::<_, anyhow::Error>((builder, event_speaker, video_recovery))
     }
     .await
     .map_err(|error| (InboundMediaFailureStage::LocalPreparation, error))?;
@@ -1160,6 +1165,9 @@ async fn start_media(
             anyhow!("accept media: {error}"),
         )
     })?;
+    if let Some(slot) = video_recovery {
+        let _ = slot.set(handle.clone());
+    }
     info!(
         "🎙  {} media flow live for call {} — speak into the mic.{}",
         audio.name(),
@@ -1199,17 +1207,23 @@ async fn place_outgoing_call(
             voip.call(peer).encoded_audio(audio.format(), source, sink)
         }
     };
+    let mut video_recovery = None;
     if video {
         let opts = VideoOpts::from_env().await?;
+        let (on_loss, slot) = deferred_keyframe_recovery();
+        video_recovery = Some(slot);
         builder = builder.video(
             video::spawn_video_source(&opts).await?,
-            video::spawn_video_sink(&opts, "outgoing").await?,
+            video::spawn_video_sink(&opts, "outgoing", Some(on_loss)).await?,
         );
     }
     let handle = builder
         .start()
         .await
         .map_err(|e| anyhow!("place call: {e}"))?;
+    if let Some(slot) = video_recovery {
+        let _ = slot.set(handle.clone());
+    }
     info!(
         "☎  {} offer sent for call {} — waiting for the peer's relay to connect media.{}",
         audio.name(),
@@ -1430,6 +1444,17 @@ fn spawn_call_event_listener(
                     }
                     other => info!("🎥 peer video state: {other:?}"),
                 },
+                // Outbound video is dropping every frame until an IDR reaches
+                // the wire, and only the encoder can make one. This example
+                // cannot: its source is a spawned ffmpeg whose GOP is fixed at
+                // launch, with no runtime input that forces a keyframe. Saying
+                // so beats leaving someone to wonder why their picture froze
+                // for up to `GOP_SECONDS`; a real client wires this to its
+                // encoder's force-IDR control.
+                CallEvent::VideoKeyframeNeeded => info!(
+                    "🎥 engine wants a keyframe; this encoder makes one every {}s and cannot be asked",
+                    video::GOP_SECONDS
+                ),
                 // CallEvent is #[non_exhaustive]: ignore variants newer core versions may add.
                 _ => {}
             }
@@ -1437,11 +1462,42 @@ fn spawn_call_event_listener(
     });
 }
 
+/// Let a sink ask the peer for the keyframe that ends a shed: an access unit
+/// ffplay refused is a loss nothing inside the library can see. Available to the
+/// mid-call flows only -- the from-start ones build their sink to hand to the
+/// builder that produces the handle, so there is nothing to close over yet.
+fn keyframe_recovery(handle: &CallHandle) -> video::OnVideoLoss {
+    let handle = handle.clone();
+    Arc::new(move || handle.request_peer_keyframe(KeyframeUrgency::Coalesced))
+}
+
+/// The same recovery for a flow that builds its sink *before* the handle exists.
+///
+/// A video-from-start call hands its endpoints to the builder that produces the
+/// handle, so there is nothing to close over yet -- but the sink outlives that,
+/// and a shed frame after the call is up deserves the same request an upgrade
+/// gets. Returns the hook and the slot to fill once the handle is in hand; until
+/// it is filled the hook is a no-op, which is the honest answer for a loss that
+/// happened before there was a call to ask on.
+fn deferred_keyframe_recovery() -> (video::OnVideoLoss, Arc<OnceLock<CallHandle>>) {
+    let slot: Arc<OnceLock<CallHandle>> = Arc::new(OnceLock::new());
+    let hook = {
+        let slot = slot.clone();
+        Arc::new(move || {
+            if let Some(handle) = slot.get() {
+                handle.request_peer_keyframe(KeyframeUrgency::Coalesced);
+            }
+        }) as video::OnVideoLoss
+    };
+    (hook, slot)
+}
+
 /// Fresh ffmpeg/ffplay endpoints for a mid-call upgrade/accept on `handle`.
 async fn accept_peer_video(handle: &CallHandle, request: VideoUpgradeToken) -> Result<()> {
     let opts = VideoOpts::from_env().await?;
     let src = video::spawn_video_source(&opts).await?;
-    let sink = video::spawn_video_sink(&opts, handle.call_id()).await?;
+    let sink =
+        video::spawn_video_sink(&opts, handle.call_id(), Some(keyframe_recovery(handle))).await?;
     handle
         .accept_video(request, src, sink)
         .await
@@ -1555,7 +1611,12 @@ fn spawn_stdin_ui(state: Arc<Mutex<CallState>>) {
                         let started = async {
                             let opts = VideoOpts::from_env().await?;
                             let src = video::spawn_video_source(&opts).await?;
-                            let sink = video::spawn_video_sink(&opts, &cid).await?;
+                            let sink = video::spawn_video_sink(
+                                &opts,
+                                &cid,
+                                Some(keyframe_recovery(&handle)),
+                            )
+                            .await?;
                             handle
                                 .start_video(src, sink)
                                 .await

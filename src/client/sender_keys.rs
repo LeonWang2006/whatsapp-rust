@@ -274,7 +274,7 @@ impl Client {
     /// Look up and consume a message by exact `ChatMessageId` (L1 cache then DB).
     async fn try_take_by_key(&self, key: &ChatMessageId) -> Option<wa::Message> {
         let chat_str = key.chat.to_string();
-        let has_l1_cache = self.cache_config.recent_messages.capacity > 0;
+        let has_l1_cache = self.cache_config.recent_messages_enabled;
 
         // L1 cache check (if capacity > 0)
         if has_l1_cache && let Some(bytes) = self.recent_messages.remove(key).await {
@@ -369,7 +369,7 @@ impl Client {
     /// (capacity 0) or misses; the DB is intentionally not read here so the caller
     /// can fall back to the consuming take + re-add path.
     async fn peek_by_key(&self, key: &ChatMessageId) -> Option<wa::Message> {
-        if self.cache_config.recent_messages.capacity == 0 {
+        if !self.cache_config.recent_messages_enabled {
             return None;
         }
         let bytes = self.recent_messages.get(key).await?;
@@ -378,6 +378,58 @@ impl Client {
             Err(e) => {
                 log::warn!(
                     "Failed to decode cached message for {}:{}: {e}",
+                    key.chat.observe(),
+                    key.id
+                );
+                None
+            }
+        }
+    }
+
+    /// Read the stored bytes without consuming the message or refreshing its
+    /// expiry. Cancellation cannot remove either the L1 entry or the DB row.
+    /// Returns `None` on a miss or backend error, including unsupported reads.
+    pub(crate) async fn recent_message_bytes(
+        &self,
+        to: &Jid,
+        id: &str,
+    ) -> Option<std::sync::Arc<Vec<u8>>> {
+        let primary_key = self.make_chat_message_id(to, id).await;
+        if let Some(bytes) = self.recent_message_bytes_by_key(&primary_key).await {
+            return Some(bytes);
+        }
+
+        let alt_chat = if primary_key.chat.server != to.server {
+            Some(to.clone())
+        } else {
+            self.swap_pn_lid_namespace(&primary_key.chat).await
+        }?;
+        self.recent_message_bytes_by_key(&ChatMessageId {
+            chat: alt_chat,
+            id: primary_key.id,
+        })
+        .await
+    }
+
+    async fn recent_message_bytes_by_key(
+        &self,
+        key: &ChatMessageId,
+    ) -> Option<std::sync::Arc<Vec<u8>>> {
+        if self.cache_config.recent_messages_enabled
+            && let Some(bytes) = self.recent_messages.get(key).await
+        {
+            return Some(bytes);
+        }
+        match self
+            .persistence_manager
+            .backend()
+            .get_sent_message(&key.chat.to_string(), &key.id)
+            .await
+        {
+            Ok(bytes) => bytes.map(std::sync::Arc::new),
+            Err(e) => {
+                log::warn!(
+                    "Failed to read sent message from DB for {}:{}: {e}",
                     key.chat.observe(),
                     key.id
                 );
@@ -401,7 +453,7 @@ impl Client {
     ) {
         let shared =
             encoded.unwrap_or_else(|| std::sync::Arc::new(waproto::codec::message_to_vec(msg)));
-        let has_l1_cache = self.cache_config.recent_messages.capacity > 0;
+        let has_l1_cache = self.cache_config.recent_messages_enabled;
 
         if has_l1_cache {
             // L1 cache serves reads immediately; DB write can be backgrounded.
@@ -449,6 +501,160 @@ mod tests {
     use crate::test_utils::create_test_client;
     use std::sync::Arc;
     use wacore_binary::Jid;
+
+    #[test]
+    fn recent_message_bytes_cancellation_keeps_sqlite_row() {
+        use std::future::Future;
+        use std::task::{Context, Waker};
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for cancel_before_query in [true, false] {
+                let client = create_test_client().await;
+                assert!(!client.cache_config.recent_messages_enabled);
+                let chat: Jid = "120363000000000001@g.us".parse().unwrap();
+                let backend = client.persistence_manager.backend();
+                let payload = b"\x0a\x05hello";
+                backend
+                    .store_sent_message(&chat.to_string(), "CANCEL_READ", payload)
+                    .await
+                    .unwrap();
+
+                // Occupy the sole blocking worker so the first poll must suspend
+                // after dispatching SQLite, before it can return any bytes.
+                let (release, blocked) = std::sync::mpsc::channel();
+                let blocker = tokio::task::spawn_blocking(move || {
+                    blocked
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                });
+                let mut read = Some(Box::pin(client.recent_message_bytes(&chat, "CANCEL_READ")));
+                assert!(
+                    read.as_mut()
+                        .unwrap()
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                        .is_pending()
+                );
+                if cancel_before_query {
+                    drop(read.take());
+                }
+                release.send(()).unwrap();
+                blocker.await.unwrap();
+                // The single worker runs this fence after the queued SQL job.
+                // Do not poll the read again, even when its query has finished.
+                tokio::task::spawn_blocking(|| ()).await.unwrap();
+                drop(read);
+
+                assert_eq!(
+                    backend
+                        .take_sent_message(&chat.to_string(), "CANCEL_READ")
+                        .await
+                        .unwrap()
+                        .as_deref(),
+                    Some(payload.as_slice()),
+                    "cancellation must not consume the row, before_query={cancel_before_query}"
+                );
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn recent_message_bytes_shares_l1_and_preserves_db_bytes() {
+        let mut config = crate::cache_config::CacheConfig::default();
+        config.recent_messages.capacity = 10;
+        let client = crate::test_utils::create_test_client_with_config(
+            "recent_message_bytes",
+            Arc::new(crate::test_utils::MockHttpClient),
+            config,
+        )
+        .await;
+        let chat: Jid = "120363000000000001@g.us".parse().unwrap();
+        let key = client.make_chat_message_id(&chat, "READ").await;
+        // An unknown protobuf field must survive without decode/re-encode.
+        let bytes = Arc::new(b"\x0a\x05hello\xf8\x7f\x01".to_vec());
+        client
+            .recent_messages
+            .insert(key.clone(), Arc::clone(&bytes))
+            .await;
+        let cached = client.recent_message_bytes(&chat, "READ").await.unwrap();
+        assert!(Arc::ptr_eq(&cached, &bytes));
+        assert!(Arc::ptr_eq(
+            &client.recent_messages.get(&key).await.unwrap(),
+            &bytes
+        ));
+
+        client.recent_messages.remove(&key).await;
+        let backend = client.persistence_manager.backend();
+        backend
+            .store_sent_message(&chat.to_string(), "READ", &bytes)
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                client.recent_message_bytes(&chat, "READ").await.unwrap(),
+                bytes
+            );
+        }
+        assert_eq!(
+            backend
+                .take_sent_message(&chat.to_string(), "READ")
+                .await
+                .unwrap(),
+            Some(bytes.as_ref().clone())
+        );
+        assert!(client.recent_message_bytes(&chat, "READ").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn recent_message_bytes_keeps_alternate_namespace() {
+        let client = create_test_client().await;
+        let pn: Jid = "15550000001@s.whatsapp.net".parse().unwrap();
+        let lid: Jid = "100000000000001@lid".parse().unwrap();
+        let backend = client.persistence_manager.backend();
+        backend
+            .store_sent_message(&pn.to_string(), "ALT", b"payload")
+            .await
+            .unwrap();
+        client
+            .lid_pn_cache
+            .add(&wacore::types::lid_pn::LidPnEntry {
+                lid: lid.user.as_str().into(),
+                phone_number: pn.user.as_str().into(),
+                created_at: 0,
+                learning_source: wacore::types::lid_pn::LearningSource::Usync,
+            })
+            .await;
+        for chat in [&pn, &lid] {
+            assert_eq!(
+                client
+                    .recent_message_bytes(chat, "ALT")
+                    .await
+                    .unwrap()
+                    .as_slice(),
+                b"payload"
+            );
+        }
+        assert!(
+            backend
+                .get_sent_message(&lid.to_string(), "ALT")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            backend
+                .get_sent_message(&pn.to_string(), "ALT")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(b"payload".as_slice())
+        );
+    }
 
     // A cold mark flips has_key in place, keeping the same cached_map Arc, so the
     // skdm_warm_memo cannot notice via pointer identity. It bumps the map's

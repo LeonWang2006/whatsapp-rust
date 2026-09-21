@@ -248,12 +248,12 @@ fn smpl_filt_ma2(x: &[f32], n: usize, coef: &[f32], state: &[f32; 2], y: &mut [f
 // autocorrelation -> reflection coeffs, Levinson, double precision.
 fn smpl_ac2rc_dbl(corr: &[f64], order: usize, reg: f64, rc: &mut [f32]) {
     debug_assert!(order > 0);
-    debug_assert!(order - 1 <= SMPL_MAX_SF_LEN);
-    let mut c0 = vec![0.0f64; order + 1];
-    let mut c1 = vec![0.0f64; order + 1];
+    assert!(order < SMPL_MAX_L_RESP);
+    let mut c0 = [0.0f64; SMPL_MAX_L_RESP];
+    let mut c1 = [0.0f64; SMPL_MAX_L_RESP];
     c0[..(order + 1)].copy_from_slice(&corr[..(order + 1)]);
     c0[0] *= 1.0f64 + reg;
-    c1.copy_from_slice(&c0);
+    c1[..=order].copy_from_slice(&c0[..=order]);
     for r in rc[..order].iter_mut() {
         *r = 0.0;
     }
@@ -283,8 +283,8 @@ fn smpl_ac2rc_dbl(corr: &[f64], order: usize, reg: f64, rc: &mut [f32]) {
 // Float wrapper that promotes to double precision before Levinson.
 fn smpl_ac2rc(corr: &[f32], order: usize, reg: f32, rc: &mut [f32]) {
     debug_assert!(order > 0);
-    debug_assert!(order - 1 <= SMPL_MAX_SF_LEN);
-    let mut corr_dbl = vec![0.0f64; order + 1];
+    assert!(order < SMPL_MAX_L_RESP);
+    let mut corr_dbl = [0.0f64; SMPL_MAX_L_RESP];
     for i in 0..(order + 1) {
         corr_dbl[i] = corr[i] as f64;
     }
@@ -924,22 +924,39 @@ pub(crate) fn smpl_perc_ac2a(
     perc_resp_len: usize,
     reg: f32,
 ) -> Vec<f32> {
+    let mut a = vec![0.0f32; perc_resp_len];
+    smpl_perc_ac2a_into(r, len_r, perc_emph, perc_resp_len, reg, &mut a);
+    a
+}
+
+/// Write the perceptual LPC response into `a[..perc_resp_len]` without allocating.
+/// Overwrites every active coefficient, including the leading 1.0, and leaves
+/// any destination tail untouched. Input and output storage can be reused across calls.
+///
+/// Requires `2 <= perc_resp_len <= SMPL_MAX_L_RESP`,
+/// `r.len() >= len_r >= perc_resp_len + 1`, and `a.len() >= perc_resp_len`.
+/// These are internal caller invariants, not recoverable input errors.
+pub(crate) fn smpl_perc_ac2a_into(
+    r: &[f32],
+    len_r: usize,
+    perc_emph: f32,
+    perc_resp_len: usize,
+    reg: f32,
+    a: &mut [f32],
+) {
     debug_assert!(len_r >= perc_resp_len + 1);
     debug_assert!(SMPL_MAX_L_RESP >= perc_resp_len);
 
     let b = [perc_emph, 1.0 + perc_emph * perc_emph, perc_emph];
     let state = [r[0], r[1]];
-    // `SMPL_MAX_L_RESP` is 33, so both intermediates are 132 bytes: on the stack they cost nothing,
-    // while as `vec!` they were two heap allocations per call and this runs 16x per 60 ms frame.
+    // Fixed intermediates avoid heap allocation but contribute to the runtime stack peak.
     let mut r_ = [0.0f32; SMPL_MAX_L_RESP];
     smpl_filt_ma2(&r[1..], perc_resp_len, &b, &state, &mut r_);
 
     let mut rc = [0.0f32; SMPL_MAX_L_RESP];
     smpl_ac2rc(&r_, perc_resp_len - 1, reg, &mut rc);
 
-    let mut a = vec![0.0f32; perc_resp_len];
-    smpl_rc2a(&rc, perc_resp_len - 1, &mut a);
-    a
+    smpl_rc2a(&rc, perc_resp_len - 1, a);
 }
 
 // Bitrate controller
@@ -1205,6 +1222,26 @@ pub(crate) fn rfft_backward_ordered_ref_sc(f: &[f32], time: &mut [f32], sc: &mut
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn perceptual_response_overwrites_reused_destination() {
+        let mut reused = [f32::NAN; SMPL_MAX_L_RESP];
+        for len in [32, 17, 32] {
+            let corr: [f32; SMPL_MAX_L_RESP] = std::array::from_fn(|i| 0.8f32.powi(i as i32));
+            let expected = smpl_perc_ac2a(&corr, corr.len(), -0.72, len, SMPL_PERC_REG);
+            reused.fill(f32::NAN);
+            smpl_perc_ac2a_into(
+                &corr,
+                corr.len(),
+                -0.72,
+                len,
+                SMPL_PERC_REG,
+                &mut reused[..len],
+            );
+            assert_eq!(&reused[..len], expected.as_slice());
+            assert!(reused[len..].iter().all(|x| x.is_nan()));
+        }
+    }
 
     // The precomputed twiddle tables MUST reproduce the inline cos/sin to the bit, or the golden
     // checksum shifts. Assert every used (n, k, q) combine entry and (n, k, j) base entry equals the

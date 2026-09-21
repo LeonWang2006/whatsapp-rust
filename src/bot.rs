@@ -1,5 +1,6 @@
 use crate::cache_config::CacheConfig;
 use crate::client::{Client, ClientBuilderError};
+use crate::features::PresencePolicy;
 use crate::pair_code::PairCodeOptions;
 #[cfg(feature = "plugins")]
 use crate::plugins::{ClientPlugin, PluginHostConfig, PluginRegistration, UntypedClientPlugin};
@@ -10,6 +11,7 @@ use crate::store::traits::Backend;
 use crate::types::durability_hook::InboundDurabilityHook;
 use crate::types::enc_handler::EncHandler;
 use crate::types::events::{Event, EventHandler, EventInterest, EventKind};
+use crate::types::history_sync_admission::HistorySyncAdmission;
 use crate::types::message::MessageInfo;
 use futures::FutureExt;
 use log::{info, warn};
@@ -19,6 +21,7 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::{Arc, Weak};
 use thiserror::Error;
+use wacore::handshake::NoiseCertPolicy;
 use wacore::proto_helpers::MessageBuilderExt;
 use wacore::runtime::Runtime;
 use wacore::store::DevicePropsOverride;
@@ -49,9 +52,14 @@ type DefaultHttpState = Provided;
 #[cfg(not(feature = "ureq-client"))]
 type DefaultHttpState = MissingHttpClient;
 
-#[cfg(feature = "tokio-runtime")]
+// The target as well as the feature, because `default_runtime` below answers on both: `TokioRuntime`
+// spawns through `tokio::spawn`, which wasm32 does not have, so a builder that read `Provided` from
+// the feature alone would offer `build()` on a page and then reach `build_graph`'s
+// `unreachable!("typestate guarantees...")` at run time. A page supplies its own runtime, and the
+// type system is where it should be told to.
+#[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
 type DefaultRuntimeState = Provided;
-#[cfg(not(feature = "tokio-runtime"))]
+#[cfg(not(all(feature = "tokio-runtime", not(target_arch = "wasm32"))))]
 type DefaultRuntimeState = MissingRuntime;
 
 #[cfg(feature = "tokio-transport")]
@@ -74,11 +82,14 @@ fn default_http_client() -> Option<Arc<dyn crate::http::HttpClient>> {
     None
 }
 
-#[cfg(feature = "tokio-runtime")]
+#[cfg(all(feature = "tokio-runtime", not(target_arch = "wasm32")))]
 fn default_runtime() -> Option<Arc<dyn Runtime>> {
     Some(Arc::new(crate::runtime_impl::TokioRuntime))
 }
-#[cfg(not(feature = "tokio-runtime"))]
+/// No default anywhere `TokioRuntime` is absent -- which on wasm32 is the whole point: the page
+/// supplies its own single-threaded runtime, and a default that panicked on first spawn would be
+/// found out one call into a session rather than at assembly.
+#[cfg(not(all(feature = "tokio-runtime", not(target_arch = "wasm32"))))]
 fn default_runtime() -> Option<Arc<dyn Runtime>> {
     None
 }
@@ -101,6 +112,14 @@ pub struct MessageContext {
     pub message: Arc<wa::Message>,
     pub info: MessageInfo,
     pub client: Arc<Client>,
+    /// Disappearing-message timer of the chat this message arrived in, in
+    /// seconds, when the stanza carried one. Mirrors
+    /// [`InboundMessage::ephemeral_expiration`](wacore::types::events::InboundMessage::ephemeral_expiration).
+    pub ephemeral_expiration: Option<u32>,
+    /// For a decrypted newsletter comment, the key of the post it replies to.
+    /// Mirrors
+    /// [`InboundMessage::comment_target`](wacore::types::events::InboundMessage::comment_target).
+    pub comment_target: Option<Box<wa::MessageKey>>,
 }
 
 impl MessageContext {
@@ -111,19 +130,32 @@ impl MessageContext {
         Self::from_arc(Arc::new(message.clone()), info, client)
     }
 
+    /// Builds a context from a message and its info alone; the inbound-only
+    /// metadata (`ephemeral_expiration`, `comment_target`) is absent because
+    /// this constructor never sees the stanza it came from.
     pub fn from_arc(message: Arc<wa::Message>, info: &MessageInfo, client: Arc<Client>) -> Self {
         Self {
             message,
             info: info.clone(),
             client,
+            ephemeral_expiration: None,
+            comment_target: None,
         }
     }
 
+    /// Builds a context from a dispatched [`InboundMessage`], carrying every
+    /// field a handler could read off the event, not only `message` and `info`.
+    ///
+    /// [`InboundMessage`]: wacore::types::events::InboundMessage
     pub fn from_inbound(
         inbound: &wacore::types::events::InboundMessage,
         client: Arc<Client>,
     ) -> Self {
-        Self::from_arc(Arc::clone(&inbound.message), &inbound.info, client)
+        Self {
+            ephemeral_expiration: inbound.ephemeral_expiration,
+            comment_target: inbound.comment_target.clone(),
+            ..Self::from_arc(Arc::clone(&inbound.message), &inbound.info, client)
+        }
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.bot.send_message", level = "debug", skip_all, fields(chat = %self.info.source.chat.observe()), err(Debug)))]
@@ -159,7 +191,7 @@ impl MessageContext {
         // info.source.chat, so remote_jid is omitted (WA Web parity).
         let chat = &self.info.source.chat;
         wacore::proto_helpers::build_quote_context_with_info(
-            &self.info.id,
+            self.info.id.as_str(),
             &self.info.source.sender,
             chat,
             chat,
@@ -176,17 +208,19 @@ impl MessageContext {
         wa::MessageKey {
             remote_jid: Some(self.info.source.chat.to_string()),
             from_me: Some(self.info.source.is_from_me),
-            id: Some(self.info.id.clone()),
+            id: Some(self.info.id.to_string()),
             participant: needs_participant.then(|| self.info.source.sender.to_string()),
         }
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.bot.edit_message", level = "debug", skip_all, fields(chat = %self.info.source.chat.observe()), err(Debug)))]
+    /// Edit a message of ours in this chat; see [`Client::edit_message`] for
+    /// what the returned result describes.
     pub async fn edit_message(
         &self,
         original_message_id: impl Into<String>,
         new_message: wa::Message,
-    ) -> Result<String, crate::send::SendError> {
+    ) -> Result<crate::send::SendResult, crate::send::SendError> {
         self.client
             .edit_message(&self.info.source.chat, original_message_id, new_message)
             .await
@@ -198,7 +232,7 @@ impl MessageContext {
         &self,
         message_id: impl Into<String>,
         revoke_type: crate::send::RevokeType,
-    ) -> Result<(), crate::send::SendError> {
+    ) -> Result<crate::send::SendResult, crate::send::SendError> {
         self.client
             .revoke_message(&self.info.source.chat, message_id, revoke_type)
             .await
@@ -403,9 +437,10 @@ impl BotHandle {
     /// Gracefully stop the bot: disconnects (flushing the device snapshot,
     /// buffered receipts and message secrets) and waits for the run loop to
     /// exit.
-    pub async fn shutdown(mut self) {
+    pub async fn shutdown(self) {
         self.client.disconnect().await;
-        let _ = (&mut self.done_rx).await;
+        let mut done_rx = self.done_rx;
+        let _ = (&mut done_rx).await;
     }
 
     /// Abort the bot task immediately. Skips the flush work
@@ -434,10 +469,10 @@ impl std::future::Future for BotHandle {
 /// CPU-relevant work of a session would be missing from the hook on the
 /// common `bot.run().await` launch path. `Bot::spawn` needs no equivalent:
 /// it routes the same loop through `Runtime::spawn`.
-async fn run_metered<F: std::future::Future<Output = ()>>(
+async fn run_metered<F: std::future::Future>(
     fut: F,
     instrument: Option<Arc<dyn wacore::stats::TaskInstrument>>,
-) {
+) -> F::Output {
     match instrument {
         // Stack-pinned, not boxed: `MeteredFuture` only needs an `Unpin` inner,
         // and `Pin<&mut F>` is one without an allocation.
@@ -530,11 +565,17 @@ impl Bot {
     /// (linker-shared) function, so callers poll through a vtable and the
     /// graph is compiled once, here. One allocation per process.
     pub async fn run(self) {
+        let _ = self.run_with_reason().await;
+    }
+
+    /// Run the bot and report why its client supervision ended. Existing
+    /// callers can continue using [`Self::run`], which returns `()`.
+    pub async fn run_with_reason(self) -> crate::RunCompletionReason {
         self.run_boxed().await
     }
 
     #[inline(never)]
-    fn run_boxed(self) -> wacore::runtime::BoxFuture<'static, ()> {
+    fn run_boxed(self) -> wacore::runtime::BoxFuture<'static, crate::RunCompletionReason> {
         Box::pin(self.run_graph())
     }
 
@@ -542,10 +583,10 @@ impl Bot {
         feature = "tracing",
         tracing::instrument(name = "wa.bot.run", level = "debug", skip_all)
     )]
-    async fn run_graph(self) {
+    async fn run_graph(self) -> crate::RunCompletionReason {
         let instrument = self.task_instrument.clone();
         let client = self.start_background();
-        run_metered(client.run(), instrument).await;
+        run_metered(client.run_with_reason(), instrument).await
     }
 
     /// Start the bot on its runtime and return a [`BotHandle`] to await,
@@ -556,7 +597,7 @@ impl Bot {
         let run_client = client.clone();
         let (done_tx, done_rx) = futures::channel::oneshot::channel::<()>();
         let abort_handle = client.runtime.spawn(Box::pin(async move {
-            run_client.run().await;
+            run_client.run_with_reason().await;
             let _ = done_tx.send(());
         }));
 
@@ -674,10 +715,14 @@ pub struct BotBuilder<
     raw_handlers: Vec<Arc<dyn EventHandler>>,
     custom_enc_handlers: HashMap<String, Arc<dyn EncHandler>>,
     inbound_durability_hook: Option<Arc<dyn InboundDurabilityHook>>,
+    history_sync_admission: Option<Arc<dyn HistorySyncAdmission>>,
     override_version: Option<(u32, u32, u32)>,
     device_props_override: Option<DevicePropsOverride>,
     pair_code_options: Option<PairCodeOptions>,
     skip_history_sync: bool,
+    ab_props_fetch: bool,
+    presence_policy: PresencePolicy,
+    noise_cert_policy: NoiseCertPolicy,
     initial_push_name: Option<String>,
     cache_config: CacheConfig,
     wanted_pre_key_count: Option<usize>,
@@ -703,10 +748,14 @@ impl BotBuilder<MissingBackend, DefaultTransportState, DefaultHttpState, Default
             raw_handlers: Vec::new(),
             custom_enc_handlers: HashMap::new(),
             inbound_durability_hook: None,
+            history_sync_admission: None,
             override_version: None,
             device_props_override: None,
             pair_code_options: None,
             skip_history_sync: false,
+            ab_props_fetch: true,
+            presence_policy: PresencePolicy::default(),
+            noise_cert_policy: NoiseCertPolicy::default(),
             initial_push_name: None,
             cache_config: CacheConfig::default(),
             wanted_pre_key_count: None,
@@ -736,10 +785,14 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
             raw_handlers: self.raw_handlers,
             custom_enc_handlers: self.custom_enc_handlers,
             inbound_durability_hook: self.inbound_durability_hook,
+            history_sync_admission: self.history_sync_admission,
             override_version: self.override_version,
             device_props_override: self.device_props_override,
             pair_code_options: self.pair_code_options,
             skip_history_sync: self.skip_history_sync,
+            ab_props_fetch: self.ab_props_fetch,
+            presence_policy: self.presence_policy,
+            noise_cert_policy: self.noise_cert_policy,
             initial_push_name: self.initial_push_name,
             cache_config: self.cache_config,
             wanted_pre_key_count: self.wanted_pre_key_count,
@@ -761,6 +814,13 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     ///
     /// The backend is wrapped in an `Arc` internally; use
     /// [`BotBuilder::with_backend_arc`] to pass an already-shared backend.
+    ///
+    /// A bot that pairs once and stays connected for weeks is the
+    /// single-long-lived-session profile, and `SqliteStore`'s defaults are tuned
+    /// for the opposite one (many small per-session stores in a process). See
+    /// the `SqliteStoreConfig` docs for the cache size, reader count and mmap
+    /// setting that profile wants, and pass them with
+    /// `SqliteStore::with_config`.
     ///
     /// # Example
     /// ```rust,ignore
@@ -894,8 +954,13 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     /// Runtime-agnostic: the hook wraps whatever runtime the client uses, so
     /// every task spawned through the `Runtime` trait is covered, and
     /// [`Bot::run`] meters the main run loop itself — the read loop reports
-    /// on either launch path (`voip` media tasks spawn directly on Tokio and
-    /// are not covered). Pass a
+    /// on either launch path. The VoIP **call driver** is covered too, and so is
+    /// the native relay transport's own socket and timer work
+    /// (`voip-relay-native`): `RelayMediaChannelFactory` is constructed with the
+    /// client's `Arc<dyn Runtime>` and spawns its driver through it. So do not
+    /// attribute either separately, or the work is counted twice. A platform
+    /// that installs its own `RelayTransportProvider` decides that side for
+    /// itself. Pass a
     /// [`CpuMeter`](wacore::stats::CpuMeter) for per-session CPU accounting
     /// (keep a clone to read snapshots), or a custom hook to scope
     /// allocator-attribution or platform samplers to this client's work.
@@ -1164,7 +1229,7 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     {
         self.on_event_for(&[EventKind::LoggedOut], move |event, _client| {
             let fut = match &*event {
-                Event::LoggedOut(info) => Some(handler(info.clone())),
+                Event::LoggedOut(info) => Some(handler(info.as_ref().clone())),
                 _ => None,
             };
             async move {
@@ -1238,6 +1303,25 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
         Dh: InboundDurabilityHook + 'static,
     {
         self.inbound_durability_hook = Some(Arc::new(hook));
+        self
+    }
+
+    /// Register a synchronous policy that can reject inbound history-sync
+    /// notifications before they create history-sync work.
+    pub fn with_history_sync_admission<A>(mut self, admission: A) -> Self
+    where
+        A: HistorySyncAdmission + 'static,
+    {
+        self.history_sync_admission = Some(Arc::new(admission));
+        self
+    }
+
+    /// Register an already-shared history-sync admission policy.
+    pub fn with_history_sync_admission_arc(
+        mut self,
+        admission: Arc<dyn HistorySyncAdmission>,
+    ) -> Self {
+        self.history_sync_admission = Some(admission);
         self
     }
 
@@ -1327,6 +1411,34 @@ impl<B, T, H, R> BotBuilder<B, T, H, R> {
     /// Default: `false` (history sync is processed normally).
     pub fn skip_history_sync(mut self) -> Self {
         self.skip_history_sync = true;
+        self
+    }
+
+    /// Whether to fetch the server's A/B props catalog on connect. On by
+    /// default; see [`ClientBuilder::with_ab_props_fetch`](crate::client::ClientBuilder::with_ab_props_fetch) for what turning
+    /// it off costs and which targets would want to.
+    pub fn with_ab_props_fetch(mut self, enabled: bool) -> Self {
+        self.ab_props_fetch = enabled;
+        self
+    }
+
+    /// Choose who announces the account's own `available` presence.
+    ///
+    /// Default: [`PresencePolicy::Automatic`], which matches WhatsApp Web. See
+    /// [`PresencePolicy::Manual`] for the host that has to own it.
+    pub fn with_presence_policy(mut self, policy: PresencePolicy) -> Self {
+        self.presence_policy = policy;
+        self
+    }
+
+    /// Select the Noise server-cert verification policy for handshakes made
+    /// by the built client. Defaults to strict (explicit `Strict` always
+    /// verifies); pass
+    /// [`NoiseCertPolicy::DangerSkipCertChainVerify`] only for testing
+    /// against a mock server that cannot produce a WhatsApp-rooted chain.
+    /// Fixed at build time and applied to every connect, including reconnects.
+    pub fn with_noise_cert_policy(mut self, policy: NoiseCertPolicy) -> Self {
+        self.noise_cert_policy = policy;
         self
     }
 
@@ -1472,8 +1584,11 @@ impl BotBuilder<Provided, Provided, Provided, Provided> {
             .with_transport_factory_arc(transport_factory)
             .with_http_client_arc(http_client)
             .with_cache_config(self.cache_config)
+            .with_noise_cert_policy(self.noise_cert_policy)
             .with_custom_enc_handlers(self.custom_enc_handlers)
             .with_skip_history_sync(self.skip_history_sync)
+            .with_ab_props_fetch(self.ab_props_fetch)
+            .with_presence_policy(self.presence_policy)
             .with_background_saver_interval(std::time::Duration::from_secs(30));
         #[cfg(feature = "plugins")]
         let client_builder = client_builder
@@ -1486,6 +1601,9 @@ impl BotBuilder<Provided, Provided, Provided, Provided> {
         }
         if let Some(hook) = self.inbound_durability_hook {
             client_builder = client_builder.with_inbound_durability_hook_arc(hook);
+        }
+        if let Some(admission) = self.history_sync_admission {
+            client_builder = client_builder.with_history_sync_admission_arc(admission);
         }
         if let Some(count) = self.wanted_pre_key_count {
             client_builder = client_builder.with_wanted_pre_key_count(count);
@@ -1611,6 +1729,57 @@ mod tests {
             Some(&"installed")
         );
         bot.client().disconnect().await;
+    }
+
+    #[tokio::test]
+    async fn bot_builder_noise_cert_policy_reaches_built_client() {
+        use wacore::handshake::NoiseCertPolicy;
+
+        let default_bot = Bot::builder()
+            .with_backend_arc(create_test_sqlite_backend().await)
+            .with_transport_factory(TokioWebSocketTransportFactory::new())
+            .with_http_client(MockHttpClient)
+            .with_runtime(TokioRuntime)
+            .build()
+            .await
+            .expect("default bot build");
+        assert_eq!(
+            default_bot.client().noise_cert_policy,
+            NoiseCertPolicy::default()
+        );
+        default_bot.client().disconnect().await;
+
+        let bypass_bot = Bot::builder()
+            .with_backend_arc(create_test_sqlite_backend().await)
+            .with_transport_factory(TokioWebSocketTransportFactory::new())
+            .with_http_client(MockHttpClient)
+            .with_runtime(TokioRuntime)
+            .with_noise_cert_policy(NoiseCertPolicy::DangerSkipCertChainVerify)
+            .build()
+            .await
+            .expect("bypass bot build");
+        assert_eq!(
+            bypass_bot.client().noise_cert_policy,
+            NoiseCertPolicy::DangerSkipCertChainVerify
+        );
+        bypass_bot.client().disconnect().await;
+
+        // Explicit Strict is distinct from the default only when the
+        // default changes: the setter, not a build flag, decides.
+        let strict_bot = Bot::builder()
+            .with_backend_arc(create_test_sqlite_backend().await)
+            .with_transport_factory(TokioWebSocketTransportFactory::new())
+            .with_http_client(MockHttpClient)
+            .with_runtime(TokioRuntime)
+            .with_noise_cert_policy(NoiseCertPolicy::Strict)
+            .build()
+            .await
+            .expect("explicit strict bot build");
+        assert_eq!(
+            strict_bot.client().noise_cert_policy,
+            NoiseCertPolicy::Strict
+        );
+        strict_bot.client().disconnect().await;
     }
 
     fn pairing_code_event(code: &str) -> Arc<Event> {
@@ -2174,6 +2343,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_bot_builder_history_sync_admission_reaches_client() {
+        let backend = create_test_sqlite_backend().await;
+        let decisions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let admission_decisions = Arc::clone(&decisions);
+        struct Admission {
+            decisions: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl HistorySyncAdmission for Admission {
+            fn decide(
+                &self,
+                _metadata: &crate::HistorySyncMetadata<'_>,
+            ) -> crate::HistorySyncDecision {
+                self.decisions
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                crate::HistorySyncDecision::Accept
+            }
+        }
+
+        let bot = Bot::builder()
+            .with_backend_arc(backend)
+            .with_history_sync_admission(Admission {
+                decisions: admission_decisions,
+            })
+            .with_runtime(TokioRuntime)
+            .build()
+            .await
+            .expect("Failed to build bot");
+
+        let client = bot.client();
+        let admission = client
+            .history_sync_admission
+            .as_ref()
+            .expect("builder-installed history-sync admission");
+        assert_eq!(
+            admission.decide(&crate::HistorySyncMetadata {
+                sync_type: None,
+                chunk_order: None,
+                progress: None,
+                file_length: None,
+                inline_payload_len: None,
+                peer_data_request_session_id: None,
+            }),
+            crate::HistorySyncDecision::Accept
+        );
+        assert_eq!(decisions.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_bot_builder_ab_props_fetch_forwards_to_the_client() {
+        let backend = create_test_sqlite_backend().await;
+        let bot = Bot::builder()
+            .with_backend_arc(backend)
+            .with_transport_factory(TokioWebSocketTransportFactory::new())
+            .with_http_client(MockHttpClient)
+            .with_ab_props_fetch(false)
+            .with_runtime(TokioRuntime)
+            .build()
+            .await
+            .expect("Failed to build bot with ab props fetch off");
+        assert!(!bot.client().ab_props_fetch_enabled());
+
+        let backend = create_test_sqlite_backend().await;
+        let bot = Bot::builder()
+            .with_backend_arc(backend)
+            .with_transport_factory(TokioWebSocketTransportFactory::new())
+            .with_http_client(MockHttpClient)
+            .with_runtime(TokioRuntime)
+            .build()
+            .await
+            .expect("Failed to build bot");
+        assert!(bot.client().ab_props_fetch_enabled());
+    }
+
+    #[tokio::test]
     async fn test_bot_builder_wanted_pre_key_count() {
         let backend = create_test_sqlite_backend().await;
         let transport = TokioWebSocketTransportFactory::new();
@@ -2280,6 +2523,64 @@ mod tests {
         assert!(std::ptr::eq(Arc::as_ptr(&ctx.message), original_ptr));
     }
 
+    #[tokio::test]
+    async fn from_inbound_keeps_the_inbound_only_metadata() {
+        let backend = create_test_sqlite_backend().await;
+        let bot = Bot::builder()
+            .with_backend_arc(backend)
+            .with_transport_factory(TokioWebSocketTransportFactory::new())
+            .with_http_client(MockHttpClient)
+            .with_runtime(TokioRuntime)
+            .build()
+            .await
+            .expect("Failed to build bot");
+
+        // A message in a disappearing chat: the timer rides the event, not the
+        // shared info, and must still reach the handler's context.
+        let ephemeral = wacore::types::events::InboundMessage::builder()
+            .message(Arc::new(wa::Message::default()))
+            .info(Arc::new(react_info(
+                "12025550100@s.whatsapp.net",
+                "12025550100@s.whatsapp.net",
+                "MSGID01",
+                false,
+            )))
+            .ephemeral_expiration(86400)
+            .build();
+        let ctx = MessageContext::from_inbound(&ephemeral, bot.client());
+        assert_eq!(ctx.ephemeral_expiration, Some(86400));
+        assert!(ctx.comment_target.is_none());
+
+        // A newsletter comment: the parent post key rides the same way.
+        let parent = wa::MessageKey {
+            remote_jid: Some("120363000000000001@newsletter".to_string()),
+            id: Some("POSTID01".to_string()),
+            ..Default::default()
+        };
+        let comment = wacore::types::events::InboundMessage::builder()
+            .message(Arc::new(wa::Message::default()))
+            .info(Arc::new(react_info(
+                "120363000000000001@newsletter",
+                "120363000000000001@newsletter",
+                "MSGID02",
+                false,
+            )))
+            .comment_target(Box::new(parent.clone()))
+            .build();
+        let ctx = MessageContext::from_inbound(&comment, bot.client());
+        assert_eq!(ctx.comment_target.as_deref(), Some(&parent));
+        assert!(ctx.ephemeral_expiration.is_none());
+
+        // The info-only constructor has no stanza to read them from.
+        let plain = MessageContext::from_arc(
+            Arc::new(wa::Message::default()),
+            &MessageInfo::default(),
+            bot.client(),
+        );
+        assert!(plain.ephemeral_expiration.is_none());
+        assert!(plain.comment_target.is_none());
+    }
+
     async fn test_context_with_info(info: MessageInfo) -> MessageContext {
         let backend = create_test_sqlite_backend().await;
         let bot = Bot::builder()
@@ -2296,7 +2597,7 @@ mod tests {
     fn react_info(chat: &str, sender: &str, id: &str, is_group: bool) -> MessageInfo {
         use crate::types::message::MessageSource;
         MessageInfo {
-            id: id.to_string(),
+            id: id.into(),
             source: MessageSource {
                 chat: chat.parse().expect("chat jid"),
                 sender: sender.parse().expect("sender jid"),

@@ -1,5 +1,8 @@
 // Re-export transport types from wacore
-pub use wacore::net::{DisconnectReason, Transport, TransportEvent, TransportFactory};
+pub use wacore::net::{
+    DisconnectReason, RacingTransportFactory, Transport, TransportEvent, TransportFactory,
+    WHATSAPP_WEB_WS_URL_FALLBACK, WHATSAPP_WEB_WS_URLS, with_edge_routing_param,
+};
 
 #[cfg(feature = "tokio-transport")]
 pub use whatsapp_rust_tokio_transport::{
@@ -44,6 +47,62 @@ pub mod mock {
         {
             let (_tx, rx) = async_channel::bounded(1);
             Ok((Arc::new(MockTransport), rx))
+        }
+    }
+
+    /// A transport that accepts calls and never answers them.
+    ///
+    /// Stands in for the socket a teardown cannot rely on: a connection whose
+    /// peer has gone away without a FIN is not refused, it is retried by the
+    /// kernel until `tcp_retries2` gives up (~15 minutes on Linux), and both
+    /// `send` and the close queue behind that. Anything that awaits either of
+    /// them unbounded is parked for the same quarter of an hour.
+    pub struct StallingMockTransport {
+        sends_started: std::sync::atomic::AtomicUsize,
+        disconnects_started: std::sync::atomic::AtomicUsize,
+    }
+
+    impl StallingMockTransport {
+        pub fn new() -> Self {
+            Self {
+                sends_started: std::sync::atomic::AtomicUsize::new(0),
+                disconnects_started: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        /// Sends that entered the transport and never came back out.
+        pub fn sends_started(&self) -> usize {
+            self.sends_started
+                .load(std::sync::atomic::Ordering::Acquire)
+        }
+
+        /// Closes that entered the transport and never came back out.
+        pub fn disconnects_started(&self) -> usize {
+            self.disconnects_started
+                .load(std::sync::atomic::Ordering::Acquire)
+        }
+    }
+
+    impl Default for StallingMockTransport {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    impl Transport for StallingMockTransport {
+        async fn send(&self, _data: bytes::Bytes) -> Result<(), anyhow::Error> {
+            self.sends_started
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            std::future::pending::<()>().await;
+            unreachable!("a stalled send never resolves")
+        }
+
+        async fn disconnect(&self) {
+            self.disconnects_started
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            std::future::pending::<()>().await;
         }
     }
 

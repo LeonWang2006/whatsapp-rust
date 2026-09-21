@@ -76,6 +76,7 @@ pub(crate) fn encode_server_cert_chain(c: &CachedServerCertChain) -> Vec<u8> {
     ServerCertChain {
         intermediate: buffa::MessageField::some(NoiseCert::from(&c.intermediate)),
         leaf: buffa::MessageField::some(NoiseCert::from(&c.leaf)),
+        signature_verified: c.signature_verified,
     }
     .encode_to_vec()
 }
@@ -91,6 +92,9 @@ pub(crate) fn decode_server_cert_chain(bytes: &[u8]) -> Result<CachedServerCertC
     Ok(CachedServerCertChain {
         intermediate: noise_cert_from_wire(intermediate)?,
         leaf: noise_cert_from_wire(leaf)?,
+        // Absent in rows written before the field existed: untrusted, so
+        // the next connect falls back to one XX.
+        signature_verified: w.signature_verified,
     })
 }
 
@@ -137,6 +141,7 @@ pub(crate) fn encode_hash_state(s: &HashState) -> Vec<u8> {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
         mac_mismatch_fatal: s.mac_mismatch_fatal,
+        bootstrapped: s.bootstrapped,
     }
     .encode_to_vec()
 }
@@ -153,6 +158,7 @@ pub(crate) fn decode_hash_state(bytes: &[u8]) -> Result<HashState, StoreError> {
         hash,
         index_value_map: w.index_value_map.into_iter().collect(),
         mac_mismatch_fatal: w.mac_mismatch_fatal,
+        bootstrapped: w.bootstrapped,
     })
 }
 
@@ -163,20 +169,23 @@ mod tests {
 
     #[test]
     fn server_cert_chain_roundtrips() {
-        let chain = CachedServerCertChain {
-            intermediate: CachedNoiseCert {
-                key: [0xAB; 32],
-                not_before: 1_700_000_000,
-                not_after: 1_900_000_000,
-            },
-            leaf: CachedNoiseCert {
-                key: [0xCD; 32],
-                not_before: 1_700_000_500,
-                not_after: 1_899_999_500,
-            },
-        };
-        let decoded = decode_server_cert_chain(&encode_server_cert_chain(&chain)).unwrap();
-        assert_eq!(decoded, chain);
+        for signature_verified in [true, false] {
+            let chain = CachedServerCertChain {
+                intermediate: CachedNoiseCert {
+                    key: [0xAB; 32],
+                    not_before: 1_700_000_000,
+                    not_after: 1_900_000_000,
+                },
+                leaf: CachedNoiseCert {
+                    key: [0xCD; 32],
+                    not_before: 1_700_000_500,
+                    not_after: 1_899_999_500,
+                },
+                signature_verified,
+            };
+            let decoded = decode_server_cert_chain(&encode_server_cert_chain(&chain)).unwrap();
+            assert_eq!(decoded, chain);
+        }
     }
 
     #[test]
@@ -193,6 +202,7 @@ mod tests {
                 not_before: 1,
                 not_after: 2,
             }),
+            signature_verified: false,
         }
         .encode_to_vec();
         assert!(decode_server_cert_chain(&bytes).is_err());
@@ -238,6 +248,7 @@ mod tests {
             hash,
             index_value_map: index_value_map.clone(),
             mac_mismatch_fatal: true,
+            bootstrapped: true,
         };
         let decoded = decode_hash_state(&encode_hash_state(&state)).unwrap();
         assert_eq!(decoded.version, 42);
@@ -268,12 +279,17 @@ mod tests {
             version: 9,
             hash: vec![0u8; 128],
             index_value_map: Default::default(),
-            mac_mismatch_fatal: false,
+            ..Default::default()
         }
         .encode_to_vec();
         let decoded = decode_hash_state(&bytes).expect("an old row must still decode");
         assert_eq!(decoded.version, 9);
         assert!(!decoded.mac_mismatch_fatal);
+        assert!(
+            !decoded.bootstrapped,
+            "a row written before the flag existed has not recorded a completed \
+             bootstrap, so it must read as one that has not"
+        );
     }
 
     #[test]
@@ -283,7 +299,7 @@ mod tests {
             version: 1,
             hash: vec![0u8; 64],
             index_value_map: Default::default(),
-            mac_mismatch_fatal: false,
+            ..Default::default()
         }
         .encode_to_vec();
         assert!(decode_hash_state(&bytes).is_err());

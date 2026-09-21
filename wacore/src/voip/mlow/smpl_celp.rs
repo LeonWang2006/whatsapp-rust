@@ -412,14 +412,45 @@ fn smpl_get_maxi(x: &[f32], x_len: usize) -> usize {
     i
 }
 
-/// Top-K indices, descending by value: the K largest in descending order (the deldec search relies on
-/// `idx[0]` being the best). Ties resolve to the lowest index, matching the reference for distinct
-/// floats.
+/// Write the best `k` indices into `idx[..k]`, descending by value with lowest-index ties.
+/// The remaining destination is untouched. Storage is the caller's bounded survivor array.
 fn smpl_get_maxi_k(x: &[f32], idx: &mut [i32], x_len: usize, k: usize) {
-    // Partial selection: repeatedly take the current max, masking taken indices.
-    // Stack-scratch the mask: x_len is bounded by the subframe length and the
-    // candidate count (NUMSURV^2 = 64), both <= SMPL_MAX_SF_LEN, so this avoids
-    // a heap alloc on the hottest allocation site in the encoder (~500x/frame).
+    debug_assert!(x_len <= SMPL_MAX_SF_LEN);
+    if k == 0 {
+        return;
+    }
+    let values = &x[..x_len];
+    if k == 1 {
+        idx[0] = smpl_get_maxi(values, x_len) as i32;
+        return;
+    }
+    // A NaN wins only when it is the first unselected value in the legacy scan.
+    // That ordering cannot be represented by a value comparator.
+    if values.iter().any(|v| v.is_nan()) {
+        smpl_get_maxi_k_scan(values, idx, x_len, k);
+        return;
+    }
+    assert!(!values.is_empty());
+    let limit = k.min(x_len);
+    let mut len = 0;
+    for (i, &v) in values.iter().enumerate() {
+        if len == limit && v <= values[idx[limit - 1] as usize] {
+            continue;
+        }
+        let mut pos = len.min(limit - 1);
+        while pos > 0 && v > values[idx[pos - 1] as usize] {
+            idx[pos] = idx[pos - 1];
+            pos -= 1;
+        }
+        idx[pos] = i as i32;
+        len = (len + 1).min(limit);
+    }
+    // The old scan repeats index zero after exhausting the candidates.
+    idx[limit..k].fill(0);
+}
+
+/// Preserve repeated-selection semantics, including index zero after nonempty input is exhausted.
+fn smpl_get_maxi_k_scan(x: &[f32], idx: &mut [i32], x_len: usize, k: usize) {
     debug_assert!(x_len <= SMPL_MAX_SF_LEN);
     let mut taken_buf = [false; SMPL_MAX_SF_LEN];
     let taken = &mut taken_buf[..x_len];
@@ -738,7 +769,9 @@ fn non_zero_range(col: i32, perc_resp_len: usize, fcb_subfrlen: usize) -> (usize
 // Public output of the per-subframe encoder.
 
 pub(crate) struct CelpSubframeOut {
-    pub pulses: [Vec<i16>; SMPL_CELP_MAX_RATES],
+    /// Packed pulses for each rate. Only the prefix selected by `n_pulses`
+    /// belongs to the subframe; consumers must ignore the remaining capacity.
+    pub pulses: [[i16; SMPL_MAX_PULSES_PER_SF]; SMPL_CELP_MAX_RATES],
     pub n_pulses: [i16; SMPL_CELP_MAX_RATES],
     pub acb_idx: [i16; SMPL_CELP_MAX_RATES],
     pub gain_idx: [i16; SMPL_CELP_MAX_RATES],
@@ -2239,12 +2272,6 @@ impl CelpEncoder {
         }
         self.fcbgain = fcbgain;
 
-        // Materialize pulses Vecs trimmed to n_pulses.
-        let pulses_fec: Vec<i16> =
-            pulses[SMPL_CELP_IDX_FEC][..n_pulses[SMPL_CELP_IDX_FEC].max(0) as usize].to_vec();
-        let pulses_main: Vec<i16> =
-            pulses[SMPL_CELP_IDX_MAIN][..n_pulses[SMPL_CELP_IDX_MAIN].max(0) as usize].to_vec();
-
         // Return the pooled subframe buffers for reuse next call.
         self.sf.imp_lpc_rev = imp_lpc_rev;
         self.sf.res_lpc_pad = res_lpc_pad;
@@ -2259,7 +2286,7 @@ impl CelpEncoder {
         self.sf.exc_fcb_raw = exc_fcb_raw;
 
         CelpSubframeOut {
-            pulses: [pulses_fec, pulses_main],
+            pulses,
             n_pulses,
             acb_idx,
             gain_idx,
@@ -2312,6 +2339,87 @@ pub(crate) fn cb_acbgains_lr_q14() -> &'static [i16] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Keep this oracle independent of the production fallback so a shared defect cannot self-validate.
+    fn reference_maxi_k(x: &[f32], idx: &mut [i32], x_len: usize, k: usize) {
+        let mut taken = [false; SMPL_MAX_SF_LEN];
+        for dest in &mut idx[..k] {
+            let mut best = -f32::MAX;
+            let mut best_index = 0;
+            let mut found = false;
+            for i in 0..x_len {
+                if !taken[i] && (!found || x[i] > best) {
+                    best = x[i];
+                    best_index = i;
+                    found = true;
+                }
+            }
+            taken[best_index] = true;
+            *dest = best_index as i32;
+        }
+    }
+
+    /// Compare the entire destination to observe writes past the requested survivor count.
+    fn check_maxi_k(x: &[f32], x_len: usize, k: usize) {
+        let mut expected = [-123; SMPL_CELP_MAX_NUMSURV];
+        let mut actual = expected;
+        reference_maxi_k(x, &mut expected, x_len, k);
+        smpl_get_maxi_k(x, &mut actual, x_len, k);
+        assert_eq!(actual, expected, "k={k}, live={:?}", &x[..x_len]);
+    }
+
+    /// A total-order comparator would change the reference's NaN and signed-zero choices.
+    #[test]
+    fn top_k_matches_selection_for_exhaustive_ties_and_nonfinite_values() {
+        let values = [
+            -1.0,
+            -0.0,
+            0.0,
+            1.0,
+            f32::NEG_INFINITY,
+            f32::INFINITY,
+            f32::NAN,
+        ];
+        check_maxi_k(&[], 0, 0);
+        for len in 1..=5u32 {
+            for mut key in 0..7usize.pow(len) {
+                let mut x = [f32::INFINITY; 8];
+                for value in &mut x[..len as usize] {
+                    *value = values[key % 7];
+                    key /= 7;
+                }
+                for k in 0..=SMPL_CELP_MAX_NUMSURV {
+                    check_maxi_k(&x, len as usize, k);
+                }
+            }
+        }
+    }
+
+    /// Mix raw IEEE-754 patterns with a small integer alphabet that forces repeated tied scores.
+    #[test]
+    fn top_k_matches_selection_over_a_million_vectors() {
+        let mut seed = 0x715fba91u32;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        let mut x = [0.0; SMPL_MAX_SF_LEN];
+        for case in 0..1_000_000 {
+            let len = 1 + next() as usize % SMPL_MAX_SF_LEN;
+            let k = next() as usize % (SMPL_CELP_MAX_NUMSURV + 1);
+            for value in &mut x[..len] {
+                let bits = next();
+                *value = if case % 4 == 0 {
+                    (bits as i32 % 5) as f32
+                } else {
+                    f32::from_bits(bits)
+                };
+            }
+            check_maxi_k(&x, len, k);
+        }
+    }
 
     #[test]
     fn tables_build_and_have_expected_shapes() {

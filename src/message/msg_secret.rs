@@ -252,8 +252,11 @@ impl Client {
             },
         };
         // On a total store miss, ask the app-supplied resolver (if any) for the
-        // parent secret. This is what lets the Disabled policy still decrypt. The
-        // resolver carries no parent timestamp, so parent_ts stays 0 (unknown).
+        // parent secret. This is what lets the Disabled policy still decrypt. A
+        // resolver that reports the parent's event time feeds it into the same
+        // edit-window check a store row uses; a legacy resolver that reports no
+        // timestamp yields `0` here, which the check reads as unknown and
+        // leaves permissive.
         let (secret, parent_ts) = match store_secret {
             Some((secret, ts)) => (secret, ts),
             None => {
@@ -269,7 +272,7 @@ impl Client {
                     )
                     .await
                 {
-                    Some(secret) => (secret, 0),
+                    Some(found) => (found.secret.to_vec(), found.message_ts_or_zero()),
                     None => return None,
                 }
             }
@@ -558,7 +561,7 @@ impl Client {
         // Chat scope for the secret lookup: prefer <meta target_chat_jid>;
         // fall back to the stanza's chat (matches WA Web `decryptMsmsgBotMessage`).
         let chat_for_lookup = info
-            .meta_info
+            .meta()
             .target_chat
             .as_ref()
             .unwrap_or(&info.source.chat)
@@ -569,7 +572,7 @@ impl Client {
         // The id used for the SECRET LOOKUP is `meta.target_id` (our outbound
         // id); the id used as HKDF input is the bot reply id (or
         // `bot_info.edit_target_id` when the bot is editing a prior reply).
-        let target_id = match info.meta_info.target_id.as_deref() {
+        let target_id = match info.meta().target_id.as_deref() {
             Some(id) => id,
             None => {
                 log::warn!(
@@ -671,7 +674,7 @@ impl Client {
                     )
                     .await
                 {
-                    Some(s) => s,
+                    Some(found) => found.secret.to_vec(),
                     None => {
                         // For a group bot invocation initiated by our PRIMARY
                         // device, the messageSecret lives in the bot-addressed
@@ -839,7 +842,7 @@ impl Client {
     /// Resolve `target_sender` for a msmsg stanza: echo from `<meta>` when
     /// present, else fall back to our LID (sender on bot server) or PN.
     async fn resolve_msmsg_target_sender(&self, info: &Arc<MessageInfo>) -> Option<Jid> {
-        if let Some(ts) = info.meta_info.target_sender.as_ref() {
+        if let Some(ts) = info.meta().target_sender.as_ref() {
             return Some(ts.clone());
         }
         if info.source.sender.server == wacore_binary::Server::Bot {
@@ -856,21 +859,29 @@ impl Client {
     /// a terminal miss.
     pub(crate) async fn alternate_msg_secret_jid(
         &self,
-        backend: &Arc<dyn crate::store::traits::Backend>,
+        _backend: &Arc<dyn crate::store::traits::Backend>,
         primary_sender: &Jid,
     ) -> Result<Option<Jid>, crate::store::error::StoreError> {
-        let alternate = match primary_sender.server {
-            wacore_binary::Server::Lid => backend
-                .get_lid_mapping(&primary_sender.user)
-                .await?
-                .map(|m| Jid::new(m.phone_number, wacore_binary::Server::Pn)),
-            wacore_binary::Server::Pn => backend
-                .get_pn_mapping(&primary_sender.user)
-                .await?
-                .map(|m| Jid::new(m.lid, wacore_binary::Server::Lid)),
-            _ => None,
+        // Cache-aside, like every other LID<->PN question the client asks:
+        // the mapping cache is warmed from the whole table at startup and
+        // never expires, so this went to SQLite — on the write queue, twice
+        // per secret-encrypted message — for an answer already in memory.
+        let is_lid = match primary_sender.server {
+            wacore_binary::Server::Lid => true,
+            wacore_binary::Server::Pn => false,
+            _ => return Ok(None),
         };
-        Ok(alternate)
+        let entry = self
+            .get_lid_pn_entry_by_user(&primary_sender.user, is_lid)
+            .await
+            .map_err(|e| crate::store::error::StoreError::Database(e.into()))?;
+        Ok(entry.map(|entry| {
+            if is_lid {
+                Jid::new(&*entry.phone_number, wacore_binary::Server::Pn)
+            } else {
+                Jid::new(&*entry.lid, wacore_binary::Server::Lid)
+            }
+        }))
     }
 
     async fn alternate_msg_secret_lookup(
@@ -983,6 +994,7 @@ impl Client {
                     target_id,
                 )
                 .await
+                .map(|found| found.secret.to_vec())
                 .ok_or_else(|| {
                     SendError::InvalidRequest(format!(
                         "no messageSecret stored for target {target_id}; the parent \
@@ -1001,7 +1013,7 @@ impl Client {
     pub(crate) async fn addon_self_jid_for_chat(&self, chat: &Jid) -> Option<Jid> {
         use wacore_binary::JidExt;
         if chat.is_group() {
-            let lid_mode = match self.groups().query_info(chat).await {
+            let lid_mode = match self.groups().routing_info(chat).await {
                 Ok(info) => info.addressing_mode == wacore::types::message::AddressingMode::Lid,
                 Err(e) => {
                     log::warn!("addon self identity: group info lookup failed: {e:?}");
@@ -1039,20 +1051,22 @@ impl Client {
         primary_sender: &str,
         alternate_sender: Option<&str>,
         msg_id: &str,
-    ) -> Option<Vec<u8>> {
+    ) -> Option<wacore::msg_secret::ResolvedMessageSecret> {
         let resolver = self.cache_config.original_message_resolver.as_ref()?;
         let lookup = async {
-            if let Some(secret) = resolver
-                .resolve_msg_secret(chat, primary_sender, msg_id)
+            if let Some(found) = resolver
+                .resolve_msg_secret_with_metadata(chat, primary_sender, msg_id)
                 .await
             {
-                return Some(secret);
+                return Some(found);
             }
             if let Some(alt) = alternate_sender
                 && alt != primary_sender
-                && let Some(secret) = resolver.resolve_msg_secret(chat, alt, msg_id).await
+                && let Some(found) = resolver
+                    .resolve_msg_secret_with_metadata(chat, alt, msg_id)
+                    .await
             {
-                return Some(secret);
+                return Some(found);
             }
             None
         };
@@ -1063,7 +1077,7 @@ impl Client {
         )
         .await
         {
-            Ok(Some(secret)) => Some(secret.to_vec()),
+            Ok(Some(found)) => Some(found),
             Ok(None) => None,
             Err(_) => {
                 log::warn!("[msg:{msg_id}] original_message_resolver timed out");

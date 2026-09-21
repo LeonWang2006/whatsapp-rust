@@ -6,13 +6,183 @@
 
 use crate::AppStateError;
 use crate::decode::{Mutation, decode_record};
-use crate::hash::{HashState, generate_patch_mac};
+use crate::hash::{HashState, generate_patch_mac, value_mac_tail};
 use crate::keys::ExpandedAppStateKeys;
-use log::{debug, trace};
+use log::{Level, debug, log_enabled, trace, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use waproto::whatsapp as wa;
+
+/// `command` is the mutation's verb (`index[0]`): `archive`, `pin`,
+/// `contact`, ... Untrusted wire text — only declared verbs (see
+/// `is_known_app_state_command`) render; anything else aggregates as
+/// `<unknown-command>`, which also keeps a multi-MB hostile verb out of
+/// the `HashMap` key. `operation` is syncd `SET`/`REMOVE`. No payload, no
+/// index tail, no `SyncActionValue`: a line a consumer can paste into an
+/// issue without leaking key material, salts, names or message text.
+///
+/// Crate-private: the only consumer is the `Decoded …` aggregate logged a few
+/// functions below, and the PR body promises no public-API change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum CommandSummary<'a> {
+    Known(&'a str),
+    Unknown,
+    Empty,
+}
+
+impl<'a> CommandSummary<'a> {
+    fn of(raw: &'a str) -> Self {
+        if raw.is_empty() {
+            Self::Empty
+        } else if is_known_app_state_command(raw) {
+            Self::Known(raw)
+        } else {
+            Self::Unknown
+        }
+    }
+}
+
+/// Declared protocol verbs: every `is_known_wire_name` entry, unlisted
+/// `label_message`, legacy `pin`/`mark_chat_as_read` aliases.
+fn is_known_app_state_command(command: &str) -> bool {
+    command == crate::schemas_unlisted::LABEL_MESSAGE.name
+        || matches!(command, "pin" | "mark_chat_as_read")
+        || crate::schemas::is_known_wire_name(command)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct MutationSummary<'a> {
+    operation: &'static str,
+    command: CommandSummary<'a>,
+}
+
+impl<'a> MutationSummary<'a> {
+    fn of(m: &'a Mutation) -> Self {
+        Self {
+            operation: match m.operation {
+                wa::syncd_mutation::SyncdOperation::SET => "SET",
+                wa::syncd_mutation::SyncdOperation::REMOVE => "REMOVE",
+            },
+            command: CommandSummary::of(m.index.first().map(String::as_str).unwrap_or("")),
+        }
+    }
+}
+
+/// What counts as unsafe for a log line — anything that can break the
+/// line discipline or drive a terminal — in one place so this module and
+/// the client's `sanitize_command` can never disagree. See the client's
+/// `is_log_unsafe` for the set rationale; keep the two in sync — both are
+/// covered by the hostile-verb tests.
+fn is_log_unsafe(c: char) -> bool {
+    matches!(
+        c,
+        '\u{0}'..='\u{1F}'
+            | '\u{7F}'..='\u{9F}'
+            | '\u{061C}'
+            | '\u{200E}'
+            | '\u{200F}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{206F}'
+    )
+}
+
+fn sanitize_command(command: &str) -> String {
+    const MAX_COMMAND_CHARS: usize = 48;
+    // Single-pass and bounded: sanitize and cap while iterating — memory
+    // O(48), CPU O(49) no matter how long the wire value is — stopping one
+    // char past the cap only to learn whether the ellipsis is needed.
+    // Materializing the whole wire string first would let a multi-MB verb
+    // dictate the allocation for a ~48-char log token. Kept next to the
+    // `Display` impl it protects — the summary below is the only writer.
+    let mut out = String::new();
+    let mut chars = command.chars();
+    for _ in 0..MAX_COMMAND_CHARS {
+        let Some(c) = chars.next() else {
+            return out;
+        };
+        out.push(if is_log_unsafe(c) { '\u{FFFD}' } else { c });
+    }
+    if chars.next().is_some() {
+        out.push('\u{2026}');
+    }
+    out
+}
+
+impl std::fmt::Display for MutationSummary<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.command {
+            CommandSummary::Empty => write!(f, "{} <no-command>", self.operation),
+            CommandSummary::Unknown => write!(f, "{} <unknown-command>", self.operation),
+            CommandSummary::Known(command) => {
+                write!(f, "{} {}", self.operation, sanitize_command(command))
+            }
+        }
+    }
+}
+
+/// How many distinct `(operation, command)` entries the aggregate line keeps
+/// before folding the long tail into `… +N more`. A full sync can interleave
+/// hundreds of commands (`contact, archive, contact, archive, …`), where
+/// adjacent-run compression shows every entry and the line grows without
+/// bound; global aggregation keeps it one line no matter the order.
+const MUTATION_SUMMARY_ENTRY_CAP: usize = 12;
+
+/// Render a decoded mutation batch as a compact semantic summary.
+///
+/// The integrity line above answers "did the hash hold"; this answers the
+/// question consumers actually ask — "which app state commands did the server
+/// send" — without dumping the IQ payload `node_io` deliberately hides.
+/// Counts aggregate globally per `(operation, command)` (`contact×721`), so
+/// interleaved batches compress as well as adjacent runs do; an empty index,
+/// which no handler can dispatch, shows as `<no-command>` rather than
+/// vanishing. Pure; callers must still gate on `log_enabled!(Debug)`.
+/// Crate-private, like [`MutationSummary`]: called only from this module.
+fn mutation_summary(mutations: &[Mutation]) -> String {
+    use std::fmt::Write;
+
+    // Counted in a `HashMap` so `n` distinct verbs cost O(n), not the
+    // O(n²) of a linear scan per mutation. Snapshots can carry
+    // hundreds/thousands of mutations and this whole pass exists only
+    // for observability, so the aggregation must not dominate the
+    // decode it describes. The value is `(count, first_position)`: the
+    // sort below orders most frequent first with first appearance as
+    // the deterministic tiebreak (the old stable-sort order).
+    let mut counts: HashMap<MutationSummary<'_>, (usize, usize)> =
+        HashMap::with_capacity(mutations.len().min(64));
+    for (position, m) in mutations.iter().enumerate() {
+        let summary = MutationSummary::of(m);
+        let entry = counts.entry(summary).or_insert((0, position));
+        entry.0 += 1;
+    }
+    // Most frequent first: the dominant command of a snapshot reads before
+    // the tail, and the cap below drops the least interesting entries.
+    // `k log k` over distinct commands only, not over mutations.
+    let mut counts: Vec<_> = counts.into_iter().collect();
+    counts.sort_by(|a, b| b.1.0.cmp(&a.1.0).then_with(|| a.1.1.cmp(&b.1.1)));
+
+    let mut out = String::new();
+    let shown = counts.len().min(MUTATION_SUMMARY_ENTRY_CAP);
+    for (i, (summary, (count, _))) in counts[..shown].iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        let _ = write!(out, "{summary}");
+        if *count > 1 {
+            let _ = write!(out, "×{count}");
+        }
+    }
+    let hidden: usize = counts[shown..].iter().map(|(_, (c, _))| c).sum();
+    if hidden > 0 {
+        if !out.is_empty() {
+            out.push_str(", ");
+        }
+        let _ = write!(out, "… +{hidden} more");
+    }
+    out
+}
 
 /// Resolve a mutation's operation to the closed Rust enum. Absent defaults
 /// to SET (proto2 enum default); an unknown wire value is a typed error so
@@ -86,7 +256,25 @@ where
     initial_state.version = version;
 
     // Update hash state directly from records (no cloning needed)
-    initial_state.update_hash_from_records(&snapshot.records);
+    let fold = initial_state.update_hash_from_records(&snapshot.records);
+
+    // A record with no value blob is one nobody can agree about: WA Web reads
+    // `.byteLength` off the absent buffer and the whole fold throws. Refused
+    // here rather than folded around, because the fold and the decode both have
+    // to leave it out to stay in step -- and two passes quietly agreeing to
+    // ignore a record is how a malformed snapshot would validate and be stored
+    // as though it were whole. Rejecting keeps the old answer
+    // (`decode_record`'s `MissingValueBlob`) for input that never changed.
+    if fold.valueless > 0 {
+        warn!(
+            target: "AppState",
+            "Snapshot {} v{} carries {} record(s) with no value blob; refusing it",
+            collection_name,
+            version,
+            fold.valueless,
+        );
+        return Err(AppStateError::MissingValueBlob);
+    }
 
     debug!(
         target: "AppState",
@@ -100,34 +288,127 @@ where
     // Validate snapshot MAC if requested. A snapshot that omits `mac`/`key_id` is
     // treated as a validation FAILURE, not skipped: WA Web's anti-tampering
     // compares against the (possibly undefined) mac and fires the recovery path on
-    // mismatch, so a missing mac must not silently accept unverified records.
+    // mismatch, so a missing mac must not silently accept unverified records. It
+    // answers its own variant, though: the two failures need different fixes and
+    // reaching the log as one string cost a production investigation.
     if validate_macs {
         let (Some(mac_expected), Some(key_id)) = (
             snapshot.mac.as_ref(),
             snapshot.key_id.as_option().and_then(|k| k.id.as_deref()),
         ) else {
-            return Err(AppStateError::SnapshotMACMismatch);
+            warn!(
+                target: "AppState",
+                "Snapshot {} v{} carries no {}; refusing it rather than accepting unverified records",
+                collection_name,
+                version,
+                if snapshot.mac.is_none() { "MAC" } else { "key id" }
+            );
+            return Err(AppStateError::SnapshotMACMissing);
         };
         let keys = get_keys(key_id)?;
         let computed = initial_state.generate_snapshot_mac(collection_name, &keys.snapshot_mac);
-        trace!(
-            target: "AppState",
-            "Snapshot {} v{} MAC validation: computed={}, expected={}",
-            collection_name,
-            version,
-            hex::encode(&computed),
-            hex::encode(mac_expected)
-        );
         if computed != *mac_expected {
+            // Two things can produce this, and they need opposite fixes: the key
+            // we derived is wrong, or the ltHash we folded is. They are
+            // indistinguishable from the MACs alone, and the MAC is checked
+            // before any record is decoded -- so nothing downstream ever gets to
+            // disagree. Decoding one record answers it: the value MAC inside it
+            // is derived from the same expanded key, so a record that decodes
+            // proves the key is right and points at the fold.
+            // Only when someone is reading: decoding a record costs an AES pass, a
+            // MAC and a protobuf parse, and this arm is reached on every page of
+            // a collection that is failing.
+            // Only when someone is reading: decoding a record costs an AES pass, a
+            // MAC and a protobuf parse, and this arm is reached on every page of
+            // a collection that is failing.
+            let key_probe = if log_enabled!(target: "AppState", Level::Debug) {
+                // The question is whether *this* key is right, and `computed` was
+                // made with the snapshot's. A record keyed with some other id
+                // answers about that other key: decoding it proves nothing here,
+                // and failing to decode it accuses a key the snapshot never
+                // claimed. Across an app-state key rotation a snapshot may carry
+                // both, so the record has to be chosen, not taken.
+                match snapshot
+                    .records
+                    .iter()
+                    .find(|rec| rec.key_id.id.as_deref() == Some(key_id))
+                {
+                    None => "inconclusive: no record is keyed with the snapshot's own key id"
+                        .to_string(),
+                    Some(rec) => match decode_record(
+                        wa::syncd_mutation::SyncdOperation::SET,
+                        rec,
+                        &keys,
+                        key_id,
+                        true,
+                    ) {
+                        // Says what it proved and no more. The key validating one
+                        // record does not make the fold the culprit: a stale or
+                        // truncated expected MAC produces this same mismatch with
+                        // a fold that is perfectly correct.
+                        Ok(_) => "the snapshot's key decodes its own record".to_string(),
+                        // The class, not just the fact: `decode_record` refuses
+                        // for a bad content MAC, a failed decryption, a malformed
+                        // value and a missing index MAC, and only some of those
+                        // are about the key.
+                        Err(e) => format!("the snapshot's key failed on its own record: {e}"),
+                    },
+                }
+            } else {
+                "not probed".to_string()
+            };
+
+            // The identifying line stays at warn, because a collection that
+            // strands itself has to be visible without turning logging up. The
+            // MACs and the ltHash do not: a snapshot MAC is HMAC output under
+            // the account's app-state key and the ltHash is an aggregate of the
+            // collection's contents, and this failure repeats deterministically
+            // -- at warn it would be a loop pouring key-derived material into a
+            // log people paste into issues.
+            warn!(
+                target: "AppState",
+                "Snapshot {} v{} MAC mismatch over {} records",
+                collection_name,
+                version,
+                snapshot.records.len()
+            );
+            debug!(
+                target: "AppState",
+                "Snapshot {} v{} MAC mismatch: computed={}, expected={}, ltHash={}, \
+                 the fold folded {} of {} records ({} carrying no index), \
+                 key probe says {}",
+                collection_name,
+                version,
+                hex::encode(&computed),
+                hex::encode(mac_expected),
+                hex::encode(&initial_state.hash[120..]),
+                fold.folded,
+                snapshot.records.len(),
+                fold.unkeyed,
+                key_probe
+            );
             return Err(AppStateError::SnapshotMACMismatch);
         }
+        trace!(
+            target: "AppState",
+            "Snapshot {} v{} MAC validated",
+            collection_name,
+            version
+        );
     }
 
-    // Decode all records and collect MACs in a single pass
-    let mut mutations = Vec::with_capacity(snapshot.records.len());
-    let mut mutation_macs = Vec::with_capacity(snapshot.records.len());
+    // Decode the records and collect MACs in a single pass, over the same keyed
+    // set the ltHash folded. A snapshot that repeats an index has one winner --
+    // the last record for it -- and decoding the losers too would dispatch a
+    // stale mutation beside the winning one. Event delivery is concurrent by
+    // default, so the consumer can apply them in either order and end up with a
+    // contact, mute or label that the snapshot we just authenticated does not
+    // describe.
+    let winners = last_record_per_index(&snapshot.records);
+    let mut mutations = Vec::with_capacity(winners.len());
+    let mut mutation_macs = Vec::with_capacity(winners.len());
 
-    for rec in &snapshot.records {
+    for rec in winners {
         let key_id = rec.key_id.id.as_ref().ok_or(AppStateError::MissingKeyId)?;
         let keys = get_keys(key_id)?;
 
@@ -145,6 +426,20 @@ where
         });
 
         mutations.push(mutation);
+    }
+
+    // A snapshot can carry thousands of mutations, so the per-mutation lines
+    // stay at TRACE (see `log_mutation_dispatched`); DEBUG gets only the
+    // aggregate below.
+    if log_enabled!(target: "AppState", Level::Debug) {
+        debug!(
+            target: "AppState",
+            "Decoded {} v{} snapshot: {} mutations [{}]",
+            collection_name,
+            version,
+            mutations.len(),
+            mutation_summary(&mutations)
+        );
     }
 
     Ok(ProcessedSnapshot {
@@ -233,12 +528,24 @@ where
         } else {
             get_prev_value_mac(index_mac).map_err(|e| anyhow::anyhow!(e))?
         };
-        if let Some(rec) = patch.mutations[idx].record.as_option()
+        // The operand `update_hash` just added for this SET, by the same rule it
+        // used -- so the next SET on this index subtracts what the first one
+        // contributed rather than the store's pre-patch value. A short blob is
+        // folded there, so recording it only when it is 32 bytes long leaves the
+        // first SET's operand added and never cancelled.
+        //
+        // Only a SET, because only a SET adds one. A REMOVE subtracts, and after
+        // it the index holds nothing -- so recording its tail here would have a
+        // later SET on that index subtract a value the patch had already taken
+        // out. `update_hash` suppresses that lookup entirely, but only when
+        // every mutation carries an index; one that does not drops the whole
+        // patch to the legacy path, where this map is what answers.
+        if !is_remove
+            && let Some(rec) = patch.mutations[idx].record.as_option()
             && let Some(index) = rec.index.as_option().and_then(|i| i.blob.as_deref())
             && let Some(value) = rec.value.as_option().and_then(|v| v.blob.as_deref())
-            && value.len() >= 32
         {
-            in_patch.insert(index, &value[value.len() - 32..]);
+            in_patch.insert(index, value_mac_tail(value));
         }
         Ok(prev)
     });
@@ -286,9 +593,21 @@ where
     }
 
     // Decode all mutations and collect MACs in a single pass
+    // SET and REMOVE are disjoint, and a patch is almost always all one or the
+    // other, so sizing both lists to the full count wasted one allocation.
+    let sets = patch
+        .mutations
+        .iter()
+        .filter(|m| {
+            matches!(
+                known_op(m.operation),
+                Ok(wa::syncd_mutation::SyncdOperation::SET)
+            )
+        })
+        .count();
     let mut mutations = Vec::with_capacity(patch.mutations.len());
-    let mut added_macs = Vec::with_capacity(patch.mutations.len());
-    let mut removed_index_macs = Vec::with_capacity(patch.mutations.len());
+    let mut added_macs = Vec::with_capacity(sets);
+    let mut removed_index_macs = Vec::with_capacity(patch.mutations.len() - sets);
 
     for m in &patch.mutations {
         if m.record.is_set() {
@@ -318,6 +637,21 @@ where
 
             mutations.push(mutation);
         }
+    }
+
+    // Semantic summary of what the patch carried: the command is index[0],
+    // already decoded above, so no extra crypto or parsing. Gated so a quiet
+    // logger pays for nothing — particularly on full-sync snapshots, where
+    // this would otherwise format thousands of entries per patch.
+    if log_enabled!(target: "AppState", Level::Debug) {
+        debug!(
+            target: "AppState",
+            "Decoded {} v{}: {} mutations [{}]",
+            collection_name,
+            state.version,
+            mutations.len(),
+            mutation_summary(&mutations)
+        );
     }
 
     Ok(PatchProcessingResult {
@@ -483,6 +817,49 @@ pub fn validate_patch_macs(
     Ok(PatchMacVerdict::default())
 }
 
+/// The records a keyed snapshot actually describes: one per index, the last of
+/// any run.
+///
+/// Mirrors the `Map` WA Web builds in `WAWebSyncdAntiTampering`, and must stay in
+/// step with [`HashState::update_hash_from_records`] -- the ltHash is folded over
+/// this same set, and a snapshot whose MAC we accepted has to be the snapshot we
+/// then decode.
+///
+/// Which is why a record carrying no index is keyed here too, on the empty
+/// slice, exactly as the fold keys it. Letting every such record through as its
+/// own winner read as "they cannot collide" and was the same mistake the fold
+/// made: WA Web keys on `hex(index.blob)`, `hex` of an absent buffer is the
+/// empty string, and they all collide there. Keeping the two in step matters
+/// more than either answer on its own -- the fold decides which MAC we accept
+/// and this decides what we then decrypt, so a disagreement means accepting a
+/// snapshot on one set of records and storing another.
+fn last_record_per_index(records: &[wa::SyncdRecord]) -> Vec<&wa::SyncdRecord> {
+    let mut winners: Vec<&wa::SyncdRecord> = Vec::with_capacity(records.len());
+    let mut seen: Vec<&[u8]> = Vec::new();
+    // Backwards, so the first hit for an index is its last record.
+    for rec in records.iter().rev() {
+        // Skipped for the same reason the fold skips it: a record with no value
+        // blob contributes no value MAC, so it is not part of what the accepted
+        // MAC describes. Letting it win an index anyway is worse than letting it
+        // through -- it displaces the record that *was* folded, so the two
+        // passes disagree about a snapshot that is otherwise perfectly ordinary.
+        if rec.value.blob.is_none() {
+            continue;
+        }
+        let index_mac = rec
+            .index
+            .as_option()
+            .and_then(|idx| idx.blob.as_deref())
+            .unwrap_or_default();
+        if !seen.contains(&index_mac) {
+            seen.push(index_mac);
+            winners.push(rec);
+        }
+    }
+    winners.reverse();
+    winners
+}
+
 /// Validate a snapshot MAC.
 ///
 /// This is a pure function that validates the snapshot MAC without any I/O.
@@ -495,7 +872,7 @@ pub fn validate_snapshot_mac(
     // A missing snapshot mac is a validation failure, not a skip (matches WA Web
     // and process_snapshot's enforced gate).
     let Some(mac_expected) = snapshot.mac.as_ref() else {
-        return Err(AppStateError::SnapshotMACMismatch);
+        return Err(AppStateError::SnapshotMACMissing);
     };
     let computed = state.generate_snapshot_mac(collection_name, &keys.snapshot_mac);
     if computed != *mac_expected {
@@ -579,6 +956,142 @@ mod tests {
         }
     }
 
+    /// A run of one index and three records with no index describe two things,
+    /// and both passes have to say two -- the last of the run and the last of
+    /// the unkeyed.
+    #[test]
+    fn the_decode_set_is_the_set_the_fold_folded() {
+        fn record(index: Option<&[u8]>, value_mac: u8) -> wa::SyncdRecord {
+            let mut blob = vec![0u8; 16];
+            blob.extend_from_slice(&[value_mac; 32]);
+            wa::SyncdRecord {
+                index: buffa::MessageField::some(wa::SyncdIndex {
+                    blob: index.map(<[u8]>::to_vec),
+                }),
+                value: buffa::MessageField::some(wa::SyncdValue { blob: Some(blob) }),
+                ..Default::default()
+            }
+        }
+
+        // One ordinary index carrying a run of two, and three records with no
+        // index at all: five records describing two things.
+        let records = vec![
+            record(Some(&[0x01; 32]), 0x11),
+            record(None, 0x22),
+            record(Some(&[0x01; 32]), 0x33),
+            record(None, 0x44),
+            record(None, 0x55),
+        ];
+
+        let mut state = HashState::default();
+        let fold = state.update_hash_from_records(&records);
+        let winners = last_record_per_index(&records);
+
+        assert_eq!(fold.folded, 2, "one index and one empty key");
+        assert_eq!(
+            winners.len(),
+            fold.folded,
+            "the decode walks the records the fold folded, or the MAC we accepted \
+             was computed over a different snapshot than the one we store"
+        );
+        assert_eq!(
+            fold.unkeyed, 3,
+            "and it still says how many arrived unkeyed"
+        );
+
+        // Last wins in both, and on the same records.
+        let last_of = |mac: u8| {
+            winners
+                .iter()
+                .any(|rec| rec.value.blob.as_ref().is_some_and(|b| b[16] == mac))
+        };
+        assert!(last_of(0x33), "the run's last record, not its first");
+        assert!(last_of(0x55), "the last unkeyed record, not the first");
+    }
+
+    /// The regression the invariant above did not catch on its own: a record
+    /// with no value blob is skipped by the fold, so it must not be allowed to
+    /// win an index from the record that *was* folded. Every record here is
+    /// perfectly ordinary except the last, and the snapshot is one the server
+    /// could send.
+    #[test]
+    fn a_record_with_no_value_cannot_displace_the_one_that_folded() {
+        let mut blob = vec![0u8; 16];
+        blob.extend_from_slice(&[0x11; 32]);
+        let records = vec![
+            wa::SyncdRecord {
+                index: buffa::MessageField::some(wa::SyncdIndex {
+                    blob: Some(vec![0x01; 32]),
+                }),
+                value: buffa::MessageField::some(wa::SyncdValue { blob: Some(blob) }),
+                ..Default::default()
+            },
+            // Same index, no value: later in the run, and so the winner under a
+            // dedup that only looks at indices.
+            wa::SyncdRecord {
+                index: buffa::MessageField::some(wa::SyncdIndex {
+                    blob: Some(vec![0x01; 32]),
+                }),
+                value: buffa::MessageField::some(wa::SyncdValue { blob: None }),
+                ..Default::default()
+            },
+        ];
+
+        let mut state = HashState::default();
+        let fold = state.update_hash_from_records(&records);
+        let winners = last_record_per_index(&records);
+
+        assert_eq!(fold.folded, 1, "only the record carrying a value folded");
+        assert_eq!(winners.len(), 1, "and only that record is decoded");
+        assert!(
+            winners[0].value.blob.is_some(),
+            "the winner is the folded record, not the valueless one that followed it"
+        );
+    }
+
+    /// A snapshot carrying a record with no value blob is refused, not quietly
+    /// folded around. Both passes leave such a record out to stay in step, so
+    /// without this the two would agree to ignore it and a malformed snapshot
+    /// would validate and be stored as though it were whole -- where before it
+    /// was rejected at the decode.
+    #[test]
+    fn a_snapshot_with_a_valueless_record_is_refused() {
+        let mut blob = vec![0u8; 16];
+        blob.extend_from_slice(&[0x11; 32]);
+        let snapshot = wa::SyncdSnapshot {
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(7) }),
+            records: vec![
+                wa::SyncdRecord {
+                    index: buffa::MessageField::some(wa::SyncdIndex {
+                        blob: Some(vec![0x01; 32]),
+                    }),
+                    value: buffa::MessageField::some(wa::SyncdValue { blob: Some(blob) }),
+                    ..Default::default()
+                },
+                wa::SyncdRecord {
+                    index: buffa::MessageField::some(wa::SyncdIndex {
+                        blob: Some(vec![0x02; 32]),
+                    }),
+                    value: buffa::MessageField::some(wa::SyncdValue { blob: None }),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let mut state = HashState::default();
+        // Refused before the MAC is even reached, so it needs no key and no mac.
+        let err = process_snapshot(
+            &snapshot,
+            &mut state,
+            |_| panic!("a valueless record is refused before any key is looked up"),
+            true,
+            "regular_low",
+        )
+        .expect_err("a snapshot with a valueless record must be refused");
+        assert!(matches!(err, AppStateError::MissingValueBlob), "{err:?}");
+    }
+
     #[test]
     fn test_process_snapshot_basic() {
         let master_key = [7u8; 32];
@@ -656,7 +1169,10 @@ mod tests {
         let mut state = HashState::default();
         let err = process_snapshot(&snapshot, &mut state, get_keys, true, "regular")
             .expect_err("missing snapshot mac must fail when validating");
-        assert!(matches!(err, AppStateError::SnapshotMACMismatch));
+        assert!(
+            matches!(err, AppStateError::SnapshotMACMissing),
+            "a snapshot with no MAC must be distinguishable from one whose MAC differs, got {err:?}"
+        );
     }
 
     #[test]
@@ -682,7 +1198,10 @@ mod tests {
         let mut state = HashState::default();
         let err = process_snapshot(&snapshot, &mut state, get_keys, true, "regular")
             .expect_err("missing snapshot key_id must fail when validating");
-        assert!(matches!(err, AppStateError::SnapshotMACMismatch));
+        assert!(
+            matches!(err, AppStateError::SnapshotMACMissing),
+            "no key id means nothing to compare against, not a differing MAC, got {err:?}"
+        );
     }
 
     /// Deterministic reproduction of the fresh-pairing race that PR #972 works
@@ -855,6 +1374,7 @@ mod tests {
             hash: [hash; 128],
             index_value_map: HashMap::new(),
             mac_mismatch_fatal: false,
+            bootstrapped: false,
         }
     }
 
@@ -1344,6 +1864,163 @@ mod tests {
         );
     }
 
+    /// A REMOVE leaves nothing behind for a later SET to subtract.
+    ///
+    /// `update_hash` suppresses that subtraction outright, but only when every
+    /// mutation carries an index MAC; the unindexed third mutation here is what
+    /// drops the patch to the legacy path, where the overwrite map is the only
+    /// thing answering. A REMOVE recorded there would have the SET subtract a
+    /// value the REMOVE had already taken out.
+    #[test]
+    fn a_remove_leaves_nothing_for_a_later_set_to_subtract() {
+        let index_mac = vec![9u8; 32];
+        let removed: Vec<u8> = (0..48u8).collect();
+        let set: Vec<u8> = (100..148u8).collect();
+        let unindexed: Vec<u8> = (200..248u8).collect();
+        let tail = |b: &[u8]| b[b.len() - 32..].to_vec();
+
+        let mutation = |op: wa::syncd_mutation::SyncdOperation,
+                        index: Option<&[u8]>,
+                        blob: &[u8]| wa::SyncdMutation {
+            operation: Some(op.into()),
+            record: buffa::MessageField::some(wa::SyncdRecord {
+                index: buffa::MessageField::some(wa::SyncdIndex {
+                    blob: index.map(<[u8]>::to_vec),
+                }),
+                value: buffa::MessageField::some(wa::SyncdValue {
+                    blob: Some(blob.to_vec()),
+                }),
+                key_id: buffa::MessageField::some(wa::KeyId {
+                    id: Some(b"test_key_id".to_vec()),
+                }),
+            }),
+        };
+
+        use wa::syncd_mutation::SyncdOperation::{REMOVE, SET};
+        let patch = wa::SyncdPatch {
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(1) }),
+            mutations: vec![
+                mutation(REMOVE, Some(&index_mac), &removed),
+                mutation(SET, Some(&index_mac), &set),
+                // No index: this is what makes it the legacy path.
+                mutation(SET, None, &unindexed),
+            ],
+            key_id: buffa::MessageField::some(wa::KeyId {
+                id: Some(b"test_key_id".to_vec()),
+            }),
+            ..Default::default()
+        };
+
+        let master_key = [7u8; 32];
+        let keys = expand_app_state_keys(&master_key);
+        let mut state = HashState::default();
+        let _ = process_patch(
+            &patch,
+            &mut state,
+            |_: &[u8]| Ok(Arc::new(keys.clone())),
+            |_: &[u8]| Ok(None),
+            false,
+            "regular",
+        );
+
+        const EMPTY: &[Vec<u8>] = &[];
+        let expected = WAPATCH_INTEGRITY.subtract_then_add(
+            &[0u8; 128],
+            EMPTY,
+            &[tail(&set), tail(&unindexed)],
+        );
+        assert_eq!(
+            state.hash.as_slice(),
+            expected.as_slice(),
+            "the store held nothing, so the two SETs are all there is to fold"
+        );
+
+        // The exact regression: the SET subtracting the REMOVE's own tail.
+        let subtracted_the_remove = WAPATCH_INTEGRITY.subtract_then_add(
+            &[0u8; 128],
+            &[tail(&removed)],
+            &[tail(&set), tail(&unindexed)],
+        );
+        assert_ne!(
+            state.hash.as_slice(),
+            subtracted_the_remove.as_slice(),
+            "a REMOVE must not leave an operand for the SET after it to cancel"
+        );
+    }
+
+    /// A first SET whose value blob is short must still be cancelled by the
+    /// second SET on the same index.
+    ///
+    /// Read off the state rather than the return value: a 16-byte blob is not
+    /// decryptable, so this patch fails after the hash has already been updated,
+    /// and the ltHash it left behind is the thing under test.
+    #[test]
+    fn a_short_first_set_is_cancelled_by_the_second() {
+        let index_mac = vec![9u8; 32];
+        let short = vec![0xABu8; 16];
+        let second: Vec<u8> = (0..48u8).collect();
+
+        let mutation = |blob: &[u8]| wa::SyncdMutation {
+            operation: Some(wa::syncd_mutation::SyncdOperation::SET.into()),
+            record: buffa::MessageField::some(wa::SyncdRecord {
+                index: buffa::MessageField::some(wa::SyncdIndex {
+                    blob: Some(index_mac.clone()),
+                }),
+                value: buffa::MessageField::some(wa::SyncdValue {
+                    blob: Some(blob.to_vec()),
+                }),
+                key_id: buffa::MessageField::some(wa::KeyId {
+                    id: Some(b"test_key_id".to_vec()),
+                }),
+            }),
+        };
+
+        let patch = wa::SyncdPatch {
+            version: buffa::MessageField::some(wa::SyncdVersion { version: Some(1) }),
+            mutations: vec![mutation(&short), mutation(&second)],
+            key_id: buffa::MessageField::some(wa::KeyId {
+                id: Some(b"test_key_id".to_vec()),
+            }),
+            ..Default::default()
+        };
+
+        let master_key = [7u8; 32];
+        let keys = expand_app_state_keys(&master_key);
+        let mut state = HashState::default();
+        let _ = process_patch(
+            &patch,
+            &mut state,
+            |_: &[u8]| Ok(Arc::new(keys.clone())),
+            |_: &[u8]| Ok(None),
+            false,
+            "regular",
+        );
+
+        const EMPTY: &[Vec<u8>] = &[];
+        let only_second = WAPATCH_INTEGRITY.subtract_then_add(
+            &[0u8; 128],
+            EMPTY,
+            &[second[second.len() - 32..].to_vec()],
+        );
+        assert_eq!(
+            state.hash.as_slice(),
+            only_second.as_slice(),
+            "the short first SET must be cancelled by the second, not left in the ltHash"
+        );
+
+        // The exact regression: the short operand added and never subtracted.
+        let both_kept = WAPATCH_INTEGRITY.subtract_then_add(
+            &[0u8; 128],
+            EMPTY,
+            &[short.clone(), second[second.len() - 32..].to_vec()],
+        );
+        assert_ne!(
+            state.hash.as_slice(),
+            both_kept.as_slice(),
+            "the overwrite map forgot the short operand the fold added"
+        );
+    }
+
     /// SET+REMOVE on the same index in one patch: WA Web index-mode pre-collects the
     /// REMOVEd indices and suppresses the SET's subtraction (the REMOVE owns it, and
     /// it subtracts the STORE value, never the in-patch one). Net must be
@@ -1632,5 +2309,165 @@ mod tests {
         let result = process_patch(&patch, &mut state, get_keys, get_prev, false, "regular")
             .expect("no-prior-state should skip version check");
         assert_eq!(result.state.version, 42);
+    }
+
+    fn summary_mutation(command: Option<&str>, op: wa::syncd_mutation::SyncdOperation) -> Mutation {
+        Mutation {
+            action_value: None,
+            index: command.map(|c| vec![c.to_string()]).unwrap_or_default(),
+            operation: op,
+        }
+    }
+
+    /// The complaint that motivated this: a patch decodes 4 mutations and the
+    /// log names none of them. The summary names every command with its
+    /// operation, most frequent first.
+    #[test]
+    fn mutation_summary_names_each_command_with_its_operation() {
+        use wa::syncd_mutation::SyncdOperation::{REMOVE, SET};
+        let mutations = vec![
+            summary_mutation(Some("archive"), SET),
+            summary_mutation(Some("mark_chat_as_read"), SET),
+            summary_mutation(Some("pin"), SET),
+            summary_mutation(Some("contact"), SET),
+            summary_mutation(Some("contact"), REMOVE),
+        ];
+        assert_eq!(
+            mutation_summary(&mutations),
+            "SET archive, SET mark_chat_as_read, SET pin, SET contact, REMOVE contact"
+        );
+    }
+
+    /// Repeats collapse so a 12-mutation patch still fits on one line —
+    /// including interleaved ones, which adjacent-run compression would miss.
+    #[test]
+    fn mutation_summary_aggregates_repeats_globally() {
+        use wa::syncd_mutation::SyncdOperation::SET;
+        let mutations = vec![
+            summary_mutation(Some("contact"), SET),
+            summary_mutation(Some("archive"), SET),
+            summary_mutation(Some("contact"), SET),
+            summary_mutation(Some("archive"), SET),
+            summary_mutation(Some("pin"), SET),
+        ];
+        assert_eq!(
+            mutation_summary(&mutations),
+            "SET contact×2, SET archive×2, SET pin"
+        );
+    }
+
+    /// Past the entry cap the tail folds into `… +N more`.
+    #[test]
+    fn mutation_summary_caps_entries_and_counts_the_tail() {
+        use wa::syncd_mutation::SyncdOperation::SET;
+        let known = [
+            "archive",
+            "pin_v1",
+            "mute",
+            "contact",
+            "star",
+            "call_log",
+            "label_edit",
+            "quick_reply",
+            "clearChat",
+            "deleteChat",
+            "lock",
+            "markChatAsRead",
+            "deleteMessageForMe",
+            "nct_salt_sync",
+            "userStatusMute",
+        ];
+        debug_assert!(known.iter().all(|c| crate::schemas::is_known_wire_name(c)));
+        let mutations: Vec<Mutation> = known
+            .iter()
+            .map(|c| summary_mutation(Some(c), SET))
+            .collect();
+        let summary = mutation_summary(&mutations);
+        assert!(summary.contains("… +3 more"), "tail folded: {summary}");
+        assert_eq!(summary.matches("SET ").count(), MUTATION_SUMMARY_ENTRY_CAP);
+    }
+
+    /// Thousands of distinct unknown verbs collapse into one bucket.
+    #[test]
+    fn mutation_summary_scales_to_thousands_of_distinct_commands() {
+        use wa::syncd_mutation::SyncdOperation::SET;
+        let verbs: Vec<String> = (0..2_000).map(|i| format!("cmd{i:04}")).collect();
+        let mutations: Vec<Mutation> = verbs
+            .iter()
+            .map(|v| summary_mutation(Some(v), SET))
+            .collect();
+        let summary = mutation_summary(&mutations);
+        assert_eq!(summary, "SET <unknown-command>×2000");
+    }
+
+    /// Unknown verbs aggregate without printing.
+    #[test]
+    fn mutation_summary_never_renders_unknown_verbs() {
+        use wa::syncd_mutation::SyncdOperation::SET;
+        let summary = mutation_summary(&[
+            summary_mutation(Some("5511999999999@s.whatsapp.net"), SET),
+            summary_mutation(Some("CUSTOMER_SECRET_MESSAGE_ID"), SET),
+            summary_mutation(Some("archive"), SET),
+        ]);
+        assert!(!summary.contains("5511999999999"), "{summary}");
+        assert!(!summary.contains("CUSTOMER_SECRET"), "{summary}");
+        assert!(summary.contains("SET <unknown-command>×2"), "{summary}");
+        assert!(summary.contains("SET archive"), "{summary}");
+    }
+
+    /// An empty index has no command to name; it must still appear (no handler
+    /// can dispatch it, so vanishing would hide exactly the mutation worth
+    /// noticing), and an empty batch renders as an empty string.
+    #[test]
+    fn mutation_summary_marks_empty_index_and_empty_batch() {
+        use wa::syncd_mutation::SyncdOperation::SET;
+        assert_eq!(
+            mutation_summary(&[summary_mutation(None, SET)]),
+            "SET <no-command>"
+        );
+        assert_eq!(mutation_summary(&[]), "");
+    }
+
+    /// Unknown verbs aggregate as `<unknown-command>`, never verbatim.
+    #[test]
+    fn mutation_summary_sanitizes_hostile_commands() {
+        use wa::syncd_mutation::SyncdOperation::SET;
+        assert_eq!(
+            mutation_summary(&[summary_mutation(Some("archive"), SET)]),
+            "SET archive"
+        );
+        for hostile in [
+            "archive\nFORGED: yes\u{1B}[2J".to_string(),
+            "a".repeat(200),
+            "a".repeat(20_000),
+            "5511999999999@s.whatsapp.net".to_string(),
+        ] {
+            let summary = mutation_summary(&[summary_mutation(Some(&hostile), SET)]);
+            assert_eq!(summary, "SET <unknown-command>", "{hostile:?}");
+        }
+        for c in [
+            '\u{85}', '\u{9B}', '\u{2028}', '\u{2029}', '\u{202E}', '\u{061C}', '\u{200E}',
+            '\u{200F}', '\u{2067}', '\u{206A}',
+        ] {
+            let verb = format!("archive{c}FORGED");
+            let summary = mutation_summary(&[summary_mutation(Some(&verb), SET)]);
+            assert!(!summary.contains(c), "verb must not carry {c:?}");
+            assert_eq!(summary, "SET <unknown-command>");
+        }
+    }
+
+    /// `sanitize_command` replaces the unsafe set and bounds in one pass.
+    #[test]
+    fn sanitize_command_replaces_unsafe_set_and_bounds() {
+        for c in [
+            '\n', '\u{1B}', '\u{85}', '\u{9B}', '\u{2028}', '\u{2029}', '\u{202E}', '\u{061C}',
+            '\u{200E}', '\u{200F}', '\u{2067}', '\u{206A}',
+        ] {
+            let rendered = sanitize_command(&format!("archive{c}FORGED"));
+            assert!(!rendered.contains(c), "must not carry {c:?}");
+            assert!(rendered.contains('\u{FFFD}'));
+        }
+        let bounded = sanitize_command(&"a".repeat(20_000));
+        assert!(bounded.chars().count() <= 48 + 1);
     }
 }

@@ -1,173 +1,29 @@
 use crate::socket::NoiseSocket;
 use crate::store::persistence_manager::PersistenceManager;
 use crate::transport::{Transport, TransportEvent};
-use log::{debug, info, warn};
+use log::{debug, warn};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Duration;
-use thiserror::Error;
-use wacore::handshake::{
-    HandshakeError as CoreHandshakeError, IkHandshakeState, IkServerHelloOutcome,
-    VerifiedServerCertChain, XxFallbackHandshakeState, XxHandshakeState, build_handshake_header,
-};
 use wacore::noise::NoiseCipher;
-use wacore::runtime::{Runtime, timeout as rt_timeout};
+use wacore::runtime::Runtime;
 use wacore::store::DeviceCommand;
-use wacore_binary::consts::WA_CONN_HEADER;
 
-const NOISE_HANDSHAKE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(20);
-
-/// One IK failure per process before falling back to XX (matches WA Web).
-const IK_FAILURE_THRESHOLD: u32 = 1;
-
-#[derive(Debug, Error)]
-#[non_exhaustive]
-pub enum HandshakeError {
-    #[error("Transport error: {0}")]
-    Transport(#[from] anyhow::Error),
-    #[error("Core handshake error: {0}")]
-    Core(#[from] CoreHandshakeError),
-    #[error("Timed out waiting for handshake response")]
-    Timeout,
-    /// Producer side of `transport_events` was dropped — distinct from a
-    /// timeout because nothing more will ever arrive on the channel,
-    /// regardless of how long we wait. Surfaced separately so callers can
-    /// log it accurately and so retry policies that pace themselves on
-    /// timeout don't silently swallow a teardown.
-    #[error("Transport event stream closed before handshake completed")]
-    StreamClosed,
-    #[error("Disconnected during handshake")]
-    Disconnected,
-    #[error("Unexpected event during handshake: {0}")]
-    UnexpectedEvent(String),
-}
-
-impl HandshakeError {
-    /// The handshake ran out of time, as opposed to being torn down.
-    ///
-    /// Matched exhaustively so a new variant has to be classified here rather
-    /// than defaulting to "not a timeout" unnoticed.
-    pub fn is_timeout(&self) -> bool {
-        match self {
-            HandshakeError::Timeout => true,
-            HandshakeError::Transport(_)
-            | HandshakeError::Core(_)
-            | HandshakeError::StreamClosed
-            | HandshakeError::Disconnected
-            | HandshakeError::UnexpectedEvent(_) => false,
-        }
-    }
-}
-
-impl HandshakeError {
-    /// Transient errors that are expected during reconnect and will resolve
-    /// on retry. These never invalidate the cached server static.
-    pub fn is_transient(&self) -> bool {
-        matches!(
-            self,
-            Self::Transport(_) | Self::Timeout | Self::Disconnected | Self::StreamClosed
-        )
-    }
-
-    /// Crypto-fatal: a cached server static or cert chain is no longer
-    /// trustworthy. The orchestration layer must clear the IK cache and
-    /// fall back to XX on the next attempt.
-    ///
-    /// Narrowed to the `Core` variants that actually point at a stale or
-    /// poisoned cache. Programmer-side bugs (`Proto` encode failure, our
-    /// own crypto provider misuse, HKDF impossible failure, counter
-    /// exhaustion in a single handshake) are NOT crypto-fatal — they
-    /// indicate a code defect, and clearing the cache would mask it. A
-    /// stream-closed event during recv is treated as transient by
-    /// `is_transient`, not here.
-    pub fn is_crypto_fatal(&self) -> bool {
-        let Self::Core(inner) = self else {
-            return false;
-        };
-        use wacore::handshake::HandshakeError as Core;
-        use wacore::noise::NoiseError;
-        match inner {
-            // Server-supplied bytes failed AEAD authentication or had the
-            // wrong shape — canonical "the static we used to derive ee/se
-            // doesn't actually belong to this server" signal.
-            Core::Noise(NoiseError::Decrypt(_))
-            | Core::Noise(NoiseError::CiphertextTooShort)
-            | Core::Noise(NoiseError::InvalidKeyLength { .. }) => true,
-            // Cert content didn't match the static we just decrypted, or
-            // the chain was structurally invalid.
-            Core::CertVerification(_) => true,
-            // Server sent a structurally invalid response. Either it's
-            // out of sync with our cached static or it has a real bug;
-            // either way IK won't recover, so fall back.
-            Core::IncompleteResponse
-            | Core::InvalidLength { .. }
-            | Core::InvalidKeyLength
-            | Core::ProtoDecode(_) => true,
-            // Programmer-side: our encode shouldn't fail with a valid
-            // Device, our own crypto provider shouldn't reject our own
-            // inputs, HKDF can't reasonably fail, and a single handshake
-            // can't exhaust the counter. None of these mean the cache
-            // is bad.
-            Core::Crypto(_)
-            | Core::Noise(NoiseError::Encrypt(_))
-            | Core::Noise(NoiseError::HkdfExpandFailed)
-            | Core::Noise(NoiseError::InvalidPatternLength { .. })
-            | Core::Noise(NoiseError::CounterExhausted) => false,
-        }
-    }
-}
-
-type Result<T> = std::result::Result<T, HandshakeError>;
-
-/// Pattern picked at the start of a handshake based on cached state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HandshakePattern {
-    /// Cold start / pairing / forced fallback after an earlier IK failure.
-    Xx,
-    /// Cached server static + valid cert chain available; attempt IK.
-    Ik([u8; 32]),
-}
-
-fn select_pattern(
-    device: &wacore::store::Device,
-    ik_failures: u32,
-    now_secs: i64,
-) -> HandshakePattern {
-    // Unregistered + cached chain is a signal of a legacy DB written before
-    // the registration gate; `do_handshake` no longer creates that state but
-    // we still need to refuse IK against it.
-    if !device.is_registered() {
-        return HandshakePattern::Xx;
-    }
-    if ik_failures >= IK_FAILURE_THRESHOLD {
-        return HandshakePattern::Xx;
-    }
-    let Some(chain) = device.server_cert_chain.as_ref() else {
-        return HandshakePattern::Xx;
-    };
-    // `not_before` covers backwards clock skew, `not_after` is normal expiry.
-    if now_secs < chain.leaf.not_before
-        || now_secs < chain.intermediate.not_before
-        || now_secs >= chain.leaf.not_after
-        || now_secs >= chain.intermediate.not_after
-    {
-        return HandshakePattern::Xx;
-    }
-    HandshakePattern::Ik(chain.leaf.key)
-}
-
-/// `server_cert_chain` is `Some` for XX / XX-fallback (fresh chain to persist)
-/// and `None` for IK Continue (on-disk cache stays authoritative).
-struct HandshakeSuccess {
-    write_cipher: NoiseCipher,
-    read_cipher: NoiseCipher,
-    server_cert_chain: Option<VerifiedServerCertChain>,
-}
+pub use wacore::handshake::HandshakeError as CoreHandshakeError;
+pub use wacore::handshake::NoiseCertPolicy;
+pub use wacore::handshake::build_handshake_header;
+pub use wacore::handshake::runner::{
+    HandshakeError, HandshakePattern, HandshakeSuccess, IK_FAILURE_THRESHOLD,
+    NOISE_HANDSHAKE_RESPONSE_TIMEOUT, Result, recv_frame, run_ik_handshake, run_xx_handshake,
+    select_pattern, send_first_handshake_message,
+};
 
 fn should_persist_cert_chain(device: &wacore::store::Device) -> bool {
     device.is_registered()
 }
 
+/// Runs the Noise handshake with the default cert policy (strict without
+/// the legacy feature). Only callers that explicitly opt a client into the
+/// testing bypass use `do_handshake_with_cert_policy`.
 pub async fn do_handshake(
     runtime: Arc<dyn Runtime>,
     persistence_manager: &PersistenceManager,
@@ -176,12 +32,37 @@ pub async fn do_handshake(
     transport_events: &mut async_channel::Receiver<TransportEvent>,
     observers: crate::socket::noise_socket::SendObservers,
 ) -> Result<Arc<NoiseSocket>> {
+    do_handshake_with_cert_policy(
+        runtime,
+        persistence_manager,
+        ik_handshake_failures,
+        transport,
+        transport_events,
+        observers,
+        NoiseCertPolicy::default(),
+    )
+    .await
+}
+
+/// Runs the Noise handshake with the client's cert policy. A chain accepted
+/// under the bypass is neither read from nor written to the trusted IK
+/// cache: every connect starts at XX and nothing it learns persists.
+pub async fn do_handshake_with_cert_policy(
+    runtime: Arc<dyn Runtime>,
+    persistence_manager: &PersistenceManager,
+    ik_handshake_failures: &AtomicU32,
+    transport: Arc<dyn Transport>,
+    transport_events: &mut async_channel::Receiver<TransportEvent>,
+    observers: crate::socket::noise_socket::SendObservers,
+    cert_policy: NoiseCertPolicy,
+) -> Result<Arc<NoiseSocket>> {
     let (write_cipher, read_cipher) = negotiate(
         &runtime,
         persistence_manager,
         ik_handshake_failures,
         &transport,
         transport_events,
+        cert_policy,
     )
     .await?;
 
@@ -210,6 +91,7 @@ async fn negotiate(
     ik_handshake_failures: &AtomicU32,
     transport: &Arc<dyn Transport>,
     transport_events: &mut async_channel::Receiver<TransportEvent>,
+    cert_policy: NoiseCertPolicy,
 ) -> Result<(NoiseCipher, NoiseCipher)> {
     let device_snapshot = persistence_manager.get_device_snapshot();
     let now_secs = wacore::time::now_secs();
@@ -217,6 +99,7 @@ async fn negotiate(
         &device_snapshot,
         ik_handshake_failures.load(Ordering::Acquire),
         now_secs,
+        cert_policy,
     );
 
     let mut fallback_taken = false;
@@ -229,6 +112,7 @@ async fn negotiate(
                 &device_snapshot,
                 transport.clone(),
                 transport_events,
+                cert_policy,
             )
             .await
         }
@@ -241,6 +125,7 @@ async fn negotiate(
                 transport.clone(),
                 transport_events,
                 &mut fallback_taken,
+                cert_policy,
             )
             .await
         }
@@ -248,6 +133,8 @@ async fn negotiate(
 
     match result {
         Ok(success) => {
+            // A bypass-accepted chain arrives as `None`, so it can never be
+            // persisted no matter which policy ran the handshake.
             if let Some(chain) = success.server_cert_chain
                 && should_persist_cert_chain(&device_snapshot)
             {
@@ -278,166 +165,6 @@ async fn negotiate(
     }
 }
 
-#[cfg_attr(
-    feature = "tracing",
-    tracing::instrument(name = "wa.conn.handshake.xx", level = "debug", skip_all, err(Debug))
-)]
-async fn run_xx_handshake(
-    runtime: &Arc<dyn Runtime>,
-    device: &wacore::store::Device,
-    transport: Arc<dyn Transport>,
-    transport_events: &mut async_channel::Receiver<TransportEvent>,
-) -> Result<HandshakeSuccess> {
-    let client_payload = waproto::codec::client_payload_to_vec(&device.get_client_payload());
-    let mut handshake_state =
-        XxHandshakeState::new(device.noise_key.clone(), client_payload, &WA_CONN_HEADER)?;
-    let mut frame_decoder = wacore::framing::FrameDecoder::new();
-
-    let client_hello_bytes = handshake_state.build_client_hello()?;
-    send_first_handshake_message(&transport, device, &client_hello_bytes).await?;
-
-    let resp_frame = recv_frame(runtime, transport_events, &mut frame_decoder).await?;
-    debug!("[socket] openChatSocket rcv hello");
-
-    let client_finish_bytes =
-        handshake_state.read_server_hello_and_build_client_finish(&resp_frame)?;
-
-    debug!("[socket] continueFullHandshakeCore client finish and deriving secrets");
-    let framed = wacore::framing::encode_frame(&client_finish_bytes, None)
-        .map_err(HandshakeError::Transport)?;
-    transport.send(bytes::Bytes::from(framed)).await?;
-
-    let outcome = handshake_state.finish()?;
-    info!("Handshake complete (XX), switching to encrypted communication");
-
-    Ok(HandshakeSuccess {
-        write_cipher: outcome.write_cipher,
-        read_cipher: outcome.read_cipher,
-        server_cert_chain: Some(outcome.server_cert_chain),
-    })
-}
-
-/// `fallback_taken` is set to `true` once we pivot from IK to XXfallback,
-/// before any operation that could fail.
-#[cfg_attr(
-    feature = "tracing",
-    tracing::instrument(name = "wa.conn.handshake.ik", level = "debug", skip_all, err(Debug))
-)]
-async fn run_ik_handshake(
-    runtime: &Arc<dyn Runtime>,
-    device: &wacore::store::Device,
-    server_static_pub: [u8; 32],
-    transport: Arc<dyn Transport>,
-    transport_events: &mut async_channel::Receiver<TransportEvent>,
-    fallback_taken: &mut bool,
-) -> Result<HandshakeSuccess> {
-    let client_payload = waproto::codec::client_payload_to_vec(&device.get_client_payload());
-    let mut ik = IkHandshakeState::new(
-        device.noise_key.clone(),
-        server_static_pub,
-        client_payload,
-        &WA_CONN_HEADER,
-    )?;
-    let mut frame_decoder = wacore::framing::FrameDecoder::new();
-
-    debug!("[socket] resumeNoiseHandshake send hello");
-    let client_hello_bytes = ik.build_client_hello()?;
-    send_first_handshake_message(&transport, device, &client_hello_bytes).await?;
-
-    let resp_frame = recv_frame(runtime, transport_events, &mut frame_decoder).await?;
-    debug!("[socket] resumeNoiseHandshake rcv hello");
-
-    match ik.read_server_hello(&resp_frame)? {
-        IkServerHelloOutcome::Continue(out) => {
-            debug!("[socket] resumeNoiseHandshake deriving secrets");
-            info!("Handshake complete (IK), switching to encrypted communication");
-            Ok(HandshakeSuccess {
-                write_cipher: out.write_cipher,
-                read_cipher: out.read_cipher,
-                server_cert_chain: None,
-            })
-        }
-        IkServerHelloOutcome::Fallback(inputs) => {
-            *fallback_taken = true;
-            // Not a failure of ours: the server declined the IK resume and
-            // answered with a full server hello, which XXfallback completes in
-            // the same round trip. WA Web logs this at its plain log level for
-            // the same reason (the "failed" wording is inherited from there).
-            // The outcome is already reported by the `info!` below, so this
-            // line only carries the reason and belongs with the other `[socket]`
-            // trace lines.
-            debug!(
-                "[socket] resumeNoiseHandshake failed: serverStaticCiphertext not null — \
-                 doFallbackHandshake continuing handshake with given server hello"
-            );
-            let mut fb = XxFallbackHandshakeState::from_ik_failure(*inputs, &WA_CONN_HEADER)?;
-            let client_finish_bytes = fb.build_client_finish()?;
-            debug!(
-                "[socket] continueFullHandshakeCore client finish and deriving secrets (XXfallback)"
-            );
-            let framed = wacore::framing::encode_frame(&client_finish_bytes, None)
-                .map_err(HandshakeError::Transport)?;
-            transport.send(bytes::Bytes::from(framed)).await?;
-            let outcome = fb.finish()?;
-            info!("Handshake complete (XXfallback), switching to encrypted communication");
-            Ok(HandshakeSuccess {
-                write_cipher: outcome.write_cipher,
-                read_cipher: outcome.read_cipher,
-                server_cert_chain: Some(outcome.server_cert_chain),
-            })
-        }
-    }
-}
-
-async fn send_first_handshake_message(
-    transport: &Arc<dyn Transport>,
-    device: &wacore::store::Device,
-    payload_bytes: &[u8],
-) -> Result<()> {
-    let (header, used_edge_routing) = build_handshake_header(device.edge_routing_info.as_deref());
-    if used_edge_routing {
-        debug!("Sending edge routing pre-intro for optimized reconnection");
-    } else if device.edge_routing_info.is_some() {
-        warn!("Edge routing info provided but not used (possibly too large)");
-    }
-    let framed = wacore::framing::encode_frame(payload_bytes, Some(&header))
-        .map_err(HandshakeError::Transport)?;
-    transport.send(bytes::Bytes::from(framed)).await?;
-    Ok(())
-}
-
-async fn recv_frame(
-    runtime: &Arc<dyn Runtime>,
-    transport_events: &mut async_channel::Receiver<TransportEvent>,
-    frame_decoder: &mut wacore::framing::FrameDecoder,
-) -> Result<bytes::BytesMut> {
-    loop {
-        match rt_timeout(
-            &**runtime,
-            NOISE_HANDSHAKE_RESPONSE_TIMEOUT,
-            transport_events.recv(),
-        )
-        .await
-        {
-            Ok(Ok(TransportEvent::DataReceived(data))) => {
-                frame_decoder.feed(&data);
-                if let Some(frame) = frame_decoder.decode_frame() {
-                    return Ok(frame);
-                }
-                continue;
-            }
-            Ok(Ok(TransportEvent::Connected)) => continue,
-            Ok(Ok(TransportEvent::Disconnected(reason))) => {
-                debug!("Transport disconnected during handshake: {reason}");
-                return Err(HandshakeError::Disconnected);
-            }
-            // Channel closed (no more producers) — distinct from a real timeout.
-            Ok(Err(_)) => return Err(HandshakeError::StreamClosed),
-            Err(_) => return Err(HandshakeError::Timeout),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -460,99 +187,177 @@ mod tests {
                 not_before: 1_700_000_000,
                 not_after: leaf_not_after,
             },
+            signature_verified: true,
         }
     }
 
-    fn paired_device() -> wacore::store::Device {
-        let mut device = wacore::store::Device::new();
-        device.pn = Some("12345@s.whatsapp.net".parse().unwrap());
-        device
+    async fn paired_pm() -> Arc<PersistenceManager> {
+        let pm = Arc::new(
+            PersistenceManager::new(crate::test_utils::create_test_backend().await)
+                .await
+                .expect("persistence manager"),
+        );
+        pm.process_command(DeviceCommand::SetId(Some(
+            "12345@s.whatsapp.net".parse().unwrap(),
+        )))
+        .await;
+        pm
     }
 
-    #[test]
-    fn select_pattern_no_cache_returns_xx() {
-        let device = paired_device();
+    async fn snapshot_with_chain(
+        pm: &PersistenceManager,
+        chain: CachedServerCertChain,
+    ) -> Arc<crate::store::Device> {
+        pm.process_command(DeviceCommand::SetServerCertChain(chain.clone()))
+            .await;
+        let snapshot = pm.get_device_snapshot();
         assert_eq!(
-            select_pattern(&device, 0, 1_800_000_000),
+            snapshot.server_cert_chain.as_ref(),
+            Some(&chain),
+            "command-applied chain must be visible through the cached snapshot"
+        );
+        snapshot
+    }
+
+    #[tokio::test]
+    async fn select_pattern_no_cache_returns_xx() {
+        let pm = paired_pm().await;
+        let device = pm.get_device_snapshot();
+        assert_eq!(
+            select_pattern(&device, 0, 1_800_000_000, NoiseCertPolicy::Strict),
             HandshakePattern::Xx
         );
     }
 
-    #[test]
-    fn select_pattern_with_valid_cache_returns_ik() {
-        let mut device = paired_device();
+    #[tokio::test]
+    async fn select_pattern_with_valid_cache_returns_ik() {
+        let pm = paired_pm().await;
         let pub_key = [0xAA; 32];
-        device.server_cert_chain = Some(cached_chain(pub_key, 1_900_000_000, 1_900_000_000));
+        let device =
+            snapshot_with_chain(&pm, cached_chain(pub_key, 1_900_000_000, 1_900_000_000)).await;
         assert_eq!(
-            select_pattern(&device, 0, 1_800_000_000),
+            select_pattern(&device, 0, 1_800_000_000, NoiseCertPolicy::Strict),
             HandshakePattern::Ik(pub_key)
         );
     }
 
-    #[test]
-    fn select_pattern_after_one_failure_returns_xx() {
-        let mut device = paired_device();
-        device.server_cert_chain = Some(cached_chain([0xAA; 32], 1_900_000_000, 1_900_000_000));
+    #[tokio::test]
+    async fn select_pattern_after_one_failure_returns_xx() {
+        let pm = paired_pm().await;
+        let device =
+            snapshot_with_chain(&pm, cached_chain([0xAA; 32], 1_900_000_000, 1_900_000_000)).await;
         assert_eq!(
-            select_pattern(&device, IK_FAILURE_THRESHOLD, 1_800_000_000),
+            select_pattern(
+                &device,
+                IK_FAILURE_THRESHOLD,
+                1_800_000_000,
+                NoiseCertPolicy::Strict
+            ),
             HandshakePattern::Xx
         );
     }
 
-    #[test]
-    fn select_pattern_with_expired_leaf_returns_xx() {
-        let mut device = paired_device();
-        device.server_cert_chain = Some(cached_chain([0xAA; 32], 1_700_000_500, 1_900_000_000));
+    #[tokio::test]
+    async fn select_pattern_with_expired_leaf_returns_xx() {
+        let pm = paired_pm().await;
+        let device =
+            snapshot_with_chain(&pm, cached_chain([0xAA; 32], 1_700_000_500, 1_900_000_000)).await;
         assert_eq!(
-            select_pattern(&device, 0, 1_800_000_000),
+            select_pattern(&device, 0, 1_800_000_000, NoiseCertPolicy::Strict),
             HandshakePattern::Xx
         );
     }
 
-    #[test]
-    fn select_pattern_with_expired_intermediate_returns_xx() {
-        let mut device = paired_device();
-        device.server_cert_chain = Some(cached_chain([0xAA; 32], 1_900_000_000, 1_700_000_500));
+    #[tokio::test]
+    async fn select_pattern_with_expired_intermediate_returns_xx() {
+        let pm = paired_pm().await;
+        let device =
+            snapshot_with_chain(&pm, cached_chain([0xAA; 32], 1_900_000_000, 1_700_000_500)).await;
         assert_eq!(
-            select_pattern(&device, 0, 1_800_000_000),
+            select_pattern(&device, 0, 1_800_000_000, NoiseCertPolicy::Strict),
             HandshakePattern::Xx
         );
     }
 
-    #[test]
-    fn select_pattern_with_clock_before_leaf_not_before_returns_xx() {
-        let mut device = paired_device();
-        device.server_cert_chain = Some(cached_chain([0xAA; 32], 1_900_000_000, 1_900_000_000));
+    #[tokio::test]
+    async fn select_pattern_with_clock_before_leaf_not_before_returns_xx() {
+        let pm = paired_pm().await;
+        let device =
+            snapshot_with_chain(&pm, cached_chain([0xAA; 32], 1_900_000_000, 1_900_000_000)).await;
         assert_eq!(
-            select_pattern(&device, 0, 1_699_999_999),
+            select_pattern(&device, 0, 1_699_999_999, NoiseCertPolicy::Strict),
             HandshakePattern::Xx
         );
     }
 
-    #[test]
-    fn select_pattern_with_clock_before_intermediate_not_before_returns_xx() {
-        let mut device = paired_device();
+    #[tokio::test]
+    async fn select_pattern_with_clock_before_intermediate_not_before_returns_xx() {
+        let pm = paired_pm().await;
         let mut chain = cached_chain([0xAA; 32], 1_900_000_000, 1_900_000_000);
         chain.intermediate.not_before = 1_800_000_001;
-        device.server_cert_chain = Some(chain);
+        let device = snapshot_with_chain(&pm, chain).await;
         assert_eq!(
-            select_pattern(&device, 0, 1_800_000_000),
+            select_pattern(&device, 0, 1_800_000_000, NoiseCertPolicy::Strict),
+            HandshakePattern::Xx
+        );
+    }
+
+    #[tokio::test]
+    async fn select_pattern_unregistered_device_returns_xx_even_with_valid_cache() {
+        let pm = Arc::new(
+            PersistenceManager::new(crate::test_utils::create_test_backend().await)
+                .await
+                .expect("persistence manager"),
+        );
+        let device =
+            snapshot_with_chain(&pm, cached_chain([0xAA; 32], 1_900_000_000, 1_900_000_000)).await;
+        assert!(!device.is_registered(), "fresh backend must be unpaired");
+        assert_eq!(
+            select_pattern(&device, 0, 1_800_000_000, NoiseCertPolicy::Strict),
+            HandshakePattern::Xx
+        );
+    }
+
+    #[tokio::test]
+    async fn select_pattern_bypass_ignores_valid_cache() {
+        let pm = paired_pm().await;
+        let device =
+            snapshot_with_chain(&pm, cached_chain([0xAA; 32], 1_900_000_000, 1_900_000_000)).await;
+        assert_eq!(
+            select_pattern(
+                &device,
+                0,
+                1_800_000_000,
+                NoiseCertPolicy::DangerSkipCertChainVerify
+            ),
+            HandshakePattern::Xx
+        );
+    }
+
+    #[tokio::test]
+    async fn select_pattern_unmarked_cache_returns_xx() {
+        let pm = paired_pm().await;
+        let mut chain = cached_chain([0xAA; 32], 1_900_000_000, 1_900_000_000);
+        chain.signature_verified = false;
+        let device = snapshot_with_chain(&pm, chain).await;
+        assert_eq!(
+            select_pattern(&device, 0, 1_800_000_000, NoiseCertPolicy::Strict),
             HandshakePattern::Xx
         );
     }
 
     #[test]
-    fn select_pattern_unregistered_device_returns_xx_even_with_valid_cache() {
-        let mut device = wacore::store::Device::new();
-        assert!(
-            !device.is_registered(),
-            "fresh Device::new() must be unpaired"
-        );
-        device.server_cert_chain = Some(cached_chain([0xAA; 32], 1_900_000_000, 1_900_000_000));
-        assert_eq!(
-            select_pattern(&device, 0, 1_800_000_000),
-            HandshakePattern::Xx
-        );
+    fn cert_policy_cache_gates() {
+        assert!(NoiseCertPolicy::Strict.reuse_cached_chain());
+        assert!(!NoiseCertPolicy::DangerSkipCertChainVerify.reuse_cached_chain());
+        assert!(!NoiseCertPolicy::Strict.skip_signature_check());
+        assert!(NoiseCertPolicy::DangerSkipCertChainVerify.skip_signature_check());
+    }
+
+    // The default policy is strict.
+    #[test]
+    fn cert_policy_default_is_strict() {
+        assert_eq!(NoiseCertPolicy::default(), NoiseCertPolicy::Strict);
     }
 
     #[test]
@@ -562,9 +367,10 @@ mod tests {
         assert!(!should_persist_cert_chain(&device));
     }
 
-    #[test]
-    fn should_persist_cert_chain_registered_returns_true() {
-        let device = paired_device();
+    #[tokio::test]
+    async fn should_persist_cert_chain_registered_returns_true() {
+        let pm = paired_pm().await;
+        let device = pm.get_device_snapshot();
         assert!(device.is_registered());
         assert!(should_persist_cert_chain(&device));
     }

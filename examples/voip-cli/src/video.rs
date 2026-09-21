@@ -12,6 +12,7 @@
 //! `WA_VIDEO_BITRATE_KBPS`, and `WA_VIDEO_SINK_FPS` override the captured WhatsApp defaults.
 
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -56,7 +57,7 @@ const DEFAULT_VIDEO_BITRATE_KBPS: u32 = 1980;
 const VIDEO_VBV_WINDOW_MS: u32 = 250;
 /// Raw-H.264 fallback when the bitstream carries no timing; preview timestamps follow arrival time.
 const DEFAULT_SINK_FPS: u32 = 15;
-const GOP_SECONDS: u32 = 3;
+pub const GOP_SECONDS: u32 = 3;
 const H264_LEVEL_31_MAX_FRAME_MBS: u32 = 3600;
 const H264_LEVEL_31_MAX_MBS_PER_SECOND: u32 = 108_000;
 const H264_BASELINE_LEVEL_31_MAX_KBPS: u32 = 14_000;
@@ -783,12 +784,18 @@ enum SinkTarget {
     None,
 }
 
+/// Called when this sink discards an access unit, so the peer can be asked for
+/// the keyframe that ends the discard. `None` where the sink is built before the
+/// call handle exists, which is every flow that attaches video from the start.
+pub type OnVideoLoss = Arc<dyn Fn() + Send + Sync>;
+
 /// Spawn the display/record sink and return the channel the library pushes received frames into
 /// (`VideoSink` blanket impl on `Sender<VideoFrame>`). Lazy: the window/file only appears when the
 /// first frame arrives, so a call that never activates video opens nothing.
 pub async fn spawn_video_sink(
     opts: &VideoOpts,
     tag: &str,
+    on_loss: Option<OnVideoLoss>,
 ) -> Result<async_channel::Sender<VideoFrame>> {
     let want_window = matches!(opts.sink, VideoSinkMode::Window);
     let want_file = matches!(opts.sink, VideoSinkMode::File);
@@ -905,8 +912,14 @@ pub async fn spawn_video_sink(
                         .await
                     {
                         Ok(Ok(())) => {}
-                        // Slow consumer: shed until the next keyframe instead of stalling.
-                        Err(_) => dropping = true,
+                        // Slow consumer: shed until the next keyframe instead of stalling --
+                        // and ask for one, because nothing else can see this drop.
+                        Err(_) => {
+                            dropping = true;
+                            if let Some(ask) = on_loss.as_ref() {
+                                ask();
+                            }
+                        }
                         // Window closed / player died: degrade to discard, keep the call alive.
                         Ok(Err(e)) => {
                             warn!("🎥 ffplay pipe failed ({e}); discarding further video");
@@ -939,7 +952,7 @@ pub async fn spawn_video_sink(
 /// and `sink`, which ends their reader/writer tasks and kills the subprocesses on drop.
 pub async fn run_video_loopback(opts: &VideoOpts) -> Result<()> {
     let src = spawn_video_source(opts).await?;
-    let sink = spawn_video_sink(opts, "loopback").await?;
+    let sink = spawn_video_sink(opts, "loopback", None).await?;
     info!("🎥 video loopback running — Ctrl+C to stop");
     let mut n = 0u64;
     loop {

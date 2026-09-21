@@ -36,8 +36,19 @@ impl StanzaHandler for NotificationHandler {
     }
 }
 
-/// Dispatch notification by type. Each arm calls a separate async fn so the
-/// compiler doesn't size this future for all arms simultaneously.
+/// Dispatch notification by type.
+///
+/// Every asynchronous arm is `Box::pin`ned. Awaiting a plain async fn inlines
+/// its state machine into this one, and `async_trait` boxes *this* future on
+/// every inbound `<notification>` — so without the indirection that one
+/// allocation is sized for the union of all the arms, and a
+/// `<notification type="picture">` pays for `handle_devices_notification`'s
+/// locals. Measured on `benches/inbound_stanza`, a `<notification
+/// type="picture">` allocated 2306 bytes before — of which a single 2272-byte
+/// block was this future — and 146 bytes after. The box the arm that actually
+/// runs pays instead is a small block from a hot malloc bin, and only the arm
+/// that runs pays it. Synchronous arms need none of this: a plain call
+/// contributes no state to the caller's future.
 #[cfg_attr(
     feature = "tracing",
     tracing::instrument(name = "wa.notif.dispatch", level = "debug", skip_all)
@@ -51,22 +62,32 @@ async fn handle_notification_impl(client: &Arc<Client>, node: Arc<OwnedNodeRef>)
         .and_then(|t| NotificationType::try_from(t).ok());
 
     match parsed {
-        Some(NotificationType::Encrypt) => handle_encrypt_notification(client, nr).await,
+        Some(NotificationType::Encrypt) => Box::pin(handle_encrypt_notification(client, nr)).await,
         Some(NotificationType::ServerSync) => handle_server_sync_notification(client, nr),
-        Some(NotificationType::AccountSync) => handle_account_sync_notification(client, nr).await,
-        Some(NotificationType::Devices) => handle_devices_notification(client, nr).await,
+        Some(NotificationType::AccountSync) => {
+            Box::pin(handle_account_sync_notification(client, nr)).await
+        }
+        Some(NotificationType::Devices) => Box::pin(handle_devices_notification(client, nr)).await,
         Some(NotificationType::LinkCodeCompanionReg) => {
-            crate::pair_code::handle_pair_code_notification(client, nr).await;
+            Box::pin(crate::pair_code::handle_pair_code_notification(client, nr)).await;
         }
         Some(NotificationType::CompanionRegRefresh) => {
-            handle_companion_reg_refresh(client, nr).await
+            Box::pin(handle_companion_reg_refresh(client, nr)).await
         }
-        Some(NotificationType::Business) => handle_business_notification(client, nr).await,
+        Some(NotificationType::Business) => {
+            Box::pin(handle_business_notification(client, nr)).await
+        }
         Some(NotificationType::Picture) => handle_picture_notification(client, nr),
-        Some(NotificationType::PrivacyToken) => handle_privacy_token_notification(client, nr).await,
+        Some(NotificationType::PrivacyToken) => {
+            Box::pin(handle_privacy_token_notification(client, nr)).await
+        }
         Some(NotificationType::Status) => handle_status_notification(client, nr),
-        Some(NotificationType::Contacts) => handle_contacts_notification(client, nr).await,
-        Some(NotificationType::WGp2) => handle_group_notification(client, Arc::clone(&node)).await,
+        Some(NotificationType::Contacts) => {
+            Box::pin(handle_contacts_notification(client, nr)).await
+        }
+        Some(NotificationType::WGp2) => {
+            Box::pin(handle_group_notification(client, Arc::clone(&node))).await
+        }
         Some(NotificationType::DisappearingMode) => {
             handle_disappearing_mode_notification(client, nr)
         }
@@ -85,7 +106,10 @@ async fn handle_notification_impl(client: &Arc<Client>, node: Arc<OwnedNodeRef>)
         // not model at all, and both reach the consumer as a raw event.
         _ => {
             if let Some(parsed) = parsed
-                && crate::client::subsystem::dispatch_notification(client, parsed, &node).await
+                && Box::pin(crate::client::subsystem::dispatch_notification(
+                    client, parsed, &node,
+                ))
+                .await
             {
                 return;
             }
@@ -184,6 +208,185 @@ mod tests {
         );
     }
 
+    /// A client with an event collector already subscribed. Every test below
+    /// observes the dispatcher through the bus, so the wiring is shared rather
+    /// than repeated per test.
+    async fn client_with_collector() -> (Arc<Client>, Arc<TestEventCollector>) {
+        use crate::types::events::EventHandler;
+
+        let client = create_test_client().await;
+        let collector = Arc::new(TestEventCollector::default());
+        client
+            .subscribe_handler(collector.clone() as Arc<dyn EventHandler>)
+            .detach();
+        (client, collector)
+    }
+
+    /// The account this client owns, as the `from` of a notification the
+    /// server sends about it.
+    const OWN_PN: &str = "12025550199@s.whatsapp.net";
+
+    /// `<notification type="account_sync" from=OWN_PN>` wrapping one
+    /// `<disappearing_mode>` child — the envelope both arms share, so only the
+    /// child differs between them.
+    fn account_sync_disappearing_mode(id: &str, disappearing_mode: Node) -> Node {
+        NodeBuilder::new("notification")
+            .attr("type", NotificationType::AccountSync.as_str())
+            .attr("from", OWN_PN)
+            .attr("id", id)
+            .attr("t", "1704067200")
+            .children([disappearing_mode])
+            .build()
+    }
+
+    // ── `w:gp2` / `<groups_dirty>` (WA Web
+    // `WASmaxInGroupsGroupsDirtyNotificationRequest`)
+    //
+    // The one `w:gp2` stanza whose `from` is the server rather than a group.
+    // We ran it through the ordinary group-notification parser, which named
+    // `s.whatsapp.net` as the group in the event it produced and left the
+    // groups the server had actually called stale still cached.
+
+    #[tokio::test]
+    async fn groups_dirty_invalidates_the_named_groups_and_names_no_group_update() {
+        use wacore::client::context::GroupRoutingInfo;
+        use wacore::types::message::AddressingMode;
+
+        let (client, collector) = client_with_collector().await;
+
+        // Several dirty groups, so the bounded fan-out is exercised with more
+        // than one entry rather than degenerating to the single-item case.
+        let dirty: Vec<Jid> = [
+            "120363000000000001@g.us",
+            "120363000000000003@g.us",
+            "120363000000000004@g.us",
+        ]
+        .iter()
+        .map(|jid| jid.parse().unwrap())
+        .collect();
+        let untouched: Jid = "120363000000000002@g.us".parse().unwrap();
+        let cache = client.get_group_cache();
+        for jid in dirty.iter().chain([&untouched]) {
+            cache
+                .insert(
+                    jid.clone(),
+                    Arc::new(GroupRoutingInfo::new(
+                        vec!["12025550101@s.whatsapp.net".parse().unwrap()],
+                        AddressingMode::Pn,
+                    )),
+                )
+                .await;
+        }
+
+        let notif = NodeBuilder::new("notification")
+            .attr("type", NotificationType::WGp2.as_str())
+            .attr("from", "g.us")
+            .attr("id", "groups-dirty-1")
+            .attr("t", "1704067200")
+            .children([NodeBuilder::new("groups_dirty")
+                .children(
+                    dirty
+                        .iter()
+                        .map(|jid| NodeBuilder::new("group").attr("jid", jid).build()),
+                )
+                .build()])
+            .build();
+        handle_notification_impl(&client, node_to_arc(notif)).await;
+
+        // The invalidation runs in the per-group lane, off the ack path, so it
+        // lands shortly after the handler returns rather than inside it.
+        // `poll_until` takes a sync predicate and this one is async, hence a
+        // bounded timeout around the poll rather than that helper.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for jid in &dirty {
+                while cache.get(jid).await.is_some() {
+                    tokio::task::yield_now().await;
+                }
+            }
+        })
+        .await
+        .expect("every group the server called stale must lose its cached metadata");
+        assert!(
+            cache.get(&untouched).await.is_some(),
+            "a group the notification did not name must keep its cache"
+        );
+        assert!(
+            !collector
+                .events()
+                .iter()
+                .any(|event| matches!(event.as_ref(), Event::GroupUpdate(_))),
+            "groups_dirty must not be reported as an update to a group named by `from`"
+        );
+        assert!(
+            collector
+                .events()
+                .iter()
+                .any(|event| matches!(event.as_ref(), Event::Notification(_))),
+            "the stanza must still reach the consumer raw"
+        );
+    }
+
+    // ── `account_sync` / `<disappearing_mode>` (WA Web's account_sync parser)
+    //
+    // Our own account's default disappearing-messages timer, changed from
+    // another device. We read only `pushname` and `<devices>` out of this
+    // notification, so the change was dropped without even the raw-event
+    // fallback, which the matched `account_sync` arm skips.
+    //
+    // WA Web's parser makes `action` and `duration`/`t` mutually exclusive
+    // (`h.hasAttr("action") ? … : (duration, t)`), so the two shapes are
+    // tested apart: only the second carries a timer to report.
+
+    #[tokio::test]
+    async fn account_sync_disappearing_mode_reaches_the_consumer() {
+        let (client, collector) = client_with_collector().await;
+
+        let notif = account_sync_disappearing_mode(
+            "acct-sync-dm-1",
+            NodeBuilder::new("disappearing_mode")
+                .attr("duration", "604800")
+                .attr("t", "1704067200")
+                .build(),
+        );
+        handle_notification_impl(&client, node_to_arc(notif)).await;
+
+        let changed = collector
+            .events()
+            .into_iter()
+            .find_map(|event| match event.as_ref() {
+                Event::DisappearingModeChanged(changed) => Some(changed.clone()),
+                _ => None,
+            })
+            .expect("an account_sync disappearing_mode must reach the consumer");
+        assert_eq!(changed.from, OWN_PN.parse::<Jid>().unwrap());
+        assert_eq!(changed.duration, 604_800);
+    }
+
+    /// The other arm. `action` present means the stanza carries no timer at
+    /// all — WA Web goes back to the server for it. Reporting a
+    /// `DisappearingModeChanged` here would be inventing a duration the
+    /// notification never stated, so nothing is dispatched.
+    #[tokio::test]
+    async fn account_sync_disappearing_mode_action_reports_no_duration() {
+        let (client, collector) = client_with_collector().await;
+
+        let notif = account_sync_disappearing_mode(
+            "acct-sync-dm-2",
+            NodeBuilder::new("disappearing_mode")
+                .attr("action", "modify")
+                .build(),
+        );
+        handle_notification_impl(&client, node_to_arc(notif)).await;
+
+        assert!(
+            !collector
+                .events()
+                .iter()
+                .any(|event| matches!(event.as_ref(), Event::DisappearingModeChanged(_))),
+            "an action-only disappearing_mode states no duration, so none may be reported"
+        );
+    }
+
     /// A type a subsystem claims must not be shadowed by a core arm. The seam
     /// is consulted only in the fallthrough, so an arm added here later would
     /// take the stanza and the subsystem would silently stop seeing it. The
@@ -256,6 +459,73 @@ mod tests {
         assert_eq!(adv_secret(&client).await, before);
     }
 
+    // ── `<notification type="encrypt">` prekey-low routing
+    //
+    // What these pin: a `<count>` child reaches the prekey-low path wherever it
+    // sits among the children, and a PQ-only notification reaches nothing. Why
+    // WA Web splits it that way is stated once, at `handle_encrypt_notification`.
+
+    fn encrypt_notif(children: &[&'static str]) -> Node {
+        NodeBuilder::new("notification")
+            .attr("type", "encrypt")
+            .attr("from", "s.whatsapp.net")
+            .attr("id", "prekey-low-1")
+            .children(children.iter().map(|c| NodeBuilder::new(c).build()))
+            .build()
+    }
+
+    /// `handle_prekey_low` clears `server_has_prekeys` synchronously, before it
+    /// spawns the upload, so the flag is the observable that says the stanza was
+    /// routed to the prekey-low path at all.
+    async fn server_has_prekeys(client: &Arc<Client>) -> bool {
+        client
+            .persistence_manager
+            .get_device_snapshot()
+            .server_has_prekeys
+    }
+
+    async fn dispatch_encrypt(client: &Arc<Client>, children: &[&'static str]) -> bool {
+        client
+            .persistence_manager
+            .modify_device(|d| d.server_has_prekeys = true)
+            .await;
+        handle_notification_impl(client, node_to_arc(encrypt_notif(children))).await;
+        !server_has_prekeys(client).await
+    }
+
+    /// Every child arrangement that carries `<count>` must reach the prekey-low
+    /// path, whatever the tag order.
+    #[tokio::test]
+    async fn a_pq_count_first_encrypt_notification_still_refills_the_classic_pool() {
+        let client = create_test_client().await;
+
+        assert!(
+            dispatch_encrypt(&client, &["count"]).await,
+            "<count> alone must reach the prekey-low path"
+        );
+        assert!(
+            dispatch_encrypt(&client, &["count", "pq_count"]).await,
+            "<count> first must reach the prekey-low path"
+        );
+        assert!(
+            dispatch_encrypt(&client, &["pq_count", "count"]).await,
+            "<count> after <pq_count> must reach the prekey-low path"
+        );
+    }
+
+    /// A notification with no `<count>` anywhere must reach nothing. This one
+    /// holds on both sides of the fix; it is here to pin the other half of the
+    /// routing condition, not to demonstrate the bug.
+    #[tokio::test]
+    async fn a_pq_count_only_encrypt_notification_uploads_nothing() {
+        let client = create_test_client().await;
+
+        assert!(
+            !dispatch_encrypt(&client, &["pq_count"]).await,
+            "a PQ-only prekey-low notification must not trigger the classic upload"
+        );
+    }
+
     /// Regression: the displayed-code window and the pending-link window are not
     /// the same. A `primary_hello` accepted near the end of the 180s validity
     /// leaves `companion_finish` waiting up to another minute for pair-success,
@@ -265,11 +535,10 @@ mod tests {
     #[tokio::test]
     async fn companion_reg_refresh_waits_for_a_pending_pair_success() {
         use wacore::libsignal::protocol::KeyPair;
-        use wacore::pair_code::{PairCodeState, PairCodeUtils};
+        use wacore::pair_code::PairCodeState;
 
         let client = create_test_client().await;
-        let expired =
-            wacore::time::now_secs() - (PairCodeUtils::code_validity().as_secs() as i64 + 1);
+        let expired = wacore::time::Instant::ZERO;
         *client.pair_code_state.lock().await = PairCodeState::WaitingForPhoneConfirmation {
             pairing_ref: b"3@2:ref".to_vec(),
             phone_jid: "15551234567".to_string(),
@@ -277,7 +546,7 @@ mod tests {
             ephemeral_keypair: Box::new(KeyPair::generate(
                 &mut rand::make_rng::<rand::rngs::StdRng>(),
             )),
-            code_generation_ts: expired,
+            code_expires_at: expired,
             // Stage 2 ran: companion_finish is out and pair-success is pending.
             primary_hello_attempt_count: 1,
         };
@@ -311,7 +580,8 @@ mod tests {
             ephemeral_keypair: Box::new(KeyPair::generate(
                 &mut rand::make_rng::<rand::rngs::StdRng>(),
             )),
-            code_generation_ts: wacore::time::now_secs(),
+            code_expires_at: wacore::time::Instant::now()
+                + wacore::pair_code::PairCodeUtils::code_validity(),
             primary_hello_attempt_count: 0,
         };
         let before = adv_secret(&client).await;
@@ -977,7 +1247,7 @@ mod tests {
             Some("5511999999999"),
             "old owner comes from notification.participant"
         );
-        match &group_update.action {
+        match &*group_update.action {
             GroupNotificationAction::ChangeNumber {
                 new_owner,
                 sub_group_suggestions,
@@ -1097,7 +1367,7 @@ mod tests {
         // Pre-populate device registry so clear_device_record has something to clear
         let record = wacore::store::traits::DeviceListRecord {
             user: "5511999999999".into(),
-            devices: vec![wacore::store::traits::DeviceInfo::new(1, None)],
+            devices: [wacore::store::traits::DeviceInfo::new(1, None)].into(),
             timestamp: wacore::time::now_secs(),
             phash: None,
             raw_id: Some(42),
@@ -1411,7 +1681,7 @@ mod tests {
                 "5511666666666".into(),
                 Arc::new(wacore::store::traits::DeviceListRecord {
                     user: "5511666666666".into(),
-                    devices: vec![wacore::store::traits::DeviceInfo::new(1, None)],
+                    devices: [wacore::store::traits::DeviceInfo::new(1, None)].into(),
                     timestamp: wacore::time::now_secs(),
                     phash: None,
                     raw_id: Some(1),
@@ -1588,6 +1858,50 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "the stale stanza-LID identity must be deleted by the reset"
+        );
+    }
+    /// The one heap block `async_trait` allocates per inbound `<notification>`
+    /// must stay small.
+    ///
+    /// Awaiting an unboxed async fn inlines its state machine into the caller's
+    /// future, so a single `.await` on an unboxed arm re-sizes this allocation
+    /// for the union of every arm: 2272 bytes when it was measured that way,
+    /// against 146 bytes for the whole notification once they are boxed.
+    /// Nothing else observes that — the
+    /// allocation *count* does not move, the handler's behaviour does not
+    /// change, and `benches/inbound_stanza` reports it but does not run in
+    /// nextest. Hence a unit test, and hence a ceiling (1 KiB) rather than an
+    /// exact size: the point is the order of magnitude, not the byte.
+    #[test]
+    fn notification_future_is_not_sized_for_every_arm() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+        let client = runtime.block_on(create_test_client());
+        let peer = "19045550180@s.whatsapp.net";
+        let node = node_to_arc(
+            NodeBuilder::new("notification")
+                .attr("from", peer)
+                .attr("type", "picture")
+                .attr("id", "N1")
+                .attr("t", "1700000000")
+                .children([NodeBuilder::new("delete").attr("jid", peer).build()])
+                .build(),
+        );
+
+        // Through `StanzaHandler::handle`, because `async_trait`'s box around
+        // it is the allocation under test; calling `handle_notification_impl`
+        // directly would leave the future on the stack.
+        let handler = NotificationHandler;
+        let largest = crate::test_alloc::min_max_block(1024, || {
+            let mut cancelled = false;
+            runtime.block_on(handler.handle(Arc::clone(&client), Arc::clone(&node), &mut cancelled))
+        });
+        assert!(
+            largest < 1024,
+            "a notification allocated {largest} bytes in one block; an `.await` on an \
+             unboxed arm of handle_notification_impl re-inflates the boxed future"
         );
     }
 }

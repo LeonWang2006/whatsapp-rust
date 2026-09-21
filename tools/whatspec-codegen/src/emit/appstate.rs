@@ -64,7 +64,17 @@ pub struct Schema {
 
 ";
 
-pub fn generate(ir: &AppstateIr) -> Result<String> {
+/// What `generate` returns: the full registry plus the compact log-gating
+/// copy. Both come from one IR pass so the two files cannot drift: the
+/// root crate's logger embeds only match arms over string literals, never
+/// `Schema` records.
+#[derive(Debug)]
+pub struct Generated {
+    pub schemas: String,
+    pub known_verbs: String,
+}
+
+pub fn generate(ir: &AppstateIr) -> Result<Generated> {
     let mut out = super::header("AppState (syncd) action schemas", &ir.wa_version);
     out.push_str(HEADER);
 
@@ -165,12 +175,70 @@ pub fn generate(ir: &AppstateIr) -> Result<String> {
         out.push_str(&format!("    {name},\n"));
     }
     out.push_str("];\n\n");
+    out.push_str(&log_gate_matcher(ir));
     out.push_str(
         "/// Look up a schema by its action key (the registry key, e.g. `\"Agent\"`).\n\
          pub fn by_name(key: &str) -> Option<&'static Schema> {\n\
          \x20   ALL.iter().find(|s| s.key == key)\n}\n",
     );
-    Ok(out)
+    Ok(Generated {
+        schemas: out,
+        known_verbs: known_verbs_module_inner(ir),
+    })
+}
+
+/// The root crate's own log-gating copy: same arms as [`log_gate_matcher`],
+/// wrapped as a standalone generated module so `whatsapp-rust` gates on the
+/// same set without referencing `Schema` records. `main.rs` builds it from
+/// `Generated.known_verbs` (same IR pass as schemas); this fn exists so
+/// tests can build it from a fixture without the full registry.
+#[cfg(test)]
+pub fn known_verbs_module(ir: &AppstateIr, wa_version: &str) -> Result<String> {
+    Ok(format!(
+        "{}\n{}\n",
+        super::header("AppState known verbs (log gating)", wa_version),
+        known_verbs_module_inner(ir)
+    ))
+}
+
+fn known_verbs_module_inner(ir: &AppstateIr) -> String {
+    format!(
+        "//! Declared syncd action names for log gating. Shares its arms with\n\
+         //! `wacore-appstate`'s registry (see `emit::appstate::log_gate_matcher`);\n\
+         //! a `match` over string literals, never `Schema` records.\n\
+         #![allow(clippy::all)]\n\
+         \n\
+         pub(crate) fn is_known_wire_name(name: &str) -> bool {{\n    match name {{\n{arms}\n        _ => false,\n    }}\n}}\n",
+        arms = log_gate_match_arms(ir)
+    )
+}
+
+/// Compact log-gating matcher shared by both crates. Every on-wire action
+/// name becomes a `match` arm over string literals, so referencing a name
+/// keeps just the compared bytes in the binary — unlike `schemas::ALL`, it
+/// can never pull the full `Schema` records reachable. `log_gate_match_arms`
+/// below reuses the same arms for the root crate's own generated copy.
+fn log_gate_matcher(ir: &AppstateIr) -> String {
+    format!(
+        "/// Whether `name` is an on-wire action name. Log gating only: a\n\
+         /// `match` over string literals, so referencing a name keeps just\n\
+         /// the compared bytes, never the full `Schema` record.\n\
+         pub(crate) fn is_known_wire_name(name: &str) -> bool {{\n    match name {{\n{arms}\n        _ => false,\n    }}\n}}\n",
+        arms = log_gate_match_arms(ir)
+    )
+}
+
+/// The match arms of [`log_gate_matcher`], without the surrounding fn.
+/// The root crate embeds these in its own generated module so its logger
+/// gates on the same set without referencing `Schema` records.
+fn log_gate_match_arms(ir: &AppstateIr) -> String {
+    let mut wire_names: Vec<&str> = ir.actions.values().map(|a| a.name.as_str()).collect();
+    wire_names.sort_unstable();
+    wire_names
+        .iter()
+        .map(|name| format!("        {name_lit} => true,", name_lit = rust_lit(name)))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn opt_lit(v: Option<&str>) -> String {
@@ -250,7 +318,7 @@ mod tests {
     /// The emitters are fallible now; a test IR that trips a guard should
     /// fail the test, not be silently skipped.
     fn emitted(ir: &AppstateIr) -> String {
-        generate(ir).expect("emitter rejected the test IR")
+        generate(ir).expect("emitter rejected the test IR").schemas
     }
     use crate::ir::AppstateAction;
     use std::collections::BTreeMap;
@@ -370,6 +438,26 @@ mod tests {
             "index_parts: &[IndexPart::Literal { value: \"deviceAgent\" }, IndexPart::StringPart { name: \"agentId\" }],"
         ));
         assert!(code.contains("pub const ALL: &[Schema] = &[\n    AGENT,\n];"));
+        // Log gating: match arms over literals from the IR, never `X.name`
+        // references that could keep full `Schema` records reachable.
+        assert!(code.contains("pub(crate) fn is_known_wire_name(name: &str) -> bool"));
+        assert!(code.contains("\"deviceAgent\" => true,"), "{code}");
+        assert!(!code.contains(".name"), "{code}");
+    }
+
+    #[test]
+    fn known_verbs_module_shares_the_same_arms() {
+        let fixture = ir(vec![(
+            "Agent",
+            action("deviceAgent", "account", Some("regular")),
+        )]);
+        let module = known_verbs_module(&fixture, "2.3000.1").expect("known verbs");
+        assert!(module.contains("\"deviceAgent\" => true,"), "{module}");
+        assert!(!module.contains("struct Schema"), "{module}");
+        // "Schema" appears in the doc comment pointing at the registry;
+        // what must not appear is a reference to a record.
+        assert!(!module.contains(".name"), "{module}");
+        assert!(!module.contains("ALL"), "{module}");
     }
 
     #[test]

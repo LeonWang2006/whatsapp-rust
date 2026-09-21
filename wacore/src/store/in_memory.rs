@@ -11,7 +11,7 @@ use std::collections::hash_map::RandomState;
 use std::hash::Hash;
 use std::sync::Arc;
 #[cfg(any(test, feature = "test-util"))]
-use std::sync::atomic::{AtomicBool, AtomicU32};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize};
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use crate::appstate::hash::HashState;
@@ -37,8 +37,52 @@ struct PreKeyEntry {
     record: Bytes,
 }
 
+/// Key for the mutation-MAC store: `(collection_name, index_mac)`.
+///
+/// These buffers never grow in place, so boxed storage avoids a capacity
+/// word per buffer while preserving arbitrary byte lengths.
+#[derive(Eq, Hash, PartialEq)]
+struct MutationMacKey {
+    collection: Box<str>,
+    index_mac: Box<[u8]>,
+}
+
+/// Hashes and compares exactly like [`MutationMacKey`] to satisfy
+/// [`Equivalent`]. Lookups and removals allocate no temporary key.
+#[derive(Hash)]
+struct MutationMacKeyRef<'a> {
+    collection: &'a str,
+    index_mac: &'a [u8],
+}
+
+impl Equivalent<MutationMacKey> for MutationMacKeyRef<'_> {
+    fn equivalent(&self, key: &MutationMacKey) -> bool {
+        self.collection == key.collection.as_ref() && self.index_mac == key.index_mac.as_ref()
+    }
+}
+
+type MutationMacMap = HbHashMap<MutationMacKey, Box<[u8]>, RandomState>;
+
 /// Key for base-key collision detection: `(address, message_id)`.
-type BaseKeyKey = (String, String);
+#[derive(Eq, Hash, PartialEq)]
+struct BaseKeyKey {
+    address: String,
+    message_id: String,
+}
+
+/// Borrowed lookup key for [`BaseKeyKey`]: same field hashes, full equality
+/// (the [`Equivalent`] contract), so probes pay no allocation.
+#[derive(Hash)]
+struct BaseKeyKeyRef<'a> {
+    address: &'a str,
+    message_id: &'a str,
+}
+
+impl Equivalent<BaseKeyKey> for BaseKeyKeyRef<'_> {
+    fn equivalent(&self, key: &BaseKeyKey) -> bool {
+        self.address == key.address && self.message_id == key.message_id
+    }
+}
 
 /// Stored msg-secret value: `(secret_bytes, expires_at_secs, message_ts_secs)`.
 type MsgSecretRow = (MessageSecret, i64, i64);
@@ -117,8 +161,8 @@ struct InMemoryState {
     sync_keys: HashMap<Vec<u8>, AppStateSyncKey>,
     latest_sync_key_id: Option<Vec<u8>>,
     versions: HashMap<String, HashState>,
-    /// `(collection_name, hex(index_mac))` -> `value_mac`
-    mutation_macs: HashMap<(String, Vec<u8>), Vec<u8>>,
+    /// Raw value MACs indexed by [`MutationMacKey`].
+    mutation_macs: MutationMacMap,
 
     // --- Protocol ---
     /// Unified per-device sender key tracking: group_jid -> (device_jid -> has_key)
@@ -126,8 +170,12 @@ struct InMemoryState {
     lid_mappings: HashMap<String, LidPnMappingEntry>,
     /// Reverse index: phone_number -> lid
     pn_to_lid: HashMap<String, String>,
-    base_keys: HashMap<BaseKeyKey, Vec<u8>>,
-    device_lists: HashMap<String, DeviceListRecord>,
+    /// `(base_key, created_at)`; the timestamp is what the retention sweep
+    /// prunes on, mirroring the SQLite column. `HbHashMap` (not `std`) so
+    /// probes can borrow (`BaseKeyKeyRef`) instead of allocating a key.
+    base_keys: HbHashMap<BaseKeyKey, (Vec<u8>, i64), RandomState>,
+    /// Keyed by `Arc<str>`, shared with each record's own `user`.
+    device_lists: HashMap<Arc<str>, DeviceListRecord>,
     group_metadata: HashMap<String, Vec<u8>>,
     tc_tokens: HashMap<String, TcTokenEntry>,
     sent_messages: HashMap<SentMessageKey, SentMessageEntry>,
@@ -194,6 +242,10 @@ pub struct InMemoryBackend {
     /// ratchet advance cannot be persisted.
     #[cfg(any(test, feature = "test-util"))]
     fail_session_writes: AtomicBool,
+    /// If set, write this many session rows then fail the batch. Test hook for
+    /// retrying a backend that reports an error after partial progress.
+    #[cfg(any(test, feature = "test-util"))]
+    fail_session_after: AtomicUsize,
     /// When set, `put_sender_keys_batch` fails. Test hook: the sender-key
     /// counterpart of `fail_session_writes` (wire gate must survive a failed
     /// flush).
@@ -219,6 +271,8 @@ impl InMemoryBackend {
             #[cfg(any(test, feature = "test-util"))]
             fail_session_writes: AtomicBool::new(false),
             #[cfg(any(test, feature = "test-util"))]
+            fail_session_after: AtomicUsize::new(usize::MAX),
+            #[cfg(any(test, feature = "test-util"))]
             fail_sender_key_writes: AtomicBool::new(false),
             #[cfg(any(test, feature = "test-util"))]
             signed_prekey_read_gate: std::sync::Mutex::new(None),
@@ -243,6 +297,14 @@ impl InMemoryBackend {
     #[cfg(any(test, feature = "test-util"))]
     pub fn set_fail_session_writes(&self, fail: bool) {
         self.fail_session_writes.store(fail, Ordering::Relaxed);
+    }
+
+    /// Write `prefix` rows from the next session batch, then return an error.
+    /// Pass `None` to disable the partial-progress fault.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn set_fail_session_after_prefix(&self, prefix: Option<usize>) {
+        self.fail_session_after
+            .store(prefix.unwrap_or(usize::MAX), Ordering::Relaxed);
     }
 
     /// Make every subsequent `put_sender_keys_batch` fail (or stop failing).
@@ -309,6 +371,19 @@ impl SignalStore for InMemoryBackend {
         Ok(self.state.lock().await.sessions.get(address).cloned())
     }
 
+    /// One lock acquisition for the whole fan-out instead of one per device.
+    /// Returns only the addresses that exist, like the default.
+    async fn get_sessions_batch(&self, addresses: &[Arc<str>]) -> Result<Vec<(Arc<str>, Bytes)>> {
+        let state = self.state.lock().await;
+        let mut result = Vec::with_capacity(addresses.len());
+        for address in addresses {
+            if let Some(session) = state.sessions.get(address.as_ref()) {
+                result.push((address.clone(), session.clone()));
+            }
+        }
+        Ok(result)
+    }
+
     async fn put_session(&self, address: &str, session: &[u8]) -> Result<()> {
         self.state
             .lock()
@@ -330,12 +405,21 @@ impl SignalStore for InMemoryBackend {
         }
         let mut state = self.state.lock().await;
         state.sessions.reserve(sessions.len());
-        for (address, session) in sessions {
+        for (index, (address, session)) in sessions.iter().enumerate() {
+            #[cfg(any(test, feature = "test-util"))]
+            {
+                if index >= self.fail_session_after.load(Ordering::Relaxed) {
+                    return Err(crate::store::error::StoreError::Io(std::io::Error::other(
+                        "put_sessions_batch failed after partial progress (test hook)",
+                    )));
+                }
+            }
             if let Some(stored) = state.sessions.get_mut(address.as_ref()) {
                 *stored = session.clone();
             } else {
                 state.sessions.insert(address.to_string(), session.clone());
             }
+            let _ = index;
         }
         Ok(())
     }
@@ -570,15 +654,13 @@ impl AppSyncStore for InMemoryBackend {
         Ok(())
     }
 
-    async fn get_version(&self, name: &str) -> Result<HashState> {
-        Ok(self
-            .state
-            .lock()
-            .await
-            .versions
-            .get(name)
-            .cloned()
-            .unwrap_or_default())
+    async fn get_version(&self, name: &str) -> Result<Option<HashState>> {
+        Ok(self.state.lock().await.versions.get(name).cloned())
+    }
+
+    async fn delete_version(&self, name: &str) -> Result<()> {
+        self.state.lock().await.versions.remove(name);
+        Ok(())
     }
 
     async fn set_version(&self, name: &str, state: HashState) -> Result<()> {
@@ -598,8 +680,15 @@ impl AppSyncStore for InMemoryBackend {
     ) -> Result<()> {
         let mut s = self.state.lock().await;
         for m in mutations {
-            s.mutation_macs
-                .insert((name.to_string(), m.index_mac.clone()), m.value_mac.clone());
+            // Straight from the borrowed rows: no intermediate `Vec`, so the
+            // stored buffers carry length but no spare capacity.
+            s.mutation_macs.insert(
+                MutationMacKey {
+                    collection: name.into(),
+                    index_mac: m.index_mac.as_slice().into(),
+                },
+                m.value_mac.as_slice().into(),
+            );
         }
         Ok(())
     }
@@ -610,14 +699,20 @@ impl AppSyncStore for InMemoryBackend {
             .lock()
             .await
             .mutation_macs
-            .get(&(name.to_string(), index_mac.to_vec()))
-            .cloned())
+            .get(&MutationMacKeyRef {
+                collection: name,
+                index_mac,
+            })
+            .map(|mac| mac.to_vec()))
     }
 
     async fn delete_mutation_macs(&self, name: &str, index_macs: &[Vec<u8>]) -> Result<()> {
         let mut s = self.state.lock().await;
         for im in index_macs {
-            s.mutation_macs.remove(&(name.to_string(), im.clone()));
+            s.mutation_macs.remove(&MutationMacKeyRef {
+                collection: name,
+                index_mac: im,
+            });
         }
         Ok(())
     }
@@ -627,7 +722,7 @@ impl AppSyncStore for InMemoryBackend {
             .lock()
             .await
             .mutation_macs
-            .retain(|(n, _), _| n != name);
+            .retain(|k, _| k.collection.as_ref() != name);
         Ok(())
     }
 
@@ -737,8 +832,11 @@ impl ProtocolStore for InMemoryBackend {
 
     async fn save_base_key(&self, address: &str, message_id: &str, base_key: &[u8]) -> Result<()> {
         self.state.lock().await.base_keys.insert(
-            (address.to_string(), message_id.to_string()),
-            base_key.to_vec(),
+            BaseKeyKey {
+                address: address.to_string(),
+                message_id: message_id.to_string(),
+            },
+            (base_key.to_vec(), crate::time::now_secs()),
         );
         Ok(())
     }
@@ -752,18 +850,28 @@ impl ProtocolStore for InMemoryBackend {
         let s = self.state.lock().await;
         let same = s
             .base_keys
-            .get(&(address.to_string(), message_id.to_string()))
-            .is_some_and(|stored| stored == current_base_key);
+            .get(&BaseKeyKeyRef {
+                address,
+                message_id,
+            })
+            .is_some_and(|(stored, _)| stored == current_base_key);
         Ok(same)
     }
 
     async fn delete_base_key(&self, address: &str, message_id: &str) -> Result<()> {
-        self.state
-            .lock()
-            .await
-            .base_keys
-            .remove(&(address.to_string(), message_id.to_string()));
+        self.state.lock().await.base_keys.remove(&BaseKeyKeyRef {
+            address,
+            message_id,
+        });
         Ok(())
+    }
+
+    async fn delete_expired_base_keys(&self, cutoff_timestamp: i64) -> Result<u32> {
+        let mut s = self.state.lock().await;
+        let before = s.base_keys.len();
+        s.base_keys
+            .retain(|_, (_, created_at)| *created_at >= cutoff_timestamp);
+        Ok((before - s.base_keys.len()) as u32)
     }
 
     // --- Device Registry ---
@@ -773,12 +881,20 @@ impl ProtocolStore for InMemoryBackend {
             .lock()
             .await
             .device_lists
-            .insert(record.user.clone(), record);
+            .insert(Arc::clone(&record.user), record);
         Ok(())
     }
 
     async fn get_devices(&self, user: &str) -> Result<Option<DeviceListRecord>> {
         Ok(self.state.lock().await.device_lists.get(user).cloned())
+    }
+
+    async fn get_devices_batch(&self, users: &[&str]) -> Result<Vec<DeviceListRecord>> {
+        let state = self.state.lock().await;
+        Ok(users
+            .iter()
+            .filter_map(|user| state.device_lists.get(*user).cloned())
+            .collect())
     }
 
     async fn delete_devices(&self, user: &str) -> Result<()> {
@@ -970,6 +1086,16 @@ impl ProtocolStore for InMemoryBackend {
             },
         );
         Ok(())
+    }
+
+    async fn get_sent_message(&self, chat_jid: &str, message_id: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .state
+            .lock()
+            .await
+            .sent_messages
+            .get(&(chat_jid.to_string(), message_id.to_string()))
+            .map(|e| e.payload.clone()))
     }
 
     async fn take_sent_message(&self, chat_jid: &str, message_id: &str) -> Result<Option<Vec<u8>>> {
@@ -1241,11 +1367,11 @@ impl DeviceStore for InMemoryBackend {
                     .map(|(ik, iv)| ik.capacity() + iv.capacity())
                     .sum::<usize>()
         });
-        account!(state.mutation_macs, |k: &(String, Vec<u8>), v: &Vec<u8>| k
-            .0
-            .capacity()
-            + k.1.capacity()
-            + v.capacity());
+        bytes += hb_table_bytes(&state.mutation_macs);
+        rows += state.mutation_macs.len() as u64;
+        for (k, v) in &state.mutation_macs {
+            bytes += k.collection.len() + k.index_mac.len() + v.len();
+        }
         account!(
             state.sender_key_devices,
             |k: &String, v: &HashMap<String, bool>| {
@@ -1260,16 +1386,16 @@ impl DeviceStore for InMemoryBackend {
         });
         account!(state.pn_to_lid, |k: &String, v: &String| k.capacity()
             + v.capacity());
-        account!(state.base_keys, |k: &BaseKeyKey, v: &Vec<u8>| k
-            .0
-            .capacity()
-            + k.1.capacity()
-            + v.capacity());
-        account!(state.device_lists, |k: &String, v: &DeviceListRecord| {
-            k.capacity()
-                + v.user.capacity()
-                + v.devices.capacity() * size_of::<DeviceInfo>()
-                + v.phash.as_ref().map_or(0, String::capacity)
+        bytes += hb_table_bytes(&state.base_keys);
+        rows += state.base_keys.len() as u64;
+        for (k, v) in &state.base_keys {
+            bytes += k.address.capacity() + k.message_id.capacity() + v.0.capacity();
+        }
+        // The key and the record's `user` are one allocation, counted once.
+        account!(state.device_lists, |_k: &Arc<str>, v: &DeviceListRecord| {
+            v.user.len()
+                + v.devices.len() * size_of::<DeviceInfo>()
+                + v.phash.as_ref().map_or(0, |p| p.len())
         });
         account!(state.group_metadata, |k: &String, v: &Vec<u8>| k.capacity()
             + v.capacity());
@@ -1495,6 +1621,40 @@ mod tests {
         is_backend::<InMemoryBackend>();
     }
 
+    /// The batch read returns only what exists, keyed as requested: a send's
+    /// prefetch tells hits from misses by set difference.
+    #[tokio::test]
+    async fn get_sessions_batch_returns_only_hits() {
+        let backend = InMemoryBackend::new();
+        let first: Arc<str> = "15550000001:1@s.whatsapp.net".into();
+        let second: Arc<str> = "15550000002:2@s.whatsapp.net".into();
+        let missing: Arc<str> = "15550000003:3@s.whatsapp.net".into();
+        backend
+            .put_sessions_batch(&[
+                (first.clone(), Bytes::from_static(b"first")),
+                (second.clone(), Bytes::from_static(b"second")),
+            ])
+            .await
+            .unwrap();
+
+        let loaded = backend
+            .get_sessions_batch(&[first.clone(), missing.clone(), second.clone()])
+            .await
+            .unwrap();
+        assert_eq!(loaded.len(), 2, "misses are omitted, not returned empty");
+        assert_eq!(loaded[0], (first, Bytes::from_static(b"first")));
+        assert_eq!(loaded[1], (second, Bytes::from_static(b"second")));
+
+        assert!(
+            backend
+                .get_sessions_batch(&[missing])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(backend.get_sessions_batch(&[]).await.unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn put_sessions_batch_inserts_and_updates() {
         let backend = InMemoryBackend::new();
@@ -1711,6 +1871,170 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mutation_macs_preserve_variable_lengths_and_isolate_collections() {
+        let backend = InMemoryBackend::new();
+        for len in [0, 1, 31, 32, 33, 257] {
+            let index = vec![7; len];
+            let value = vec![9; len + 3];
+            for name in ["", "regular", "regular\0", "同步"] {
+                let mutation = AppStateMutationMAC {
+                    index_mac: index.clone(),
+                    value_mac: value.clone(),
+                };
+                backend
+                    .put_mutation_macs(name, 1, &[mutation])
+                    .await
+                    .unwrap();
+                let mut returned: Vec<u8> = backend
+                    .get_mutation_mac(name, &index)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(returned, value);
+                returned.clear();
+                assert_eq!(
+                    backend.get_mutation_mac(name, &index).await.unwrap(),
+                    Some(value.clone())
+                );
+            }
+            backend
+                .delete_mutation_macs("regular", std::slice::from_ref(&index))
+                .await
+                .unwrap();
+            assert_eq!(
+                backend.get_mutation_mac("regular", &index).await.unwrap(),
+                None
+            );
+            assert_eq!(
+                backend.get_mutation_mac("regular\0", &index).await.unwrap(),
+                Some(value)
+            );
+            let replacement = AppStateMutationMAC {
+                index_mac: index.clone(),
+                value_mac: vec![],
+            };
+            backend
+                .put_mutation_macs("同步", 2, &[replacement])
+                .await
+                .unwrap();
+            assert_eq!(
+                backend.get_mutation_mac("同步", &index).await.unwrap(),
+                Some(vec![])
+            );
+        }
+        assert_eq!(backend.resource_report().await.pages, Some(18));
+        backend.clear_mutation_macs("同步").await.unwrap();
+        assert_eq!(backend.resource_report().await.pages, Some(12));
+    }
+
+    #[test]
+    fn mutation_mac_entry_layout_is_smaller_without_capacity_words() {
+        // The old entry had three growable containers (String + two Vecs). The
+        // compact entry has boxed DST pointers and no spare-capacity words.
+        // Compare the actual entry types, rather than assuming that a private
+        // struct has the same layout as an equivalent tuple. The relational
+        // budget remains valid on 32- and 64-bit targets without prescribing a
+        // pointer width or relying on unspecified field ordering.
+        let compact = size_of::<(MutationMacKey, Box<[u8]>)>();
+        let previous = size_of::<((String, Vec<u8>), Vec<u8>)>();
+        assert!(
+            previous - compact >= size_of::<usize>(),
+            "boxed mutation-MAC entries must retain fewer capacity fields"
+        );
+    }
+
+    #[tokio::test]
+    async fn mutation_mac_report_accounts_table_keys_and_payloads() {
+        let backend = InMemoryBackend::new();
+        let name = "regular";
+        let index_mac = vec![1, 2, 3, 4, 5];
+        let value_mac = vec![6, 7, 8];
+        backend
+            .put_mutation_macs(
+                name,
+                1,
+                &[AppStateMutationMAC {
+                    index_mac: index_mac.clone(),
+                    value_mac: value_mac.clone(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let expected = {
+            let state = backend.state.lock().await;
+            let table = hb_table_bytes(&state.mutation_macs);
+            let payload = state
+                .mutation_macs
+                .iter()
+                .map(|(key, value)| key.collection.len() + key.index_mac.len() + value.len())
+                .sum::<usize>();
+            table + payload
+        };
+        let report = backend.resource_report().await;
+        assert_eq!(report.pages, Some(1));
+        assert_eq!(report.memory_bytes, Some(expected as u64));
+    }
+
+    #[tokio::test]
+    async fn base_key_fields_and_retention_remain_independent() {
+        let backend = InMemoryBackend::new();
+        for (address, message_id) in [("a", "bc"), ("ab", "c"), ("", ""), ("用户", "消息")] {
+            backend
+                .save_base_key(address, message_id, b"key")
+                .await
+                .unwrap();
+        }
+        backend.delete_base_key("a", "bc").await.unwrap();
+        assert!(!backend.has_same_base_key("a", "bc", b"key").await.unwrap());
+        assert!(backend.has_same_base_key("ab", "c", b"key").await.unwrap());
+        assert_eq!(backend.delete_expired_base_keys(i64::MIN).await.unwrap(), 0);
+        assert_eq!(backend.resource_report().await.pages, Some(3));
+        assert_eq!(backend.delete_expired_base_keys(i64::MAX).await.unwrap(), 3);
+        assert_eq!(backend.resource_report().await.pages, Some(0));
+    }
+
+    #[tokio::test]
+    async fn base_key_borrowed_lookups_preserve_exact_key_matching() {
+        use crate::store::traits::ProtocolStore;
+        let backend = InMemoryBackend::new();
+        let address = "15550000001:1@s.whatsapp.net";
+        let message_id = "base-key-test";
+
+        backend
+            .save_base_key(address, message_id, b"base-key")
+            .await
+            .unwrap();
+        assert!(
+            backend
+                .has_same_base_key(address, message_id, b"base-key")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !backend
+                .has_same_base_key(address, message_id, b"different")
+                .await
+                .unwrap()
+        );
+        // A near miss in either field must not compare equal.
+        assert!(
+            !backend
+                .has_same_base_key(address, "base-key-test-2", b"base-key")
+                .await
+                .unwrap()
+        );
+
+        backend.delete_base_key(address, message_id).await.unwrap();
+        assert!(
+            !backend
+                .has_same_base_key(address, message_id, b"base-key")
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
     async fn has_signal_state_for_user_matches_by_user_prefix() {
         let backend = InMemoryBackend::new();
         let user = "5511999990000";
@@ -1738,6 +2062,56 @@ mod tests {
             .await
             .unwrap();
         assert!(dev.has_signal_state_for_user(user).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn get_sent_message_preserves_payload_and_expiry() {
+        let backend = InMemoryBackend::new();
+        let chat = "120363000000000001@g.us";
+        backend
+            .store_sent_message(chat, "READ", b"payload")
+            .await
+            .unwrap();
+        backend
+            .state
+            .lock()
+            .await
+            .sent_messages
+            .get_mut(&(chat.into(), "READ".into()))
+            .unwrap()
+            .timestamp = 1;
+        for _ in 0..2 {
+            assert_eq!(
+                backend
+                    .get_sent_message(chat, "READ")
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(b"payload".as_slice())
+            );
+        }
+        assert!(
+            backend
+                .get_sent_message(chat, "MISSING")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            backend
+                .get_sent_message("120363000000000002@g.us", "READ")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(backend.delete_expired_sent_messages(2).await.unwrap(), 1);
+        assert!(
+            backend
+                .get_sent_message(chat, "READ")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

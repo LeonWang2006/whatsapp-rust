@@ -1,6 +1,7 @@
 //! E2E Session management for Client.
 
 use anyhow::Result;
+use futures::FutureExt;
 use rand::rngs::StdRng;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -14,7 +15,8 @@ use wacore::types::jid::JidExt;
 use wacore_binary::Jid;
 
 use super::Client;
-use crate::types::events::{Event, OfflineSyncCompleted};
+use crate::types::events::{Event, OfflineSyncCompleted, OfflineSyncInterrupted};
+use wacore::send::PrimaryDeviceRejected;
 
 /// Waiter side of an in-flight ensure: it never receives a value, only the
 /// close that the leader's drop produces. A leader that panics or is cancelled
@@ -291,6 +293,28 @@ impl Client {
     pub(crate) const DEFAULT_OFFLINE_SYNC_TIMEOUT: Duration = Duration::from_secs(60);
 
     pub(crate) async fn complete_offline_sync(&self, count: i32) {
+        let generation = self.connection_generation.load(Ordering::Acquire);
+        self.complete_offline_sync_for_generation(count, generation)
+            .await
+    }
+
+    /// [`complete_offline_sync`](Self::complete_offline_sync) for a caller that
+    /// checked the generation earlier and may have been descheduled since.
+    ///
+    /// The check is the first thing done, before any drain state is touched,
+    /// and the same `generation` is handed to the finisher instead of being
+    /// re-read: a completion belongs to the connection whose drain it is, and
+    /// applying it to the replacement would mark that connection's backlog
+    /// finished and widen its semaphore mid-drain.
+    pub(crate) async fn complete_offline_sync_for_generation(&self, count: i32, generation: u64) {
+        if self.connection_generation.load(Ordering::Acquire) != generation {
+            log::debug!(
+                target: "Client/OfflineSync",
+                "Ignoring a completion for generation {} on a newer connection",
+                generation,
+            );
+            return;
+        }
         self.offline_sync_metrics
             .active
             .store(false, Ordering::Release);
@@ -304,11 +328,7 @@ impl Client {
         // flips after the tail commit so the tail's acks still observe it as
         // false and join the aggregate offline-receipt drain (WA Web
         // `sendAggregateOfflineReceipts`) instead of going out 1:1.
-        if self
-            .offline_sync_finish_started
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
+        if !Self::claim_generation_stamp(&self.offline_sync_finish_started, generation) {
             return;
         }
 
@@ -320,7 +340,8 @@ impl Client {
                 "complete_offline_sync: self_weak upgrade failed; dropping the drain tail and switching to live mode"
             );
             self.inbound_commit_batch.force_live_dropping_entries();
-            self.publish_offline_sync_live_state(count, None);
+            let _terminal_gate = self.offline_terminal_lock.lock().await;
+            self.publish_offline_sync_live_state(count, None, generation);
             return;
         };
 
@@ -332,7 +353,6 @@ impl Client {
         // trip the keepalive at the end of every drain. Ordering does not need
         // the inline await: the single permit already serializes the finisher
         // against stanza processing, so run it off-loop.
-        let generation = self.connection_generation.load(Ordering::Acquire);
         self.runtime
             .spawn(Box::pin(async move {
                 client.finish_offline_sync(count, generation).await;
@@ -353,14 +373,23 @@ impl Client {
         // first (WA Web's createSnapshot ordering).
         let durable = self.finish_inbound_commit_drain(generation).await;
 
+        // Taken before the check so the check and everything it publishes are
+        // one section against the teardown that would retire this generation.
+        let _terminal_gate = self.offline_terminal_lock.lock().await;
         if self.connection_generation.load(Ordering::Acquire) != generation {
             log::debug!(
                 "finish_offline_sync: connection generation changed during the tail commit; leaving the new connection's state alone"
             );
+            // No report from here: the only production bump of the generation
+            // with a drain in flight is `cleanup_connection_state`, which
+            // reports the interruption itself a few lines later. Reporting
+            // here as well would read (and disarm) whatever drain is current
+            // by the time this stale task runs, which may already be the next
+            // connection's.
             return;
         }
 
-        self.publish_offline_sync_live_state(count, Some(durable));
+        self.publish_offline_sync_live_state(count, Some(durable), generation);
     }
 
     /// The drain→live state publication, shared by the finisher and its
@@ -372,12 +401,10 @@ impl Client {
     /// so the ordering of flag flip vs. semaphore swap is not observable: any
     /// in-flight worker keeps using its old 1-permit Arc and drains normally;
     /// newly-spawned workers pick up the 64-permit semaphore via
-    /// read_message_semaphore(). The flag flip happens-before the receipt
-    /// drain takes the buffer lock, so late offline receipts either land in
-    /// the flush or observe the flag and send 1:1
-    /// (see try_buffer_offline_receipt).
+    /// read_message_semaphore(). Receipt buffering follows the batcher's drain
+    /// mode, changed under the processing permit, not this later completion flag.
     ///
-    /// `durable`: `Some(true)` flushes the buffered offline receipts;
+    /// `durable`: `Some(true)` already flushed receipts under the drain permit;
     /// `Some(false)` drops them — the tail's durable write failed, its entries
     /// are back in the batcher unacked, and receipting SKDM/session state that
     /// never became durable would trade a redeliverable failure for a
@@ -388,24 +415,132 @@ impl Client {
     /// the deferred transition (see `complete_deferred_live_transition`) and
     /// widens the semaphore then. `None` (upgrade-failure fallback) leaves
     /// the buffer alone for the connection-state reset to clear.
-    fn publish_offline_sync_live_state(&self, count: i32, durable: Option<bool>) {
+    fn publish_offline_sync_live_state(&self, count: i32, durable: Option<bool>, generation: u64) {
+        // Re-read under `offline_terminal_lock`, which every caller holds: the
+        // check each of them made before taking it could have been overtaken
+        // by the teardown waiting for that same lock.
+        if self.connection_generation.load(Ordering::Acquire) != generation {
+            log::debug!(
+                target: "Client/OfflineSync",
+                "Generation {} was retired before its drain could publish; leaving live state alone",
+                generation,
+            );
+            return;
+        }
+        // The claim is the serialization point for the whole transition, not
+        // just its event. Losing it means a teardown already reported this
+        // drain's end, or a newer drain overtook it: either way that teardown
+        // has reset the flag, the semaphore and the receipt buffer this would
+        // publish, and applying them now would be publishing one connection's
+        // drain onto another's state.
+        if !self.claim_offline_terminal_report(generation) {
+            log::debug!(
+                target: "Client/OfflineSync",
+                "Drain of generation {} was already ended by its teardown; leaving live state alone",
+                generation,
+            );
+            return;
+        }
         self.offline_sync_completed.store(true, Ordering::Release);
         if durable != Some(false) {
             self.swap_message_semaphore(64);
         }
-        match durable {
-            Some(true) => self.flush_offline_receipts(),
-            Some(false) => {
-                log::warn!(
-                    "finish_offline_sync: tail commit not durable; dropping buffered offline receipts so the server redelivers"
-                );
-                self.clear_offline_receipt_buffer();
-            }
-            None => {}
+        if let Some(false) = durable {
+            log::warn!(
+                "finish_offline_sync: tail commit not durable; dropping buffered offline receipts so the server redelivers"
+            );
+            self.clear_offline_receipt_buffer();
         }
-        self.offline_sync_notifier.notify(usize::MAX);
         self.core.event_bus.dispatch(Event::OfflineSyncCompleted(
             OfflineSyncCompleted::builder().count(count).build(),
+        ));
+        // Notified last, so a waiter that wakes on it can already see the
+        // event: the notifier is the coarser signal and firing it first left a
+        // window where the drain looked finished and its event had not been
+        // dispatched yet.
+        self.offline_sync_notifier.notify(usize::MAX);
+    }
+
+    /// Claim `stamp_cell` for `generation`, once, and never for a drain a
+    /// newer one has already overtaken.
+    ///
+    /// Generations only count up, so "a stamp at or above mine is already
+    /// there" decides both cases at once: my drain has been reported (or
+    /// finished) already, or I am a task descheduled past my own connection
+    /// and the answer is no longer mine to give. Cells hold `generation + 1`
+    /// so the initial zero reads as "none yet".
+    fn claim_generation_stamp(cell: &portable_atomic::AtomicU64, generation: u64) -> bool {
+        let stamp = generation.saturating_add(1);
+        let mut seen = cell.load(Ordering::Acquire);
+        loop {
+            if seen >= stamp {
+                return false;
+            }
+            match cell.compare_exchange_weak(seen, stamp, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return true,
+                Err(actual) => seen = actual,
+            }
+        }
+    }
+
+    /// Claim the right to publish the event that ends the resume of
+    /// `generation`. Exactly one of `OfflineSyncCompleted` /
+    /// `OfflineSyncInterrupted` reaches the consumer per drain.
+    ///
+    /// Fails for a drain already reported and for one a newer drain has
+    /// overtaken, so a finisher descheduled past its own connection cannot
+    /// take the slot a later drain needs, nor contradict the interruption its
+    /// own teardown reported. Generations only count up, which is what makes
+    /// the comparison a decision rather than a guess.
+    pub(crate) fn claim_offline_terminal_report(&self, generation: u64) -> bool {
+        Self::claim_generation_stamp(&self.offline_terminal_reported, generation)
+    }
+
+    /// Report a drain that ended before its `<ib><offline>` end marker.
+    ///
+    /// Called from the connection-state resets, which are the only places a
+    /// resume can end without the finisher running. Both flags are consumed,
+    /// so the pair of resets around one teardown emits at most one event, and
+    /// a drain that already completed emits none. Nothing is retained past
+    /// this point: the numbers are read out of the same per-connection state
+    /// the reset is about to clear, which is what keeps this from becoming
+    /// another flag that outlives its connection.
+    pub(crate) fn abandon_offline_sync_if_interrupted(&self, generation: u64) {
+        // `active` covers the window before the first batch request is armed;
+        // `armed` covers the one after the last stanza cleared `active` but
+        // before the end marker arrived. Neither is set once the finisher has
+        // published completion.
+        let was_active = self
+            .offline_sync_metrics
+            .active
+            .swap(false, Ordering::AcqRel);
+        let was_armed = self.offline_batch.take_armed();
+        if (!was_active && !was_armed) || self.offline_sync_completed.load(Ordering::Acquire) {
+            return;
+        }
+        if !self.claim_offline_terminal_report(generation) {
+            return;
+        }
+
+        let total = self
+            .offline_sync_metrics
+            .total_messages
+            .load(Ordering::Acquire);
+        let delivered = self
+            .offline_sync_metrics
+            .processed_messages
+            .load(Ordering::Acquire);
+        log::warn!(
+            target: "Client/OfflineSync",
+            "Offline resume interrupted at {} of {} item(s); the undelivered backlog was never acked and the server redelivers it",
+            delivered,
+            total,
+        );
+        self.core.event_bus.dispatch(Event::OfflineSyncInterrupted(
+            OfflineSyncInterrupted::builder()
+                .total(i32::try_from(total).unwrap_or(i32::MAX))
+                .delivered(i32::try_from(delivered).unwrap_or(i32::MAX))
+                .build(),
         ));
     }
 
@@ -416,75 +551,118 @@ impl Client {
     }
 
     pub(crate) async fn wait_for_offline_delivery_end_with_timeout(&self, timeout: Duration) {
+        /// Why the wait ended, when it did not run out of time.
+        enum Wake {
+            /// The offline sync signalled completion.
+            Sync,
+            /// The connection this wait belongs to ended under it.
+            ConnectionEnded,
+        }
+
         let wait_generation = self.connection_generation.load(Ordering::Acquire);
+        // Subscribed before the completion check, so a teardown landing in the
+        // window between the two still wakes this wait.
+        let shutdown = self.connection_shutdown_signal();
         let offline_fut = self.offline_sync_notifier.listen();
         if self.offline_sync_completed.load(Ordering::Relaxed) {
             return;
         }
 
-        if wacore::runtime::timeout(&*self.runtime, timeout, offline_fut)
-            .await
-            .is_err()
-        {
-            // Guard: don't complete sync for a stale connection generation.
-            // A reconnect may have happened while we were waiting, making this
-            // timeout belong to the old connection.
-            if self.connection_generation.load(Ordering::Acquire) != wait_generation
-                || self.expected_disconnect.load(Ordering::Relaxed)
-            {
+        // Raced against the per-connection shutdown, because every caller of
+        // this helper is doing something for *this* connection — the post-login
+        // task, the prekey-low top-up, the dirty-bits handler, the send path's
+        // session pre-flight — and a teardown makes all of it moot. Without the
+        // arm they parked here for the whole timeout after the socket was gone,
+        // which on a reconnect-heavy month is a task per reconnect sitting on a
+        // connection that no longer exists.
+        //
+        // The shutdown arm deliberately does NOT complete the sync: completion
+        // is a claim about a live connection's backlog, and the timeout path
+        // below is the only place entitled to make it (behind the same
+        // generation guard it always had).
+        let waited = wacore::runtime::timeout(&*self.runtime, timeout, async {
+            futures::select! {
+                _ = offline_fut.fuse() => Wake::Sync,
+                _ = wacore::runtime::wait_for_shutdown(&shutdown).fuse() => Wake::ConnectionEnded,
+            }
+        })
+        .await;
+
+        match waited {
+            Ok(Wake::Sync) => return,
+            Ok(Wake::ConnectionEnded) => {
                 log::debug!(
                     target: "Client/OfflineSync",
-                    "Offline sync timeout ignored: connection generation changed or disconnected",
+                    "Offline sync wait ended with its connection (generation {} -> {}); leaving the sync uncompleted",
+                    wait_generation,
+                    self.connection_generation.load(Ordering::Acquire),
                 );
                 return;
             }
+            Err(_) => {}
+        }
 
-            let processed = self
-                .offline_sync_metrics
-                .processed_messages
-                .load(Ordering::Acquire);
-            let expected = self
-                .offline_sync_metrics
-                .total_messages
-                .load(Ordering::Acquire);
-            log::warn!(
+        // Guard: don't complete sync for a stale connection generation.
+        // A reconnect may have happened while we were waiting, making this
+        // timeout belong to the old connection.
+        if self.connection_generation.load(Ordering::Acquire) != wait_generation
+            || self.expected_disconnect.load(Ordering::Relaxed)
+        {
+            log::debug!(
                 target: "Client/OfflineSync",
-                "Offline sync timed out after {:?} (processed {} of {} items); marking sync complete",
-                timeout,
-                processed,
-                expected,
+                "Offline sync timeout ignored: connection generation changed or disconnected",
             );
-            self.complete_offline_sync(i32::try_from(processed).unwrap_or(i32::MAX))
-                .await;
-            // The finisher runs as a spawned task; keep this helper's contract
-            // that live state is in place when it returns (callers start
-            // session/send work right after). Ticked so a reconnect or
-            // shutdown mid-commit cannot strand this waiter, and bounded by a
-            // second `timeout` window: when the marker-triggered finisher was
-            // ALREADY running and its tail commit/hook is stuck, the
-            // complete_offline_sync above started nothing, and an unbounded
-            // wait here would defeat this helper's whole point — callers
-            // proceed and the finisher keeps running in the background.
-            let deadline = wacore::time::Instant::now() + timeout;
-            loop {
-                let listener = self.offline_sync_notifier.listen();
-                if self.offline_sync_completed.load(Ordering::Acquire)
-                    || self.connection_generation.load(Ordering::Acquire) != wait_generation
-                    || self.expected_disconnect.load(Ordering::Relaxed)
-                {
-                    return;
-                }
-                if wacore::time::Instant::now() >= deadline {
-                    log::warn!(
-                        target: "Client/OfflineSync",
-                        "Drain finisher still running {:?} after the offline sync timeout; proceeding without it",
-                        timeout,
-                    );
-                    return;
-                }
-                let _ = wacore::runtime::timeout(&*self.runtime, Duration::from_secs(1), listener)
-                    .await;
+            return;
+        }
+
+        let processed = self
+            .offline_sync_metrics
+            .processed_messages
+            .load(Ordering::Acquire);
+        let expected = self
+            .offline_sync_metrics
+            .total_messages
+            .load(Ordering::Acquire);
+        log::warn!(
+            target: "Client/OfflineSync",
+            "Offline sync timed out after {:?} (processed {} of {} items); marking sync complete",
+            timeout,
+            processed,
+            expected,
+        );
+        self.complete_offline_sync_for_generation(
+            i32::try_from(processed).unwrap_or(i32::MAX),
+            wait_generation,
+        )
+        .await;
+        // The finisher runs as a spawned task; keep this helper's contract
+        // that live state is in place when it returns (callers start
+        // session/send work right after). Ticked so a reconnect or
+        // shutdown mid-commit cannot strand this waiter, and bounded by a
+        // second `timeout` window: when the marker-triggered finisher was
+        // ALREADY running and its tail commit/hook is stuck, the
+        // complete_offline_sync above started nothing, and an unbounded
+        // wait here would defeat this helper's whole point — callers
+        // proceed and the finisher keeps running in the background.
+        let deadline = wacore::time::Instant::now() + timeout;
+        loop {
+            let listener = self.offline_sync_notifier.listen();
+            if self.offline_sync_completed.load(Ordering::Acquire)
+                || self.connection_generation.load(Ordering::Acquire) != wait_generation
+                || self.expected_disconnect.load(Ordering::Relaxed)
+            {
+                return;
             }
+            if wacore::time::Instant::now() >= deadline {
+                log::warn!(
+                    target: "Client/OfflineSync",
+                    "Drain finisher still running {:?} after the offline sync timeout; proceeding without it",
+                    timeout,
+                );
+                return;
+            }
+            let _ =
+                wacore::runtime::timeout(&*self.runtime, Duration::from_secs(1), listener).await;
         }
     }
 
@@ -495,25 +673,64 @@ impl Client {
         self.history_sync_activity.begin(payload_bytes)
     }
 
+    /// Wait until this connection's offline drain and its history-sync work
+    /// have both settled.
+    ///
+    /// Scoped to the connection it is called on: if that connection ends first
+    /// this returns an error, because neither half of the wait can be answered
+    /// truthfully afterwards. `HistorySyncActivity::reset()` runs on every
+    /// teardown and zeroes the task count while notifying every listener, so a
+    /// waiter that only looked at the count would read the teardown's zero as
+    /// "all tasks finished" and report a sync that never happened.
     pub async fn wait_for_startup_sync(&self, timeout: Duration) -> Result<()> {
         use anyhow::anyhow;
         use wacore::time::Instant;
 
         let deadline = Instant::now() + timeout;
+        let wait_generation = self.connection_generation.load(Ordering::Acquire);
+        let connection_ended = || {
+            self.connection_generation.load(Ordering::Acquire) != wait_generation
+                || self.expected_disconnect.load(Ordering::Relaxed)
+        };
 
-        // Register the notified future *before* checking state to avoid missing
-        // a notify_waiters() that fires between the check and the await.
-        let offline_fut = self.offline_sync_notifier.listen();
-        if !self.offline_sync_completed.load(Ordering::Relaxed) {
+        // Ticked rather than one long wait: a teardown ends this wait's answer
+        // but does not notify `offline_sync_notifier`, so a single await on it
+        // would sit out the caller's whole timeout before reporting a
+        // connection that has been gone the entire time.
+        loop {
+            // Register the listener *before* checking state to avoid missing a
+            // notify that fires between the check and the await.
+            let offline_fut = self.offline_sync_notifier.listen();
+            if self.offline_sync_completed.load(Ordering::Relaxed) {
+                break;
+            }
+            if connection_ended() {
+                return Err(anyhow!("Connection ended before offline sync completed"));
+            }
             let remaining = deadline.saturating_duration_since(Instant::now());
-            wacore::runtime::timeout(&*self.runtime, remaining, offline_fut)
-                .await
-                .map_err(|_| anyhow!("Timeout waiting for offline sync completion"))?;
+            if remaining.is_zero() {
+                return Err(anyhow!("Timeout waiting for offline sync completion"));
+            }
+            let _ = wacore::runtime::timeout(
+                &*self.runtime,
+                remaining.min(Duration::from_millis(250)),
+                offline_fut,
+            )
+            .await;
         }
 
         loop {
             let history_fut = self.history_sync_activity.listen();
-            if self.history_sync_activity.tasks() == 0 {
+            let idle = self.history_sync_activity.tasks() == 0;
+            // Read the generation *after* the count: teardown bumps it before
+            // `reset()` zeroes the count, so this ordering is what tells a
+            // genuine idle from the one teardown manufactures.
+            if connection_ended() {
+                return Err(anyhow!(
+                    "Connection ended before history sync tasks became idle"
+                ));
+            }
+            if idle {
                 return Ok(());
             }
 
@@ -836,6 +1053,22 @@ impl Client {
                 );
                 self.invalidate_device_caches_for(&rejected).await;
             }
+            // A 406 naming a device 0 fails the whole fetch, mirroring WA Web's
+            // `ensureE2ESessions`, whose 406 catch resolves quietly only while
+            // `x.every(e => e.device !== DEFAULT_DEVICE_ID)` holds and rethrows
+            // otherwise. The device the server says is gone owns the chat, so
+            // continuing builds a stanza that is acked and read by nobody; the
+            // send fails against a list that has just been refreshed, and the
+            // retry resolves the peer again. Only 406: every other code says
+            // the server could not answer, not that the device is gone, which
+            // is the same line the refresh above draws.
+            if prekey_bundles
+                .rejected
+                .iter()
+                .any(|device| device.jid.device == 0 && device.code == UNREGISTERED_DEVICE_CODE)
+            {
+                return Err(PrimaryDeviceRejected::new(UNREGISTERED_DEVICE_CODE).into());
+            }
         }
 
         let mut adapter = self.signal_adapter();
@@ -906,8 +1139,13 @@ impl Client {
         Ok(success_count)
     }
 
-    /// Log primary phone (device 0) session state at login.
-    /// Migration is lazy via try_pn_to_lid_migration_decrypt on first message.
+    /// Log which session (if any) exists with our own primary phone, device 0.
+    ///
+    /// Diagnostics, not a step: it establishes nothing. A LID session with the
+    /// primary is created lazily, by `try_pn_to_lid_migration_decrypt` on the
+    /// first message, and PDO's own `ensure_e2e_sessions` fallback covers the
+    /// case where none exists yet. Two DB reads for a `debug!`, so it belongs
+    /// off the login critical path — see the call site in `handle_success`.
     #[cfg_attr(
         feature = "tracing",
         tracing::instrument(
@@ -917,7 +1155,7 @@ impl Client {
             err(Debug)
         )
     )]
-    pub(crate) async fn establish_primary_phone_session_immediate(&self) -> Result<()> {
+    pub(crate) async fn log_primary_phone_session_state(&self) -> Result<()> {
         let device_snapshot = self.persistence_manager.get_device_snapshot();
 
         let own_pn = device_snapshot
@@ -959,7 +1197,7 @@ impl Client {
     /// session with an un-acked pre-key still pending). Reuses the send path's
     /// pre-flight so the voip offer treats a session-present-but-unacked device as
     /// pkmsg too, not as plain msg.
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     pub(crate) async fn would_emit_pkmsg(&self, jid: &Jid) -> Result<bool, anyhow::Error> {
         let device_store = self.persistence_manager.clone();
         let mut adapter = self.signal_adapter_from(device_store);
@@ -1015,11 +1253,14 @@ mod tests {
     /// The non-406 half also pins the behavior decision: a code that does not
     /// claim the device is gone is counted and nothing else, so a server-side
     /// failure cannot trigger a device-list refresh storm.
+    ///
+    /// A companion, because a 406 naming a primary now fails the fetch instead
+    /// of returning zero; that gate has its own tests below.
     #[tokio::test]
     async fn a_rejected_device_is_counted_on_the_stats_snapshot() {
         for code in ["406", "503"] {
             let (client, transport) = crate::test_utils::create_iq_test_client().await;
-            let gone = Jid::pn_device("5511900000060", 0);
+            let gone = Jid::pn_device("5511900000060", 4);
 
             let fetch = tokio::spawn({
                 let client = client.clone();
@@ -1059,6 +1300,120 @@ mod tests {
             );
             assert_eq!(stats.devices_unkeyed_total(), 1);
         }
+    }
+
+    /// A 406 naming the primary is the server saying the device that owns the
+    /// chat is gone. Continuing would key the companions and build a stanza the
+    /// recipient cannot read, so the fetch fails and the caller retries against
+    /// the list this call just refreshed. Mirrors `ensureE2ESessions`, whose
+    /// 406 catch rethrows unless every requested wid is a companion.
+    #[tokio::test]
+    async fn a_406_naming_the_primary_fails_the_fetch() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let primary = Jid::pn_device("5511900000061", 0);
+        let companion = Jid::pn_device("5511900000061", 2);
+
+        let fetch = tokio::spawn({
+            let client = client.clone();
+            let jids = vec![primary.clone(), companion.clone()];
+            async move { client.fetch_and_establish_sessions(&jids).await }
+        });
+
+        answer_prekey_fetch(
+            &client,
+            &transport,
+            vec![
+                NodeBuilder::new("user")
+                    .attr("jid", NodeValue::Jid(primary.clone()))
+                    .children([NodeBuilder::new("error")
+                        .attr("code", "406")
+                        .attr("text", "not-acceptable")
+                        .build()])
+                    .build(),
+            ],
+        )
+        .await;
+
+        let err = fetch
+            .await
+            .expect("join")
+            .expect_err("a rejected primary must not be reported as a clean fetch");
+        assert!(
+            err.downcast_ref::<PrimaryDeviceRejected>().is_some(),
+            "the caller must be able to match on this, not parse it: {err}"
+        );
+    }
+
+    /// The same rejection on a companion still lets the send through: the
+    /// device that owns the chat answered, so the message is readable.
+    #[tokio::test]
+    async fn a_406_naming_only_a_companion_does_not_fail_the_fetch() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let companion = Jid::pn_device("5511900000062", 3);
+
+        let fetch = tokio::spawn({
+            let client = client.clone();
+            let jids = vec![companion.clone()];
+            async move { client.fetch_and_establish_sessions(&jids).await }
+        });
+
+        answer_prekey_fetch(
+            &client,
+            &transport,
+            vec![
+                NodeBuilder::new("user")
+                    .attr("jid", NodeValue::Jid(companion.clone()))
+                    .children([NodeBuilder::new("error")
+                        .attr("code", "406")
+                        .attr("text", "not-acceptable")
+                        .build()])
+                    .build(),
+            ],
+        )
+        .await;
+
+        let established = fetch
+            .await
+            .expect("join")
+            .expect("a companion 406 is survivable");
+        assert_eq!(established, 0);
+    }
+
+    /// A code that does not claim the device is gone never fails the fetch,
+    /// primary or not: a 5xx says the server could not answer, and turning
+    /// that into a failed send would make a server wobble look like a stale
+    /// device list.
+    #[tokio::test]
+    async fn a_non_406_rejection_of_the_primary_does_not_fail_the_fetch() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        let primary = Jid::pn_device("5511900000063", 0);
+
+        let fetch = tokio::spawn({
+            let client = client.clone();
+            let jids = vec![primary.clone()];
+            async move { client.fetch_and_establish_sessions(&jids).await }
+        });
+
+        answer_prekey_fetch(
+            &client,
+            &transport,
+            vec![
+                NodeBuilder::new("user")
+                    .attr("jid", NodeValue::Jid(primary.clone()))
+                    .children([NodeBuilder::new("error")
+                        .attr("code", "503")
+                        .attr("text", "service-unavailable")
+                        .build()])
+                    .build(),
+            ],
+        )
+        .await;
+
+        let established = fetch
+            .await
+            .expect("join")
+            .expect("a 503 is not the server saying the device is gone");
+        assert_eq!(established, 0);
     }
 
     /// A batch-wide 406 answers for every device at once and fails the send, so

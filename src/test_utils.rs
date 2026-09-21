@@ -215,8 +215,59 @@ pub async fn create_test_client() -> Arc<Client> {
     create_test_client_with_name("default").await
 }
 
+#[cfg(test)]
+pub(crate) async fn create_test_client_with_sync_receiver_and_admission(
+    admission: Arc<dyn crate::HistorySyncAdmission>,
+) -> (
+    Arc<Client>,
+    async_channel::Receiver<crate::sync_task::MajorSyncTask>,
+) {
+    let pm = Arc::new(
+        PersistenceManager::new(create_test_backend().await)
+            .await
+            .expect("persistence manager should initialize"),
+    );
+    let build = Client::builder()
+        .with_runtime(TokioRuntime)
+        .with_persistence_manager(pm)
+        .with_transport_factory(MockTransportFactory::new())
+        .with_http_client(MockHttpClient)
+        .with_history_sync_admission_arc(admission)
+        .build()
+        .await
+        .expect("client builder should initialize");
+    let (client, receiver) = build.into_parts();
+    client.enter_live_mode_for_tests();
+    (client, receiver)
+}
+
 pub async fn create_test_client_with_name(name: &str) -> Arc<Client> {
     create_test_client_with_http(name, Arc::new(MockHttpClient)).await
+}
+
+/// Build an in-memory test client with an explicit VoIP media backend, so a test can substitute a
+/// fake for the default resident engine.
+#[cfg(feature = "voip-control")]
+pub async fn create_test_client_with_voip_backend(
+    backend: Arc<dyn wacore::voip_control::VoipMediaBackend>,
+) -> Arc<Client> {
+    let pm = Arc::new(
+        PersistenceManager::new(create_test_backend().await)
+            .await
+            .expect("persistence manager should initialize"),
+    );
+    let build = Client::builder()
+        .with_runtime(TokioRuntime)
+        .with_persistence_manager(pm)
+        .with_transport_factory(MockTransportFactory::new())
+        .with_http_client(MockHttpClient)
+        .with_voip_media_backend_arc(backend)
+        .build()
+        .await
+        .expect("client builder should initialize");
+    let (client, _rx) = build.into_parts();
+    client.enter_live_mode_for_tests();
+    client
 }
 
 pub async fn create_test_client_with_failing_http(name: &str) -> Arc<Client> {
@@ -330,47 +381,11 @@ pub(crate) async fn create_test_client_with_transport_factory(
     client
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn seed_peer_session(client: &Arc<Client>, peer: &Jid) {
-    use wacore::libsignal::protocol::{
-        IdentityKeyPair, KeyPair, PreKeyBundle, SignalProtocolError, UsePQRatchet,
-        process_prekey_bundle,
-    };
-    use wacore::types::jid::JidExt;
-
-    let bundle = tokio::task::spawn_blocking(|| -> Result<PreKeyBundle, SignalProtocolError> {
-        let mut rng = rand::make_rng::<rand::rngs::StdRng>();
-        let receiver = IdentityKeyPair::generate(&mut rng);
-        let spk = KeyPair::generate(&mut rng);
-        let opk = KeyPair::generate(&mut rng);
-        let signature = receiver
-            .private_key()
-            .calculate_signature(&spk.public_key.serialize(), &mut rng)?;
-        PreKeyBundle::new(
-            1,
-            1u32.into(),
-            Some((1u32.into(), opk.public_key)),
-            1u32.into(),
-            spk.public_key,
-            signature,
-            *receiver.identity_key(),
-        )
-    })
-    .await
-    .expect("bundle task")
-    .expect("bundle");
-
-    let mut adapter = client.signal_adapter();
-    let mut rng = rand::make_rng::<rand::rngs::StdRng>();
-    process_prekey_bundle(
-        &peer.to_protocol_address(),
-        &mut adapter.session_store,
-        &mut adapter.identity_store,
-        &bundle,
-        &mut rng,
-        UsePQRatchet::No,
-    )
-    .await
-    .expect("peer session");
+    crate::test_support::seed_peer_session(client, peer)
+        .await
+        .expect("peer session");
 }
 
 use std::sync::Mutex;
@@ -694,7 +709,7 @@ pub(crate) async fn answer_iq(
     .await
     .unwrap_or_else(|_| panic!("an IQ waiter should be registered for {request_id}"));
 
-    #[cfg(feature = "voip-runtime")]
+    #[cfg(feature = "voip-control")]
     client.bind_pending_call_link_join_ack(&response.as_node_ref());
     let delivered = node_to_owned_ref(response);
     // Test helper: the map only ever holds Iq waiters in these fixtures.

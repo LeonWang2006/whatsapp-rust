@@ -1,4 +1,4 @@
-use crate::client::context::{GroupInfo, SendContextResolver};
+use crate::client::context::{GroupRoutingInfo, SendContextResolver};
 use crate::libsignal::protocol::{
     CiphertextMessage, IdentityChange, ProtocolAddress, SenderKeyMessage, SenderKeyStore,
     UsePQRatchet, message_encrypt, process_prekey_bundle,
@@ -76,7 +76,7 @@ pub use dm::*;
 pub use encrypt::*;
 pub use group::*;
 pub use peer::*;
-pub use resolved_devices::{ResolvedDmDevices, ResolvedGroupDevices};
+pub use resolved_devices::{DmSignalAddressing, ResolvedDmDevices, ResolvedGroupDevices};
 pub use status::*;
 
 #[cfg(test)]

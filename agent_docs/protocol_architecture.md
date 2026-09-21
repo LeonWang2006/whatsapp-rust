@@ -4,7 +4,10 @@ Stanza builders and parsers live in `wacore/src/iq/`. Read this before adding a 
 
 ## The two traits
 
-- `ProtocolNode` (`wacore/src/protocol/mod.rs`) maps a struct to a node.
+- `ProtocolNode` (`wacore/src/protocol/mod.rs`) maps a struct to a node. The
+  trait supports attributes and children; the `ProtocolNode` derive currently
+  generates attribute-only implementations. Child-bearing nodes use explicit
+  implementations.
 - `IqSpec` (`wacore/src/iq/spec.rs`) pairs a request with its typed response.
 
 Both carry doc comments on every method; read the source rather than a copy here.
@@ -14,6 +17,7 @@ Non-obvious parts:
 - **`try_from_node_ref(&NodeRef<'_>)` is the canonical parse path**, not the owned `try_from_node`. The owned form is a defaulted convenience that borrows and delegates. Implement and call the ref form.
 - **`IqSpec` has an optional encode fast path** that writes the `<iq>` stanza straight into a pre-sized buffer and skips the `Node` intermediate. Returning `false` falls back to `build_iq()` + marshal, so it is safe to leave unimplemented — but do not add a second hand-rolled encoder next to it.
 - **Constructors take `&Jid`**, never `Jid`, so callers are not forced to clone.
+- **A response too large to hold as a tree implements `IqStreamSpec` too** (`wacore/src/iq/spec.rs`) and is sent with `client.execute_streaming(spec)`. The read loop then hands the spec a `wacore_binary::NodeStream` positioned inside the `<iq type="result">` and the spec walks the children one at a time (`open` descends, `next_child` decodes one child whole, `close` skips the rest), keeping only what it needs. `PropsSpec` is the worked example: the A/B catalog is ~2,700 `<prop>` children and a tree of it costs ~770 KB on a 64-bit host for a 30 KB frame, where the stream costs the 4 KB inflate window. `consume_response` is the only parser the client runs for such a spec: a result decoded whole for a raw-node observer is replayed to it over the tree's own node bytes (`OwnedNodeRef::backing_bytes`), and only an error stanza is reported from the tree. `parse_response` stays required (it is what `execute` returns) and should agree with it. `wacore/tests/props_stream_memory.rs` measures the frame's cost at the allocator and is the regression gate for it; `bench_props_catalog_{tree,stream}` in `wacore/binary/benches/binary_benchmark.rs` track the two readings' CPU cost on CodSpeed, which are at parity on a host.
 
 ## Derive macros
 
@@ -22,7 +26,7 @@ Non-obvious parts:
 | Derive | For |
 | --- | --- |
 | `EmptyNode` | Nodes that are only a tag |
-| `ProtocolNode` | Nodes with attributes and children |
+| `ProtocolNode` | Struct attributes (attribute-only derive) |
 | `WireEnum` | Every protocol enum |
 
 `StringEnum` is **not** a derive — it is an internal attribute kind inside the `ProtocolNode` derive. Protocol enums use `WireEnum`.

@@ -1,7 +1,9 @@
 //! App-state collection sync and mutation dispatch.
 
 use super::*;
+use crate::features::{AppStateError, AppStateResyncMode, AppStateResyncReport};
 use crate::request::DEFAULT_IQ_TIMEOUT;
+use std::borrow::Cow;
 
 /// Concurrency cap for pre-downloading app-state external blobs (independent CDN
 /// GETs, keyed by directPath — LTHash ordering is in patch application, not blob
@@ -771,6 +773,47 @@ fn finalize_app_state_key_request_peers(
     Ok(peers)
 }
 
+/// Whether a 409's conflicting patches left the collection somewhere new.
+///
+/// A rebuild is only worth re-sending if the base moved. When the recovery
+/// itself failed, the next attempt builds the same patch on the same base and
+/// earns the same refusal -- which in production meant five identical round
+/// trips, holding the collection reservation throughout, before the mutation was
+/// reported lost.
+enum Recovery {
+    Recovered,
+    Failed(anyhow::Error),
+}
+
+/// Why a collection this round asked for is missing from its results.
+///
+/// A `<sync>` that omits a requested `<collection>` parses fine, so the omission
+/// has to be reconciled rather than detected. But an apply that failed leaves the
+/// collection unaccounted for too, and calling that "the response omitted it"
+/// blames the server for our own error -- which is exactly what a production
+/// investigation into a permanently unsyncable `regular_low` had to unpick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unaccounted {
+    /// The response never mentioned it.
+    Omitted,
+    /// It came back, and the apply stopped before finishing it.
+    NotApplied,
+}
+
+fn unaccounted_for(
+    name: WAPatchName,
+    responded: &HashSet<WAPatchName>,
+    answered: &HashSet<WAPatchName>,
+) -> Option<Unaccounted> {
+    if answered.contains(&name) {
+        None
+    } else if responded.contains(&name) {
+        Some(Unaccounted::NotApplied)
+    } else {
+        Some(Unaccounted::Omitted)
+    }
+}
+
 impl Client {
     pub(crate) fn get_app_state_processor(&self) -> &Arc<AppStateProcessor> {
         self.app_state_processor.get_or_init(|| {
@@ -790,7 +833,7 @@ impl Client {
     async fn pre_download_external_blobs(
         &self,
         patch_lists: &[wacore::appstate::patch_decode::PatchList],
-    ) -> HashMap<String, Vec<u8>> {
+    ) -> HashMap<String, bytes::Bytes> {
         use futures::StreamExt;
 
         // Kept only so a failed download logs the right message (snapshot vs patch).
@@ -850,7 +893,9 @@ impl Client {
                         debug!(target: "Client/AppState", "Downloaded external snapshot ({} bytes)", bytes.len());
                     }
                     if let Some(path) = path {
-                        pre_downloaded.insert(path, bytes);
+                        // `Bytes::from(Vec)` moves; the resolvers below then
+                        // hand out refcounts instead of copying the blob.
+                        pre_downloaded.insert(path, bytes::Bytes::from(bytes));
                     }
                 }
                 Err(e) => match kind {
@@ -904,6 +949,15 @@ impl Client {
                 );
             }))
             .detach();
+    }
+
+    /// Replays one collection from the beginning.
+    pub async fn resync_app_state_collection(
+        &self,
+        name: WAPatchName,
+    ) -> Result<AppStateResyncReport, AppStateError> {
+        self.resync_app_state([name], AppStateResyncMode::Snapshot)
+            .await
     }
 
     /// Public entry point for processing [`MajorSyncTask`] from the sync channel.
@@ -981,7 +1035,7 @@ impl Client {
     /// batched path reserves its collections in
     /// [`sync_collections_batched`](Self::sync_collections_batched).
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.fetch", level = "debug", skip_all, fields(name = ?name), err(Debug)))]
-    async fn fetch_app_state_with_retry_inner(&self, name: WAPatchName) -> Result<()> {
+    async fn fetch_app_state_with_retry_inner(&self, name: WAPatchName) -> Result<SyncOutcome> {
         let _t = wacore::telemetry::timer(wacore::telemetry::APPSTATE_SYNC_DURATION);
         let mut attempt = 0u32;
         loop {
@@ -993,7 +1047,7 @@ impl Client {
             match res {
                 Ok(SyncOutcome::Completed) => {
                     wacore::telemetry::appstate_sync("ok");
-                    return Ok(());
+                    return Ok(SyncOutcome::Completed);
                 }
                 // The send succeeded and the collection is now behind its own
                 // head, which is precisely the state this re-sync exists to
@@ -1005,7 +1059,7 @@ impl Client {
                     if let Some(client) = self.self_weak.get().and_then(|w| w.upgrade()) {
                         client.schedule_app_state_task_retry(name, false);
                     }
-                    return Ok(());
+                    return Ok(SyncOutcome::Deferred);
                 }
                 Err(e) => {
                     if e.downcast_ref::<crate::appstate_sync::AppStateSyncError>()
@@ -1335,7 +1389,15 @@ impl Client {
     /// snapshot silently never happens.
     fn schedule_app_state_task_retry(self: &Arc<Self>, name: WAPatchName, full_sync: bool) {
         let mut scope = self.sync_scope(None);
-        let client = self.clone();
+        // Weak across the sleep: the backoff doubles to an hour, and holding a
+        // strong reference through it keeps the entire client graph — caches,
+        // stores, subsystems — alive for that long after the application has
+        // dropped its handle, and defers the `Drop` that signals shutdown. The
+        // runtime handle is kept separately so the sleep needs nothing from the
+        // client, and the loop re-acquires a strong reference for the round it
+        // is about to run and releases it again at the end of the iteration.
+        let weak_client = Arc::downgrade(self);
+        let runtime = self.runtime.clone();
         self.runtime.spawn_detached(Box::pin(async move {
             // Attempts and rounds are counted separately: a wait that ran out
             // never reached the server, so spending an attempt on it would let a
@@ -1346,7 +1408,11 @@ impl Client {
                 if attempts >= APP_STATE_RETRY_MAX_ROUNDS {
                     break;
                 }
-                client.runtime.sleep(app_state_retry_backoff(attempts)).await;
+                runtime.sleep(app_state_retry_backoff(attempts)).await;
+                let Some(client) = weak_client.upgrade() else {
+                    debug!(target: "Client/AppState", "App state task retry cancelled: client is gone");
+                    return;
+                };
                 if client.is_terminal() {
                     debug!(target: "Client/AppState", "App state task retry cancelled: client is finished");
                     return;
@@ -1452,7 +1518,11 @@ impl Client {
         if collections.is_empty() {
             return;
         }
-        let client = self.clone();
+        // Weak across the sleep, for the same reason as
+        // `schedule_app_state_task_retry`: an hour-long backoff must not keep
+        // the client graph alive after the application lets go of it.
+        let weak_client = Arc::downgrade(self);
+        let runtime = self.runtime.clone();
         self.runtime.spawn_detached(Box::pin(async move {
             let mut scope = scope;
             let mut settles = settles;
@@ -1474,7 +1544,11 @@ impl Client {
                 if attempts >= APP_STATE_RETRY_MAX_ROUNDS {
                     break;
                 }
-                client.runtime.sleep(app_state_retry_backoff(attempts)).await;
+                runtime.sleep(app_state_retry_backoff(attempts)).await;
+                let Some(client) = weak_client.upgrade() else {
+                    debug!(target: "Client/AppState", "App state retry cancelled: client is gone");
+                    return;
+                };
                 // Waited for, not charged for. Without this the loop spends an
                 // attempt on every offline round, and the whole budget is gone
                 // long before a reconnect that backs off in minutes returns —
@@ -1564,6 +1638,12 @@ impl Client {
             // producing any — would otherwise finish in silence, with the
             // collections still stale. `retryable` is exactly what these are:
             // not synced, and a later trigger can still fix them.
+            //
+            // Nobody to report to if the client is gone; the strong reference
+            // the rounds held was released with the last of them.
+            let Some(client) = weak_client.upgrade() else {
+                return;
+            };
             if client.admits(scope).is_ok() {
                 let exhausted = BatchedSyncOutcome {
                     retryable: pending,
@@ -1661,10 +1741,9 @@ impl Client {
         name: WAPatchName,
         scope: SyncScope,
     ) -> Result<StandDown> {
-        let state = backend.get_version(name.as_str()).await?;
-        if state.version == 0 {
+        let Some(state) = backend.get_version(name.as_str()).await? else {
             return Ok(StandDown::Done);
-        }
+        };
         if let Err(lost) = self.admits(scope) {
             return Ok(StandDown::Declined(lost));
         }
@@ -1673,9 +1752,7 @@ impl Client {
             "Batched sync: standing {name:?} down from v{} to rebuild it",
             state.version
         );
-        backend
-            .set_version(name.as_str(), wacore::appstate::hash::HashState::default())
-            .await?;
+        backend.delete_version(name.as_str()).await?;
         if let Err(lost) = self.admits(scope) {
             // The version is already down, and that half is the recoverable one:
             // the next sync sees an unsynced collection and rebuilds it, clearing
@@ -1948,20 +2025,30 @@ impl Client {
                     );
                     continue;
                 }
-                let state = backend.get_version(name.as_str()).await?;
-                let want_snapshot = state.version == 0;
+                let stored = backend.get_version(name.as_str()).await?;
+                // WA Web reads `isBootstrap = version == null`. Presence alone
+                // cannot answer it here: version 0 with an empty ltHash is
+                // byte-identical between a collection that never synced and one
+                // that synced and is empty, and a row written by an older build
+                // could be either. The flag is what separates them, and it is
+                // false on every row that predates it -- so those bootstrap once
+                // more, which is the safe direction.
+                let want_snapshot = !stored.as_ref().is_some_and(|s| s.has_baseline());
+                let state = stored.unwrap_or_default();
                 if want_snapshot {
                     replaying_snapshot.insert(name);
                 }
-                let mut builder = NodeBuilder::new("collection")
+                // `version` goes on every node, snapshot request included. WA
+                // Web's `_buildCollectionNodes` emits `version: INT(v ?? 0)`
+                // unconditionally, so a `<collection>` without one is a shape the
+                // official client never sends.
+                let builder = NodeBuilder::new("collection")
                     .attr("name", name.as_str())
                     .attr(
                         "return_snapshot",
                         if want_snapshot { "true" } else { "false" },
-                    );
-                if !want_snapshot {
-                    builder = builder.attr("version", state.version);
-                }
+                    )
+                    .attr("version", state.version);
                 collection_nodes.push(builder.build());
             }
             rebuild = false;
@@ -2077,7 +2164,7 @@ impl Client {
             // concurrently (independent CDN GETs, keyed by directPath).
             let pre_downloaded = self.pre_download_external_blobs(&patch_lists).await;
 
-            let download = |ext: &wa::ExternalBlobReference| -> Result<Vec<u8>> {
+            let download = |ext: &wa::ExternalBlobReference| -> Result<bytes::Bytes> {
                 if let Some(path) = &ext.direct_path {
                     if let Some(bytes) = pre_downloaded.get(path) {
                         Ok(bytes.clone())
@@ -2149,6 +2236,11 @@ impl Client {
             // The error still ends the run — after what was applied has been
             // dispatched.
             let mut apply_error = None;
+            // What the response actually carried, captured before the apply
+            // consumes it: a collection that came back and failed to apply is a
+            // different fact from one the server never mentioned, and the two
+            // used to reach the log as the same sentence.
+            let responded: HashSet<WAPatchName> = patch_lists.iter().map(|pl| pl.name).collect();
             for pl in patch_lists {
                 if let Err(lost) = self.admits(scope) {
                     warn!(
@@ -2157,9 +2249,20 @@ impl Client {
                     );
                     break;
                 }
+                let name = pl.name;
                 match proc.process_one_patch_list(pl, &download, true).await {
                     Ok(applied) => results.push(applied),
                     Err(e) => {
+                        // Named here or nowhere: the loop stops on the first
+                        // failure, and the collections behind it are reported as
+                        // unaccounted for without anything saying which one
+                        // actually broke. Ordering makes this concrete --
+                        // `regular_low` sorts last, so it is the usual casualty.
+                        warn!(
+                            target: "Client/AppState",
+                            "Batched sync: apply failed for {name:?}: {e}"
+                        );
+                        self.escalate_to_snapshot_recovery(name, &e).await;
                         apply_error = Some(e);
                         break;
                     }
@@ -2197,12 +2300,28 @@ impl Client {
                                 // ConflictHasMore: server has more patches, must refetch.
                                 warn!(target: "Client/AppState", "Collection {:?} conflict (has_more=true), will refetch", name);
                                 needs_refetch.push(name);
-                            } else {
-                                // Conflict without has_more: WA Web treats this as success
-                                // when there are no pending mutations to push (which is
-                                // always the case for us since we don't push app state).
-                                debug!(target: "Client/AppState", "Collection {:?} conflict (has_more=false), treating as success (no pending mutations)", name);
+                            } else if backend
+                                .get_version(name.as_str())
+                                .await?
+                                .is_some_and(|s| s.has_baseline())
+                            {
+                                // Conflict without has_more: WA Web reads this as
+                                // success once it has nothing left to push.
+                                debug!(target: "Client/AppState", "Collection {:?} conflict (has_more=false), treating as success", name);
                                 outcome.synced.push(name);
+                            } else {
+                                // Except when the collection has no record at all.
+                                // `process_parsed_patch_list` returns early for a list
+                                // carrying an error, so nothing was persisted -- calling
+                                // that synced closes the bootstrap gate over a collection
+                                // that will bootstrap again on the next connection, and
+                                // again after that.
+                                warn!(
+                                    target: "Client/AppState",
+                                    "Collection {name:?} conflict (has_more=false) while it has \
+                                     no version record; nothing was persisted, so it is not synced"
+                                );
+                                outcome.retryable.push(name);
                             }
                             continue;
                         }
@@ -2243,8 +2362,25 @@ impl Client {
                 // the set, which is what keeps it from reading as a full sync.
                 let full_sync = replaying_snapshot.contains(&name);
                 wacore::telemetry::appstate_mutations(mutations.len() as u64);
-                for m in mutations {
-                    self.dispatch_app_state_mutation(&m, full_sync).await;
+                // `new_state.version` is the version *after* this page: a page
+                // can carry a snapshot plus several patches, so mutations
+                // from the earlier pieces did not arrive at this version.
+                // They still share one per-mutation version rather than one
+                // each, because `process_patch_list` concatenates them and
+                // returns only the final state — tracking the originating
+                // version per mutation would thread a parallel `Vec<u64>`
+                // through the processor, the telemetry and every dispatch
+                // caller for a distinction the per-patch `Decoded … vN`
+                // lines already draw. The version below is therefore the
+                // page's end cursor, not each mutation's birth version.
+                let total = mutations.len();
+                for (position, mut m) in mutations.into_iter().enumerate() {
+                    self.dispatch_app_state_mutation(
+                        &mut m,
+                        full_sync,
+                        (name, new_state.version, position + 1, total),
+                    )
+                    .await;
                 }
 
                 // No version write here. `process_one_patch_list` already
@@ -2274,12 +2410,22 @@ impl Client {
             // and did not fail either; treat it as retryable so it is neither
             // reported as done nor re-asked immediately in this loop.
             for name in pending {
-                if !answered.contains(&name) {
-                    warn!(
-                        target: "Client/AppState",
-                        "Batched sync: response omitted collection {name:?}"
-                    );
-                    outcome.retryable.push(name);
+                match unaccounted_for(name, &responded, &answered) {
+                    None => {}
+                    Some(Unaccounted::Omitted) => {
+                        warn!(
+                            target: "Client/AppState",
+                            "Batched sync: response omitted collection {name:?}"
+                        );
+                        outcome.retryable.push(name);
+                    }
+                    Some(Unaccounted::NotApplied) => {
+                        warn!(
+                            target: "Client/AppState",
+                            "Batched sync: {name:?} came back but was not applied"
+                        );
+                        outcome.retryable.push(name);
+                    }
                 }
             }
 
@@ -2333,10 +2479,13 @@ impl Client {
         let backend = self.persistence_manager.backend();
         let mut full_sync = full_sync;
 
-        let mut state = backend.get_version(name.as_str()).await?;
-        if state.version == 0 {
+        // See the batched builder: a completed bootstrap is a fact the record
+        // carries, not one its presence implies.
+        let stored = backend.get_version(name.as_str()).await?;
+        if !stored.as_ref().is_some_and(|s| s.has_baseline()) {
             full_sync = true;
         }
+        let mut state = stored.unwrap_or_default();
 
         let mut has_more = true;
         let mut want_snapshot = full_sync;
@@ -2373,15 +2522,15 @@ impl Client {
             }
             debug!(target: "Client/AppState", "Fetching app state patch batch: name={:?} want_snapshot={want_snapshot} version={} full_sync={} has_more_previous={}", name, state.version, full_sync, has_more);
 
-            let mut collection_builder = NodeBuilder::new("collection")
+            // See the batched builder: `version` is unconditional, matching
+            // `_buildCollectionNodes`.
+            let collection_builder = NodeBuilder::new("collection")
                 .attr("name", name.as_str())
                 .attr(
                     "return_snapshot",
                     if want_snapshot { "true" } else { "false" },
-                );
-            if !want_snapshot {
-                collection_builder = collection_builder.attr("version", state.version);
-            }
+                )
+                .attr("version", state.version);
             let sync_node = NodeBuilder::new("sync")
                 .children([collection_builder.build()])
                 .build();
@@ -2419,7 +2568,7 @@ impl Client {
                 .pre_download_external_blobs(std::slice::from_ref(&pl))
                 .await;
 
-            let download = |ext: &wa::ExternalBlobReference| -> Result<Vec<u8>> {
+            let download = |ext: &wa::ExternalBlobReference| -> Result<bytes::Bytes> {
                 if let Some(path) = &ext.direct_path {
                     if let Some(bytes) = pre_downloaded.get(path) {
                         Ok(bytes.clone())
@@ -2457,7 +2606,17 @@ impl Client {
             }
 
             let (mutations, new_state, list) =
-                proc.process_parsed_patch_list(pl, &download, true).await?;
+                match proc.process_parsed_patch_list(pl, &download, true).await {
+                    Ok(applied) => applied,
+                    Err(e) => {
+                        // The single-collection path fails the same way the batched
+                        // one does and deserves the same escalation; without it, a
+                        // collection would recover only when its failure happened to
+                        // arrive in a batch.
+                        self.escalate_to_snapshot_recovery(name, &e).await;
+                        return Err(e);
+                    }
+                };
             let decode_elapsed = _decode_start.elapsed();
             if decode_elapsed.as_millis() > 500 {
                 debug!(target: "Client/AppState", "Patch decode for {:?} took {:?}", name, decode_elapsed);
@@ -2474,9 +2633,63 @@ impl Client {
                 .await;
 
             wacore::telemetry::appstate_mutations(mutations.len() as u64);
-            for m in mutations {
-                debug!(target: "Client/AppState", "Dispatching mutation kind={} index_len={} full_sync={}", m.index.first().map(|s| s.as_str()).unwrap_or(""), m.index.len(), full_sync);
-                self.dispatch_app_state_mutation(&m, full_sync).await;
+            let total = mutations.len();
+            for (position, mut m) in mutations.into_iter().enumerate() {
+                // `new_state`, not `state`: the page just applied produced
+                // this version, and `state` still holds the pre-page cursor
+                // until the assignment below. Logging the old version would
+                // attribute the fresh mutations to the cursor they replaced —
+                // the batched path already reports `new_state.version`.
+                self.dispatch_app_state_mutation(
+                    &mut m,
+                    full_sync,
+                    (name, new_state.version, position + 1, total),
+                )
+                .await;
+            }
+
+            // A collection the server refused advances nothing: the processor
+            // returns the state untouched for a list carrying an error
+            // (`process_parsed_patch_list`, the `pl.error.is_some()` early
+            // return). Reporting `Completed` for it would say the loop ended,
+            // not that the collection synced -- and the conflict recovery reads
+            // that answer as "the base moved", then re-sends the same patch
+            // until the attempt cap. The batched path buckets these as
+            // retryable or fatal; this one has no buckets, so it raises.
+            if let Some(refused) = &list.error
+                && new_state.version <= state.version
+            {
+                use wacore::appstate::patch_decode::CollectionSyncError;
+                match refused {
+                    // WA Web reads a conflict with nothing left to come as
+                    // success once it has nothing to push. Raising here would
+                    // send the scheduler back to rediscover the same benign
+                    // answer until its retry budget ran out.
+                    CollectionSyncError::Conflict { has_more: false } => {
+                        debug!(
+                            target: "Client/AppState",
+                            "{name:?} conflict with no more patches; nothing left to apply"
+                        );
+                    }
+                    // A collection the server will not serve. Retrying is what
+                    // the batched path already refuses to do with these.
+                    CollectionSyncError::Fatal { code, text } => {
+                        return Err(anyhow::anyhow!(
+                            "app-state sync for {name:?} refused fatally by the server \
+                             ({code}): {text}"
+                        ));
+                    }
+                    // Retryable, or a conflict that says more is coming: the
+                    // collection did not advance, so reporting this run as
+                    // completed would tell the conflict recovery that the base
+                    // moved when it did not.
+                    _ => {
+                        return Err(anyhow::anyhow!(
+                            "app-state sync for {name:?} was refused by the server \
+                             and advanced nothing: {refused}"
+                        ));
+                    }
+                }
             }
 
             state = new_state;
@@ -2486,8 +2699,14 @@ impl Client {
             debug!(target: "Client/AppState", "After processing batch name={:?} has_more={has_more} new_version={}", name, state.version);
         }
 
-        backend.set_version(name.as_str(), state.clone()).await?;
-
+        // No version write here. `process_patch_list` persists each page as it
+        // applies it, the snapshot branch persists its baseline, and a bootstrap
+        // the server answered with nothing persists its zero -- all inside the
+        // same section that writes the mutation MACs. A second write from out
+        // here would carry a `state` read before several awaits, and could land
+        // after a replacement connection had already moved the collection,
+        // putting the older version back next to the newer MACs. The batched
+        // path removed its own copy of this write for exactly that reason.
         debug!(target: "Client/AppState", "Finished app state sync for {name:?} as {outcome:?} (final version={})", state.version);
         Ok(outcome)
     }
@@ -2741,7 +2960,8 @@ impl Client {
                             ..Default::default()
                         },
                     )
-                    .await
+                    .await?;
+                    Ok::<(), anyhow::Error>(())
                 }
                 .await;
                 (device, result)
@@ -2798,6 +3018,43 @@ impl Client {
             None => None,
         };
         let proc = self.get_app_state_processor();
+
+        // A collection that never synced has nothing to build on: its ltHash is
+        // empty and the server is at whatever version the account reached, so the
+        // patch is refused with a 409 by construction rather than by a race, and
+        // the 409 is what drags the send into the rebuild loop. WA Web does not
+        // send one either -- `pendingCollectionsInBootstrap` holds the mutations
+        // back and logs "skipping N collections in sync iq patch because initial
+        // full sync is incomplete". Sync first, then build.
+        if let Some(name) = patch_name {
+            let backend = self.persistence_manager.backend();
+            if !backend
+                .get_version(collection_name)
+                .await?
+                .is_some_and(|s| s.bootstrapped)
+            {
+                debug!(
+                    target: "Client/AppState",
+                    "{collection_name} has never synced; syncing before building a patch on it"
+                );
+                // A record is not enough: a bootstrap that persisted some pages
+                // and then deferred leaves one behind while the collection is
+                // still short of the head, and a patch built on that base is the
+                // 409 this guard exists to avoid.
+                let synced = self.fetch_app_state_with_retry_inner(name).await?;
+                if synced != SyncOutcome::Completed
+                    || !backend
+                        .get_version(collection_name)
+                        .await?
+                        .is_some_and(|s| s.bootstrapped)
+                {
+                    return Err(anyhow::anyhow!(
+                        "app-state patch for {collection_name} not attempted: \
+                         its bootstrap has not completed"
+                    ));
+                }
+            }
+        }
 
         for attempt in 1..=APP_STATE_PATCH_SEND_ATTEMPTS {
             // Cloned per attempt because a conflict rebuilds the patch against
@@ -2883,8 +3140,22 @@ impl Client {
                          (attempt {attempt}/{APP_STATE_PATCH_SEND_ATTEMPTS}, has_more={has_more}); \
                          applying the conflicting patches and rebuilding"
                     );
-                    self.absorb_conflicting_patches(collection_name, patch_name, list, has_more)
-                        .await;
+                    // A rebuild is only worth re-sending if the absorb could move
+                    // the base. When the recovery itself failed -- a snapshot
+                    // whose MAC will not validate is the case production hit --
+                    // the next attempt sends byte-identical bytes and earns the
+                    // byte-identical refusal, so the cap turns one deterministic
+                    // failure into five round trips, with the collection
+                    // reservation held throughout.
+                    if let Recovery::Failed(e) = self
+                        .absorb_conflicting_patches(collection_name, patch_name, list, has_more)
+                        .await
+                    {
+                        return Err(e.context(format!(
+                            "app-state patch for {collection_name} conflicted on \
+                             v{base_version} and the collection could not be recovered"
+                        )));
+                    }
                 }
                 Some(error) => {
                     return Err(anyhow::anyhow!(
@@ -2914,7 +3185,20 @@ impl Client {
         patch_name: Option<WAPatchName>,
         mut list: wacore::appstate::patch_decode::PatchList,
         has_more: bool,
-    ) {
+    ) -> Recovery {
+        // What the recovery has to move, read before anything can move it.
+        // `process_parsed_patch_list` persists each patch as it applies it, so
+        // reading after it would compare the advanced version against itself and
+        // call a successful absorb a failure -- dropping the user's mutation on
+        // the one path where rebuilding would have worked.
+        let backend = self.persistence_manager.backend();
+        let base_before = backend
+            .get_version(collection_name)
+            .await
+            .ok()
+            .flatten()
+            .map(|s| s.version);
+
         // The error tag described the send; the patches under it are ordinary
         // inbound data, so clear it before handing the list to the processor.
         list.error = None;
@@ -2924,7 +3208,7 @@ impl Client {
             let pre_downloaded = self
                 .pre_download_external_blobs(std::slice::from_ref(&list))
                 .await;
-            let download = |ext: &wa::ExternalBlobReference| -> Result<Vec<u8>> {
+            let download = |ext: &wa::ExternalBlobReference| -> Result<bytes::Bytes> {
                 let path = ext
                     .direct_path
                     .as_ref()
@@ -2936,12 +3220,47 @@ impl Client {
             };
             let proc = self.get_app_state_processor();
             match proc.process_parsed_patch_list(list, &download, true).await {
-                Ok((mutations, _, _)) => {
+                // The third element is the processor's own verdict, and it is
+                // not always agreement: a collection with an empty ltHash and a
+                // non-genesis first patch is refused here, with `Retry` set and
+                // the version untouched. Discarding it read that refusal as a
+                // clean apply.
+                Ok((mutations, new_state, list)) => {
                     wacore::telemetry::appstate_mutations(mutations.len() as u64);
-                    for m in &mutations {
-                        self.dispatch_app_state_mutation(m, false).await;
+                    // Same semantic context as the sync paths: the conflict
+                    // absorb runs through the processor, so `new_state` is
+                    // the post-apply cursor and `list.name` the collection —
+                    // without it these mutations would dispatch with `ctx`
+                    // unset and lose their per-mutation line entirely.
+                    // A 409 absorb replays what the server sent, snapshot
+                    // included (inline or via `snapshot_ref`, inlined before
+                    // processing): like any full replay, per-mutation lines
+                    // stay at TRACE (the processor aggregate keeps DEBUG).
+                    // That is logging volume only: events keep
+                    // `event_full_sync=false` (the base passed `false`
+                    // here unconditionally), so the split args below must
+                    // not be reunited into one `full_sync`.
+                    let replaying_snapshot = list.snapshot.is_some() || list.snapshot_ref.is_some();
+                    let total = mutations.len();
+                    for (position, mut m) in mutations.into_iter().enumerate() {
+                        self.dispatch_app_state_mutation_inner(
+                            &mut m,
+                            false, // event provenance: a conflict absorb is not a full sync
+                            replaying_snapshot, // logging mode: snapshot replays stay at TRACE
+                            Some((list.name, new_state.version, position + 1, total)),
+                        )
+                        .await;
                     }
-                    true
+                    if let Some(refused) = &list.error {
+                        debug!(
+                            target: "Client/AppState",
+                            "{collection_name} refused the conflicting patches ({refused}); \
+                             a re-sync is the only way forward"
+                        );
+                        false
+                    } else {
+                        true
+                    }
                 }
                 Err(e) => {
                     warn!(
@@ -2955,137 +3274,1295 @@ impl Client {
 
         // `has_more` means the server held patches back, so even a clean apply
         // leaves the base short of the head.
-        if (!applied || has_more)
-            && let Some(patch_name) = patch_name
-            && let Err(e) = self.fetch_app_state_with_retry_inner(patch_name).await
-        {
+        if !applied || has_more {
+            let Some(patch_name) = patch_name else {
+                // Nothing to re-sync against, and the apply did not land: the
+                // retry would rebuild on the same base.
+                return Recovery::Failed(anyhow::anyhow!(
+                    "{collection_name} is not a known collection, so its conflict cannot be resolved"
+                ));
+            };
+            match self.fetch_app_state_with_retry_inner(patch_name).await {
+                // The base is where it was and the re-sync is the only thing that
+                // could have moved it. A snapshot MAC that will not validate
+                // fails this way every time, so the remaining attempts are the
+                // same request and the same refusal.
+                Err(e) => {
+                    warn!(
+                        target: "Client/AppState",
+                        "Failed to re-sync {collection_name} after a patch conflict: {e}"
+                    );
+                    return Recovery::Failed(e);
+                }
+                // Deferred is not recovered: the sync was scheduled for a later
+                // connection and this one applied nothing, so the base is exactly
+                // where the refused patch was built.
+                Ok(SyncOutcome::Deferred) => {
+                    warn!(
+                        target: "Client/AppState",
+                        "Re-sync of {collection_name} after a patch conflict was deferred; \
+                         the base has not moved"
+                    );
+                    return Recovery::Failed(anyhow::anyhow!(
+                        "re-sync of {collection_name} was deferred to a later connection"
+                    ));
+                }
+                Ok(SyncOutcome::Completed) => {}
+            }
+        }
+
+        let base_after = backend
+            .get_version(collection_name)
+            .await
+            .ok()
+            .flatten()
+            .map(|s| s.version);
+        if base_after == base_before {
             warn!(
                 target: "Client/AppState",
-                "Failed to re-sync {collection_name} after a patch conflict: {e}"
+                "Recovering {collection_name} left the base at {base_before:?}; \
+                 rebuilding would send the same patch again"
             );
+            return Recovery::Failed(anyhow::anyhow!(
+                "recovering {collection_name} did not move it past v{}",
+                base_before.unwrap_or(0)
+            ));
+        }
+        Recovery::Recovered
+    }
+
+    /// Write a collection the primary sent back, and announce what changed.
+    ///
+    /// Lives here rather than beside the peer-message plumbing because the write
+    /// is app-state's: it takes the same reservation a sync and a patch send
+    /// take, since it is a clear, a put and a set over the very rows they write,
+    /// and interleaving with either can leave the persisted ltHash and the MAC
+    /// store describing different states.
+    ///
+    /// The caller is already detached from the inbound path, so this waits for
+    /// the reservation on its own time.
+    pub(crate) async fn apply_recovered_collection(
+        &self,
+        name: &str,
+        request_id: &str,
+        generation: u64,
+        recovery: waproto::whatsapp::SyncdSnapshotRecovery,
+    ) {
+        // `WAPatchName::from_str` is infallible: every unrecognised name maps to
+        // `Unknown`, which is one shared reservation slot and one collection
+        // this side has no rules for. Rejecting it explicitly is the difference
+        // between ignoring a name we do not know and applying it under a
+        // reservation that means nothing.
+        let patch_name = name.parse::<WAPatchName>().unwrap_or(WAPatchName::Unknown);
+        if patch_name == WAPatchName::Unknown {
+            // Released for the same reason as every other ending that is not an
+            // apply: the ask has been answered, badly, and keeping it would
+            // refuse the next one for nothing.
+            self.get_app_state_processor()
+                .take_recovery_request_by_id(request_id)
+                .await;
+            warn!(
+                target: "Client/AppState",
+                "Snapshot recovery names an unknown collection {name}; ignoring"
+            );
+            return;
+        }
+
+        // The record count WA Web allows a recovery to carry. The byte ceiling
+        // bounds the payload, but small records encode in a few bytes each, so
+        // 64 MiB is room for orders of magnitude more than a collection has --
+        // and every one of them is an HMAC, a store row and a dispatched event.
+        // The prop's registry default is 2000, which is what an account that is
+        // never sent it reads.
+        let allowed = self
+            .ab_props()
+            .get_int(wacore::iq::abprops::web::SNAPSHOT_RECOVERY_MAX_MUTATIONS_COUNT_ALLOWED)
+            .await;
+        if allowed > 0 && recovery.mutation_records.len() as i64 > allowed {
+            self.get_app_state_processor()
+                .take_recovery_request_by_id(request_id)
+                .await;
+            warn!(
+                target: "Client/AppState",
+                "Snapshot recovery for {name} carries {} records, over the {allowed} allowed; refusing it",
+                recovery.mutation_records.len()
+            );
+            return;
+        }
+
+        // Refused before anything is reserved on its behalf: an unsolicited
+        // reply should cost a map lookup, not a wait. The marker is only *taken*
+        // once the reservation is held, so a wait that times out does not
+        // consume a request that was really made.
+        let proc = self.get_app_state_processor();
+        if !proc.has_recovery_request(name).await {
+            warn!(
+                target: "Client/AppState",
+                "Ignoring an unsolicited snapshot recovery for {name}: nothing here asked for one"
+            );
+            return;
+        }
+
+        // The keys the primary signed these records with, asked for before the
+        // reservation rather than during it. A recovery is reached because the
+        // collection is already stuck, and a historical key this side never
+        // received would fail every attempt at it identically -- the normal
+        // snapshot path repairs exactly this with a key share, and skipping it
+        // here would leave the one escalation that exists to unstick a
+        // collection stuck on a key nobody ever asked for.
+        let mut seen: HashSet<Vec<u8>> = HashSet::new();
+        let mut missing_keys = Vec::new();
+        for record in &recovery.mutation_records {
+            let Some(key_id) = record.key_id.as_deref() else {
+                continue;
+            };
+            if !seen.insert(key_id.to_vec()) {
+                continue;
+            }
+            // Only a key that is genuinely absent. Any other store error means
+            // the key may well be there, and asking peers for it buys a ten
+            // second wait and a message nobody needed -- the apply below reports
+            // the real failure.
+            if let Err(wacore::appstate_sync::AppStateSyncError::KeyNotFound(_)) =
+                proc.get_app_state_key(key_id).await
+            {
+                missing_keys.push(key_id.to_vec());
+            }
+        }
+        if !missing_keys.is_empty() {
+            let asked = missing_keys.len();
+            if !self
+                .request_keys_and_wait(missing_keys, APP_STATE_KEY_REQUEST_TIMEOUT)
+                .await
+            {
+                // Not a refusal: the apply below reports which record it could
+                // not read, and the ask is spent either way rather than left to
+                // suppress the next one.
+                warn!(
+                    target: "Client/AppState",
+                    "{asked} app-state key(s) the {name} recovery needs are still missing"
+                );
+            }
+        }
+
+        let Ok(_reservation) = rt_timeout(
+            &*self.runtime,
+            APP_STATE_RESERVATION_WAIT,
+            self.app_state_syncing.begin(patch_name, SyncHolder::Sync),
+        )
+        .await
+        else {
+            // Released, not left claimed. The reply is being dropped, and one
+            // ask has one reply -- so holding the request would refuse a repeat
+            // of this one and suppress the next escalation for the rest of the
+            // window, over a collection still exactly as stuck as it was.
+            proc.take_recovery_request_by_id(request_id).await;
+            warn!(
+                target: "Client/AppState",
+                "Gave up waiting to reserve {name} for a snapshot recovery"
+            );
+            return;
+        };
+
+        // Taken by the id, never by the name. The reservation above may wait
+        // longer than a request lives -- 450 seconds against a 300-second TTL --
+        // so by the time this runs the ask that produced this reply can have
+        // expired and been replaced. Taking by name would consume the
+        // replacement's marker, apply the older reply, and have the newer one
+        // refused as unsolicited.
+        if proc.take_recovery_request_by_id(request_id).await.is_none() {
+            debug!(
+                target: "Client/AppState",
+                "The recovery request for {name} is no longer outstanding; dropping this reply"
+            );
+            return;
+        }
+
+        // Rechecked after the waits above, not only before them. A disconnect
+        // during the key share or the reservation clears the registry, so the
+        // guard this holds would no longer exclude the new connection's own
+        // sync from the rows about to be written.
+        if self.connection_generation.load(Ordering::Acquire) != generation {
+            debug!(
+                target: "Client/AppState",
+                "Dropping the {name} recovery: the connection it belongs to went while it waited"
+            );
+            return;
+        }
+
+        // The generation check above is true only until the next await. Beneath
+        // this call are a store lookup per key, a whole collection's worth of
+        // HMACs, and then the three writes that replace the collection -- and a
+        // disconnect anywhere in there drops the registry wholesale, so the
+        // reservation held here stops excluding the new connection's own sync
+        // from the very rows about to be written. So the apply asks again, on
+        // the far side of that work and in front of the first write.
+        // The counter, not `self`: the predicate is `Send + Sync` so it can be
+        // held across the awaits inside the apply, and `Client` carries trait
+        // objects that are neither on wasm.
+        let live = Arc::clone(&self.connection_generation);
+        let still_current = move || live.load(Ordering::Acquire) == generation;
+        // The recovery's own version, read before `apply_snapshot_recovery`
+        // moves `recovery`: it is the post-apply cursor for the semantic
+        // context below. `apply_snapshot_recovery` refuses a version-less
+        // recovery, so a missing version here means the apply below fails —
+        // defaulting to 0 keeps the log honest about what was observed.
+        let recovery_version = recovery
+            .version
+            .as_option()
+            .and_then(|v| v.version)
+            .unwrap_or(0);
+        match proc
+            .apply_snapshot_recovery(recovery, name, &still_current)
+            .await
+        {
+            Ok(wacore::appstate_sync::RecoveryOutcome::Applied(mutations)) => {
+                info!(
+                    target: "Client/AppState",
+                    "Recovered the {name} collection from the primary device: {} record(s)",
+                    mutations.len()
+                );
+                wacore::telemetry::appstate_mutations(mutations.len() as u64);
+                // Announced unconditionally, even if the connection has gone in
+                // the meantime. The rows are committed and the collection now
+                // reads as current, so the next sync starts past these records
+                // and they are never offered again -- withholding them here
+                // would lose a mute or an archive for good. And what they
+                // describe is the account, not the session that learned it,
+                // which is why the ordinary sync path dispatches the same way.
+                // Contextual dispatch, like the sync paths: without it these
+                // mutations would lose their per-mutation line entirely and
+                // recreate the original gap ("N records, but which ones?")
+                // for exactly the recovery path that exists to unstick a
+                // collection. `full_sync = true`: a recovery replaces the
+                // whole collection, so per-mutation lines stay at TRACE.
+                let total = mutations.len();
+                for (position, mut m) in mutations.into_iter().enumerate() {
+                    self.dispatch_app_state_mutation(
+                        &mut m,
+                        true,
+                        (patch_name, recovery_version, position + 1, total),
+                    )
+                    .await;
+                }
+            }
+            Ok(wacore::appstate_sync::RecoveryOutcome::Retired) => {
+                debug!(
+                    target: "Client/AppState",
+                    "Dropping the {name} recovery: the connection it belongs to went before it was written"
+                );
+            }
+            Ok(wacore::appstate_sync::RecoveryOutcome::Stale { held, offered }) => {
+                info!(
+                    target: "Client/AppState",
+                    "Discarding the primary's {name} at v{offered}: this side already holds v{held}"
+                );
+            }
+            Err(e) => {
+                // The marker stays taken. One request was answered, and this was
+                // the answer -- no second reply is coming, so putting it back
+                // would only suppress the next ask for the rest of the window
+                // while the collection stayed stuck.
+                //
+                // What happens instead is the next sync of this collection: the
+                // snapshot fails to validate exactly as before and escalates
+                // again. That is not necessarily soon -- the retry rounds that
+                // produced this ask may already be spent -- so the honest
+                // statement is that the collection stays where it was until the
+                // next connection syncs it, which is where it was anyway.
+                warn!(
+                    target: "Client/AppState",
+                    "Failed to apply the snapshot recovery for {name}: {e}"
+                );
+            }
         }
     }
 
-    async fn dispatch_app_state_mutation(
+    /// Ask the primary for a collection whose snapshot this side cannot validate.
+    ///
+    /// A snapshot MAC that does not match is the one app-state failure with
+    /// nothing behind it: the server serves the same bytes on every retry, they
+    /// fail the same way, and the collection stays at version 0 for ever --
+    /// which means every mutation written to it (a chat marked read, a mute, an
+    /// archive) is refused with a conflict that can never resolve. WA Web treats
+    /// it as an expected condition and asks the phone; so does this.
+    ///
+    /// Narrow on purpose. A missing key is answered by a key share and a bad
+    /// decode is answered by nothing, so only the mismatch escalates, and only
+    /// after the error has been carried here as itself rather than as a string.
+    ///
+    /// `critical_block` is excluded for the reason WA Web excludes it: it is the
+    /// block list, and rebuilding it from a device that may itself be behind is
+    /// the one collection where being wrong means talking to somebody who was
+    /// blocked.
+    async fn escalate_to_snapshot_recovery(&self, name: WAPatchName, err: &anyhow::Error) {
+        use wacore::appstate::AppStateError;
+
+        // A snapshot that omits its MAC or key id is refused by the same gate
+        // for the same reason -- unverified records are not applied -- and
+        // leaves the collection just as stuck. WA Web's anti-tampering compares
+        // against a possibly-undefined mac and reaches recovery either way.
+        if !matches!(
+            err.downcast_ref::<AppStateError>(),
+            Some(AppStateError::SnapshotMACMismatch | AppStateError::SnapshotMACMissing)
+        ) {
+            return;
+        }
+        if name == WAPatchName::CriticalBlock {
+            warn!(
+                target: "Client/AppState",
+                "Not asking the primary to rebuild {name:?}: the block list is not recovered this way"
+            );
+            return;
+        }
+
+        // The rollout gate WA Web reads. Honoured when the server has actually
+        // spoken: a `0` is the account being told the primary cannot do this,
+        // and asking anyway spends a whole-collection request every window on a
+        // device that will ignore it. Absence is not a refusal, though -- this
+        // client is not on WhatsApp's rollout and may simply never be sent the
+        // prop, and treating silence as "no" would turn the escalation off for
+        // everyone it exists to help.
+        if self
+            .ab_props()
+            .get(wacore::iq::abprops::web::ENABLE_PEER_SNAPSHOT_RECOVERY)
+            .await
+            .is_some_and(|value| value == "0" || value.eq_ignore_ascii_case("false"))
+        {
+            warn!(
+                target: "Client/AppState",
+                "Not asking the primary to rebuild {name:?}: the account has peer snapshot recovery turned off"
+            );
+            return;
+        }
+
+        info!(
+            target: "Client/AppState",
+            "Asking the primary device to send back {name:?}: its snapshot did not validate here"
+        );
+        // The send needs an owned handle and the sync path holds `&self`; this
+        // is the same weak-self route the other `&self` callers here take.
+        let Some(client) = self.self_weak.get().and_then(|w| w.upgrade()) else {
+            warn!(
+                target: "Client/AppState",
+                "Could not ask the primary to rebuild {name:?}: the client is going away"
+            );
+            return;
+        };
+        if let Err(e) = client.request_syncd_snapshot_recovery(name.as_str()).await {
+            warn!(
+                target: "Client/AppState",
+                "Could not ask the primary to rebuild {name:?}: {e}"
+            );
+        }
+    }
+}
+
+/// What one app-state mutation did, as a value rather than a bare bool.
+///
+/// Private and zero-allocation: every variant borrows nothing and carries only
+/// a `&'static str` — the event it dispatched, or why nothing was emitted.
+/// This is the single vocabulary for the whole dispatch chain: the
+/// sub-dispatchers in `crate::features` return it directly, and the top-level
+/// `dispatch_app_state_mutation` logs it per mutation.
+///
+/// `Event` means an event (or a persisted internal effect) was applied.
+/// `Malformed` means the command is known but its action payload was absent,
+/// so no event was emitted — still claimed, since no other dispatcher owns
+/// the command. `Skipped` means claimed without an effect for a benign reason
+/// (bad index, redundant state). `Unclaimed` means no dispatcher recognized
+/// the command; the next one should try. `EmptyIndex` is the degenerate case
+/// the top-level dispatcher reports when the mutation carries no index at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AppStateDispatchOutcome {
+    Event(&'static str),
+    Malformed(&'static str),
+    Skipped(&'static str),
+    Unclaimed,
+    EmptyIndex,
+}
+
+impl AppStateDispatchOutcome {
+    /// The rendering of the mutation's effect. Dispatched and not-dispatched
+    /// are visibly different: a known command whose payload was absent
+    /// (`Malformed`) or a claim without an effect (`Skipped`) must never read
+    /// as a bare event name, or a drifted mutation is indistinguishable from
+    /// a working one. The caller owns the `SET archive target=…` half.
+    fn effect(self) -> Cow<'static, str> {
+        match self {
+            Self::Event(name) => Cow::Borrowed(name),
+            Self::Malformed(name) => Cow::Owned(format!("{name} (malformed: no event)")),
+            Self::Skipped(name) => Cow::Owned(format!("{name} (skipped: no event)")),
+            Self::Unclaimed => Cow::Borrowed("unclaimed"),
+            Self::EmptyIndex => Cow::Borrowed("empty-index"),
+        }
+    }
+}
+
+/// What counts as unsafe for a log line — anything that can break the
+/// line discipline or drive a terminal — in one place so `sanitize_command`
+/// here and its twin in `wacore-appstate`'s processor can never disagree:
+///
+/// - C0 + DEL (`\u{0}..=\u{1F}`, `\u{7F}` — which covers `\n\r\t`),
+/// - C1 (`\u{80}..=\u{9F}`, including the SS2/CSI-adjacent controls),
+/// - the Unicode line/paragraph separators (`U+2028`/`U+2029`),
+/// - the bidirectional embedding/override controls
+///   (`U+202A..=U+202E`, `U+2066..=U+2069`), which reorder rendered text and
+///   are a classic log-spoofing vector,
+/// - the invisible direction marks (`U+061C`, `U+200E`, `U+200F`) plus the
+///   deprecated bidi/format controls (`U+206A..=U+206F`), which alter visual
+///   order/direction without showing as characters.
+///
+/// Plain `char::is_control` would also strip `\u{200B}`-style formatting
+/// characters that are harmless in a log; matching the
+/// line/terminal-affecting set explicitly keeps zero-width text intact while
+/// closing the spoofing surface. Keep the processor copy in sync — both are
+/// covered by the hostile-verb tests.
+fn is_log_unsafe(c: char) -> bool {
+    matches!(
+        c,
+        '\u{0}'..='\u{1F}'
+            | '\u{7F}'..='\u{9F}'
+            | '\u{061C}'
+            | '\u{200E}'
+            | '\u{200F}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{206F}'
+    )
+}
+
+/// Renders `index[0]` for a log line. Empty renders `<no-command>`. A verb
+/// no dispatcher claimed renders verbatim only if the protocol declares it
+/// (protocol-known but unhandled, e.g. `settings_sync` — worth naming so
+/// the gap is visible); anything else becomes `unknown=<fingerprint>`.
+/// Routing keys on the raw verb, so unknown commands still reach `Unclaimed`.
+fn render_command(command: &str, outcome: AppStateDispatchOutcome) -> String {
+    if command.is_empty() {
+        return "<no-command>".to_string();
+    }
+    if matches!(outcome, AppStateDispatchOutcome::Unclaimed)
+        && !crate::appstate_known_verbs::is_known_wire_name(command)
+        && command != "pin"
+        && command != "mark_chat_as_read"
+        && command != wacore::appstate::schemas_unlisted::LABEL_MESSAGE.name
+    {
+        return format!("unknown={}", fingerprint_id(command));
+    }
+    sanitize_command(command)
+}
+
+fn sanitize_command(command: &str) -> String {
+    const MAX_COMMAND_CHARS: usize = 48;
+    // Single-pass and bounded: sanitize and cap while iterating — memory
+    // O(48), CPU O(49) no matter how long the wire value is — stopping one
+    // char past the cap only to learn whether the ellipsis is needed.
+    // Materializing the whole wire string first would let a multi-MB verb
+    // dictate the allocation for a ~48-char log token. Kept next to the
+    // per-mutation line and the TRACE index projection it protects.
+    let mut out = String::new();
+    let mut chars = command.chars();
+    for _ in 0..MAX_COMMAND_CHARS {
+        let Some(c) = chars.next() else {
+            return out;
+        };
+        out.push(if is_log_unsafe(c) { '\u{FFFD}' } else { c });
+    }
+    if chars.next().is_some() {
+        out.push('\u{2026}');
+    }
+    out
+}
+
+/// An opaque fingerprint for any identifier that must stay correlatable
+/// across log lines within one run without ever printing whole: the first 8
+/// bytes of HMAC-SHA256 hex (`id#<16 hex chars>`), so short ids (`call-42`,
+/// `MSGID123`, `label123`) are masked exactly like long ones and no
+/// prefix/suffix of the real identifier leaks. Same input renders the same
+/// output within this process; 64 bits make accidental collision
+/// insignificant for log correlation. Computed only behind the DEBUG/TRACE
+/// gate, like every other projection here.
+///
+/// Keyed by a process-local secret: low-entropy ids (numeric label ids,
+/// timestamp-like quick-reply ids) are enumerable offline, so a plain hash
+/// would let an observer precompute candidates and match logged prefixes.
+/// The key is generated once per process from OS randomness, so fingerprints
+/// correlate within one run's logs but are meaningless across runs — which is
+/// exactly the window correlation needs. (Cross-run correlation would require
+/// a persisted secret; deliberately not done: it would turn the log into a
+/// long-lived join key for guessable ids.)
+///
+/// Module-private like every other projection here — except the
+/// sub-dispatchers reuse it for their own WARNs (see the re-export through
+/// `crate::client`): a malformed wire value must never reach the log
+/// verbatim either.
+pub(crate) fn fingerprint_id(id: &str) -> String {
+    use hmac::Mac;
+    use hmac::digest::KeyInit;
+    use std::sync::OnceLock;
+
+    static FINGERPRINT_KEY: OnceLock<[u8; 32]> = OnceLock::new();
+    let key = FINGERPRINT_KEY.get_or_init(|| {
+        use rand::RngExt;
+        rand::make_rng::<rand::rngs::StdRng>().random()
+    });
+
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(key).expect("any key length is valid");
+    mac.update(id.as_bytes());
+    let digest = mac.finalize().into_bytes();
+    format!(
+        "id#{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7],
+    )
+}
+
+/// The kind a single index element has for logging: either a JID-shaped
+/// account reference or an opaque identifier. Decided by schema position,
+/// never by sniffing the value for `@` — an opaque id may legally contain
+/// one (e.g. a caller-provided label id).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexLogKind {
+    Jid,
+    Opaque,
+    /// A wire flag that is exactly `"0"` / `"1"` (`from_me`, `writer_flag`,
+    /// the `"0"` participant sentinel). Anything else in such a slot is an
+    /// opaque value, not a flag.
+    Flag,
+}
+
+/// Redact a `Jid` for a log line: the user part is fully masked
+/// (`…@server`) and only the server stays whole, so `s.whatsapp.net` vs
+/// `g.us` vs `lid` routing is still answerable without keeping any digits
+/// of the account. Typed, not stringly: callers holding a validated `Jid`
+/// redact through here instead of re-rendering it into the log.
+///
+/// Module-private like every other projection here — except the
+/// sub-dispatchers reuse it for their own `debug!`s (see the re-export
+/// through `crate::client`): an outgoing action log must never print the
+/// account it acts on either.
+pub(crate) fn redact_jid(jid: &Jid) -> String {
+    use std::fmt::Write;
+    // `Server::as_str` is a static table — no wire text reaches the line —
+    // so the surviving server half needs no sanitization, and the masked
+    // user half is a fixed literal.
+    let server = jid.server.as_str();
+    let mut out = String::with_capacity(server.len() + 4);
+    out.push('…');
+    out.push('@');
+    let _ = write!(out, "{server}");
+    out
+}
+
+/// Redact a value sitting in a position the schema declares as a JID:
+/// a value that parses as a JID with a known server redacts to
+/// `…@server`, anything else (corrupt wire data, a future shape, an opaque
+/// value where a JID was expected) fingerprints instead of leaking verbatim.
+/// Parsing — not `contains('@')` — is the trust boundary: `x@CUSTOMER_ID`
+/// has an `@` but is not a JID, and must never keep its suffix. The `"0"`
+/// participant sentinel passes through: it means "no participant", not an
+/// identifier.
+///
+/// Module-private: all JID-declared positions route through it.
+fn redact_jid_or_fingerprint(arg: &str) -> String {
+    if arg == "0" {
+        return "0".to_string();
+    }
+    match wacore_binary::jid::parse_jid_ref(arg) {
+        Some(jid) => format!("…@{}", jid.server.as_str()),
+        None => fingerprint_id(arg),
+    }
+}
+
+/// Command-aware semantic projection of the full index for TRACE.
+///
+/// Positional, because every command owns its index shape:
+///
+/// - JID positions redact via [`redact_jid_or_fingerprint`] (`…@server`),
+/// - every other position fingerprints via [`fingerprint_id`]
+///   (`label=id#<hex>`), so correlated mutations stay correlatable without
+///   printing any identifier whole.
+///
+/// Unknown commands are conservative: the verb plus redacted/fingerprinted
+/// elements, with no positional labels invented for a shape nobody declared
+/// and — critically — no assumption that `index[1]` is a JID. Any element
+/// that is not JID-shaped fingerprints, so an opaque
+/// TRACE must never serialize `m.index` verbatim: past the target it can
+/// carry chat JIDs, message ids and participant JIDs, which would bypass
+/// the DEBUG-level redaction. The projection itself is bounded too:
+/// [`MAX_LOG_INDEX_PARTS`] elements past the verb (see below), so a
+/// malformed index with tens of thousands of elements costs one short
+/// line, not a `Vec<String>` plus an HMAC per element.
+fn redacted_index(
+    m: &crate::appstate_sync::Mutation,
+    outcome: AppStateDispatchOutcome,
+) -> Vec<String> {
+    use IndexLogKind::{Flag, Jid, Opaque};
+
+    let command = m.index.first().map(String::as_str).unwrap_or("");
+    // The schema shape per command, as kinds from index 1 on. Shapes mirror
+    // the dispatchers: chat message keys are `[cmd, chat, msg_id, from_me,
+    // participant]`; label_message is `[cmd, label_id, chat, msg_id,
+    // from_me, participant]` (same message-key tail, see `LABEL_MESSAGE`);
+    // call_log is `[cmd, creator, call_id, writer_flag]`; deleteChat is
+    // `[cmd, chat, deleteMedia]` and clearChat is
+    // `[cmd, chat, deleteStarred, deleteMedia]`. Unknown commands
+    // declare nothing and fall back to per-element classification below, so
+    // no shape is ever guessed from the value's content.
+    let shape: &[IndexLogKind] = match command {
+        "star" | "deleteMessageForMe" => &[Jid, Opaque, Flag, Jid],
+        // Full message-key tail: `from_me` is a declared `Flag` (renders
+        // `from_me=1`, never a fingerprint), `participant` a `Jid` (the
+        // `"0"` absent-participant sentinel passes through). Truncating
+        // here would leave `"1"` to the fallback and read the same slot
+        // as `"0"`/`id#…` depending on its value — semantically backwards.
+        "label_message" => &[Opaque, Jid, Opaque, Flag, Jid],
+        "label_jid" => &[Opaque, Jid],
+        "call_log" => &[Jid, Opaque, Flag],
+        // `deleteChat`/`clearChat` carry their destructive flags in the
+        // index tail (see the schemas and the dispatcher below):
+        // `[cmd, chat, deleteMedia]` and
+        // `[cmd, chat, deleteStarred, deleteMedia]`. Declared as `Flag`
+        // so TRACE renders `delete_media=1` instead of fingerprinting
+        // `"1"` while `"0"` passes through — the old `&[Jid]` shape
+        // left `"1"` to the fallback and read `false`/`true` as
+        // `"0"`/`id#…`, which is semantically backwards.
+        "deleteChat" => &[Jid, Flag],
+        "clearChat" => &[Jid, Flag, Flag],
+        "mute" | "pin" | "pin_v1" | "archive" | "contact" | "mark_chat_as_read"
+        | "markChatAsRead" | "lock" | "userStatusMute" => &[Jid],
+        "quick_reply"
+        | "label_edit"
+        | "nct_salt_sync"
+        | "setting_pushName"
+        | "setting_disableLinkPreviews" => &[Opaque],
+        _ => &[],
+    };
+    // Positional labels for the fingerprinted slots, for readability
+    // (`msg=id#…` rather than a bare hash). Flags with labels render as
+    // `delete_media=1` / `from_me=0` instead of a bare `1`/`0`, so the
+    // TRACE line names what the flag decided; JID slots need no label
+    // (`…@server` is self-describing).
+    let labels: &[&str] = match command {
+        "star" | "deleteMessageForMe" => &["", "msg", "from_me", ""],
+        "label_message" => &["label", "chat", "msg", "from_me", ""],
+        "label_jid" => &["label", "chat"],
+        "call_log" => &["", "call", "writer_flag"],
+        "deleteChat" => &["", "delete_media"],
+        "clearChat" => &["", "delete_starred", "delete_media"],
+        "quick_reply" => &["id"],
+        "label_edit" => &["label"],
+        "nct_salt_sync" => &["salt"],
+        "setting_pushName" => &["push_name"],
+        "setting_disableLinkPreviews" => &["setting"],
+        _ => &[],
+    };
+    fn render(kind: IndexLogKind, label: &str, arg: &str) -> String {
+        match kind {
+            Jid => redact_jid_or_fingerprint(arg),
+            // A declared `"0"`/`"1"` wire flag: with a label it names
+            // the decision (`delete_media=1`), without one (star's
+            // participant-absent tail, unknown tail shapes) it passes
+            // through bare. Anything else in a flag slot is opaque wire
+            // data, not a flag, so it fingerprints.
+            Flag if matches!(arg, "0" | "1") => {
+                if label.is_empty() {
+                    arg.to_string()
+                } else {
+                    format!("{label}={arg}")
+                }
+            }
+            Flag => fingerprint_id(arg),
+            Opaque if label.is_empty() => fingerprint_id(arg),
+            Opaque => format!("{label}={}", fingerprint_id(arg)),
+        }
+    }
+    // Known schemas have tiny indexes (a verb plus ≤4 positions), so cap
+    // the projection: without it one malformed mutation with 50k elements
+    // turns the TRACE record into a memory/CPU amplification vector (a
+    // `Vec<String>` plus an HMAC for every element). The tail count keeps
+    // the truncation explicit instead of silently dropping positions.
+    const MAX_LOG_INDEX_PARTS: usize = 8;
+    let total_parts = m.index.len().saturating_sub(1);
+    let shown_parts = total_parts.min(MAX_LOG_INDEX_PARTS);
+    let mut out = Vec::with_capacity(shown_parts + 2);
+    for (i, arg) in m.index.iter().take(shown_parts + 1).enumerate() {
+        if i == 0 {
+            out.push(render_command(arg, outcome));
+        } else if let Some((kind, label)) =
+            shape.get(i - 1).copied().zip(labels.get(i - 1).copied())
+        {
+            out.push(render(kind, label, arg));
+        } else {
+            // Beyond the declared shape (or an unknown command): classify by
+            // element — JID-parsable redacts, anything else fingerprints —
+            // so a future shape leaks nothing either way.
+            out.push(redact_jid_or_fingerprint(arg));
+        }
+    }
+    if total_parts > shown_parts {
+        out.push(format!("… +{} more", total_parts - shown_parts));
+    }
+    out
+}
+
+/// Render the mutation's routing targets for the semantic line, command-aware
+/// like [`redacted_index`]: JID positions redact, opaque ids fingerprint, so
+/// caller-provided ids (quick-reply ids, label ids — free-form strings via
+/// the public API) never print whole on the DEBUG line either. Multi-target
+/// commands join with spaces (`label=id#… chat=…@g.us`), which also
+/// fixes `label_jid` previously showing only the label id as `target` while
+/// hiding the affected chat. Never the full index: positions past the target
+/// can carry participant JIDs.
+fn mutation_target(m: &crate::appstate_sync::Mutation) -> Option<String> {
+    let command = m.index.first().map(String::as_str).unwrap_or("");
+    let get = |i: usize| m.index.get(i);
+    // Declared-JID positions go through the shared helper so a malformed
+    // value (no `@`) fingerprints instead of leaking verbatim.
+    let jid = |i: usize| get(i).map(|j| redact_jid_or_fingerprint(j));
+    let fp = |label: &str, i: usize| get(i).map(|id| format!("{label}={}", fingerprint_id(id)));
+    match command {
+        // Opaque single-arg commands: fingerprint, never `target=`.
+        "quick_reply" => fp("id", 1),
+        "label_edit" => fp("label", 1),
+        "star" | "deleteMessageForMe" => match (jid(1), fp("msg", 2)) {
+            (Some(chat), Some(msg)) => Some(format!("chat={chat} {msg}")),
+            (Some(chat), None) => Some(format!("chat={chat}")),
+            (None, Some(msg)) => Some(msg),
+            (None, None) => None,
+        },
+        "label_jid" => match (fp("label", 1), jid(2)) {
+            (Some(label), Some(chat)) => Some(format!("{label} chat={chat}")),
+            (Some(label), None) => Some(label),
+            (None, Some(chat)) => Some(format!("chat={chat}")),
+            (None, None) => None,
+        },
+        "label_message" => {
+            let mut parts = Vec::with_capacity(3);
+            if let Some(label) = fp("label", 1) {
+                parts.push(label);
+            }
+            if let Some(chat) = jid(2) {
+                parts.push(format!("chat={chat}"));
+            }
+            if let Some(msg) = fp("msg", 3) {
+                parts.push(msg);
+            }
+            (!parts.is_empty()).then(|| parts.join(" "))
+        }
+        "call_log" => match (jid(1), fp("call", 2)) {
+            (Some(creator), Some(call)) => Some(format!("creator={creator} {call}")),
+            (Some(creator), None) => Some(format!("creator={creator}")),
+            (None, Some(call)) => Some(call),
+            (None, None) => None,
+        },
+        // JID-targeted chat commands and everything else with a JID at
+        // index 1, via the shared helper so malformed values fingerprint
+        // instead of leaking verbatim (opaque, possibly caller-provided).
+        _ => get(1).map(|target| format!("target={}", redact_jid_or_fingerprint(target))),
+    }
+}
+
+/// The effect half of the per-mutation line that depends on the action payload
+/// but must never leak it: booleans and counters only.
+///
+/// A `Copy` enum, formatted only at the log site: building the `String` up
+/// front would allocate on every mutation even when no per-mutation record
+/// can be emitted (logging off, or a cursor-less caller). `None` means the
+/// command has no scalar worth reporting (or its payload was absent).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MutationEffectDetail {
+    Bool(&'static str, bool),
+    BoolUntil(&'static str, bool, i64),
+    /// Two destructive flags carried in the index tail rather than the
+    /// proto (see `deleteChat`/`clearChat` below): rendered as
+    /// `delete_starred=false delete_media=true` on the DEBUG line.
+    TwoBools(&'static str, bool, &'static str, bool),
+}
+
+impl MutationEffectDetail {
+    fn render(self, out: &mut String) {
+        use std::fmt::Write;
+        match self {
+            Self::Bool(name, b) => {
+                let _ = write!(out, "{name}={b}");
+            }
+            Self::BoolUntil(name, b, until) => {
+                let _ = write!(out, "{name}={b} until={until}");
+            }
+            Self::TwoBools(n1, b1, n2, b2) => {
+                let _ = write!(out, "{n1}={b1} {n2}={b2}");
+            }
+        }
+    }
+}
+
+fn mutation_effect_detail(m: &crate::appstate_sync::Mutation) -> Option<MutationEffectDetail> {
+    let command = m.index.first().map(String::as_str).unwrap_or("");
+    let v = m.action_value.as_ref()?;
+    match command {
+        "archive" => v
+            .archive_chat_action
+            .as_option()
+            .and_then(|a| a.archived)
+            .map(|b| MutationEffectDetail::Bool("archived", b)),
+        "pin" | "pin_v1" => v
+            .pin_action
+            .as_option()
+            .and_then(|a| a.pinned)
+            .map(|b| MutationEffectDetail::Bool("pinned", b)),
+        "mute" => {
+            let a = v.mute_action.as_option()?;
+            let muted = a.muted?;
+            Some(match a.mute_end_timestamp {
+                Some(until) => MutationEffectDetail::BoolUntil("muted", muted, until),
+                None => MutationEffectDetail::Bool("muted", muted),
+            })
+        }
+        "mark_chat_as_read" | "markChatAsRead" => v
+            .mark_chat_as_read_action
+            .as_option()
+            .and_then(|a| a.read)
+            .map(|b| MutationEffectDetail::Bool("read", b)),
+        "star" => v
+            .star_action
+            .as_option()
+            .and_then(|a| a.starred)
+            .map(|b| MutationEffectDetail::Bool("starred", b)),
+        "lock" => v
+            .lock_chat_action
+            .as_option()
+            .and_then(|a| a.locked)
+            .map(|b| MutationEffectDetail::Bool("locked", b)),
+        // `delete_media` lives in the proto here (unlike
+        // `deleteChat`/`clearChat`, whose flags are index-tail). Absent
+        // field reads as false, the protobuf default.
+        "deleteMessageForMe" => v
+            .delete_message_for_me_action
+            .as_option()
+            .map(|a| MutationEffectDetail::Bool("delete_media", a.delete_media.unwrap_or(false))),
+        // The destructive flags live in the index tail, not the proto
+        // (schemas `DELETE_CHAT`/`CLEAR_CHAT`, dispatcher reads them the
+        // same way): the DEBUG line must answer "what was actually
+        // deleted", not just which chat. Missing element means the
+        // sender omitted it — same defaults as dispatch (`deleteChat`
+        // defaults media to true, `clearChat` defaults both to false).
+        "deleteChat" => v.delete_chat_action.as_option().map(|_| {
+            MutationEffectDetail::Bool("delete_media", m.index.get(2).is_none_or(|f| f != "0"))
+        }),
+        "clearChat" => v.clear_chat_action.as_option().map(|_| {
+            MutationEffectDetail::TwoBools(
+                "delete_starred",
+                m.index.get(2).is_some_and(|f| f == "1"),
+                "delete_media",
+                m.index.get(3).is_some_and(|f| f == "1"),
+            )
+        }),
+        "userStatusMute" => v
+            .user_status_mute_action
+            .as_option()
+            .and_then(|a| a.muted)
+            .map(|b| MutationEffectDetail::Bool("muted", b)),
+        "quick_reply" => v
+            .quick_reply_action
+            .as_option()
+            .and_then(|a| a.deleted)
+            .map(|b| MutationEffectDetail::Bool("deleted", b)),
+        "setting_disableLinkPreviews" => v
+            .privacy_setting_disable_link_previews_action
+            .as_option()
+            .and_then(|a| a.is_previews_disabled)
+            .map(|b| MutationEffectDetail::Bool("disabled", b)),
+        "label_edit" => v
+            .label_edit_action
+            .as_option()
+            .and_then(|a| a.deleted)
+            .map(|b| MutationEffectDetail::Bool("deleted", b)),
+        "label_jid" | "label_message" => v
+            .label_association_action
+            .as_option()
+            .and_then(|a| a.labeled)
+            .map(|b| MutationEffectDetail::Bool("labeled", b)),
+        _ => None,
+    }
+}
+
+/// Emit the semantic per-mutation line.
+///
+/// DEBUG carries collection, version/cursor, operation, command, redacted
+/// target, scalar effect and outcome — everything the consumer asked for.
+/// TRACE adds the full index, ordinal, timestamp and handler. WARN is reserved
+/// for a known command whose expected payload is absent (protocol drift), and
+/// is emitted by the caller when the outcome is `Malformed`. Never the
+/// `SyncActionValue`, the NCT salt, a push name, quick-reply text or key
+/// material: the detail helpers above project only booleans and counters.
+/// `MutationLine` exists only to keep [`log_mutation_dispatched`] at seven
+/// args: the batch cursor (collection/version/position/total) travels as one.
+struct MutationLine {
+    collection: WAPatchName,
+    version: u64,
+    position: usize,
+    total: usize,
+}
+
+fn log_mutation_dispatched(
+    cursor: MutationLine,
+    log_full_sync: bool,
+    handler: &'static str,
+    m: &crate::appstate_sync::Mutation,
+    outcome: AppStateDispatchOutcome,
+    effect_detail: Option<MutationEffectDetail>,
+) {
+    use log::{Level, log_enabled};
+
+    // Exactly one record per mutation, at exactly one level. Live sync reports
+    // at DEBUG (the processor aggregate plus one line per mutation); full sync
+    // replays whole collections, so the aggregate stays DEBUG and each
+    // mutation drops to TRACE. Every path — including empty-index — routes
+    // through here, so the policy holds everywhere by construction.
+    // `log_full_sync` is the *logging* mode only: event provenance travels
+    // separately (see `dispatch_app_state_mutation_inner`), so a snapshot
+    // replayed for log-volume reasons never rewrites what the event claims.
+    if log_full_sync {
+        if !log_enabled!(target: "Client/AppState", Level::Trace) {
+            return;
+        }
+    } else if !log_enabled!(target: "Client/AppState", Level::Debug) {
+        return;
+    }
+    let MutationLine {
+        collection,
+        version,
+        position,
+        total,
+    } = cursor;
+    let op = match m.operation {
+        wa::syncd_mutation::SyncdOperation::SET => "SET",
+        wa::syncd_mutation::SyncdOperation::REMOVE => "REMOVE",
+    };
+    let command = m.index.first().map(String::as_str).unwrap_or("");
+    // `cursor=` names the page end cursor explicitly: the page concatenates
+    // snapshot + patches and the processor returns one final state, so this
+    // is the cursor the page ended at — not each mutation's birth version.
+    // Per-patch `Decoded … vN` lines keep the exact granularity.
+    // Untrusted verb slot: claimed commands render, anything unclaimed
+    // becomes `unknown=id#…`. Routing keys on the raw verb (`Unclaimed`).
+    let mut line = format!(
+        "{collection:?} cursor={version} [{position}/{total}] {op} {}",
+        render_command(command, outcome)
+    );
+    // `mutation_target` already returns `id=…` for `quick_reply` (see above),
+    // so no second arm is needed here.
+    if let Some(target) = mutation_target(m) {
+        line.push(' ');
+        line.push_str(&target);
+    }
+    // Pre-captured before dispatch: the sub-dispatchers move the action out of
+    // the mutation with `take()`, so reading it here would see an empty field
+    // on every successful mutation and drop the advertised scalar. Rendered
+    // here, at the log site, so no `String` exists until a record is emitted.
+    if let Some(detail) = effect_detail {
+        line.push(' ');
+        detail.render(&mut line);
+    }
+    line.push_str(&format!(" -> {}", outcome.effect()));
+    // One record, one level: DEBUG for live, TRACE for full sync (see the gate
+    // at the top of this function). TRACE carries the redacted projection of
+    // the index — never `m.index` verbatim, whose tail can hold chat JIDs,
+    // message ids and participant JIDs — and the DEBUG record carries no index
+    // at all, so enabling TRACE never duplicates a mutation's line at two
+    // levels and never bypasses the redaction. `log_full_sync` reports the
+    // logging mode, not event provenance: a snapshot replayed at TRACE is
+    // still `event_full_sync=false` on the event itself.
+    if log_full_sync {
+        // Timestamps route ordering questions.
+        let ts = m.action_value.as_ref().and_then(|v| v.timestamp);
+        trace!(
+            target: "Client/AppState",
+            "{line} (ordinal={position}/{total} index={:?} timestamp={ts:?} \
+             log_full_sync={log_full_sync} handler={handler})",
+            redacted_index(m, outcome)
+        );
+    } else {
+        debug!(target: "Client/AppState", "{line}");
+    }
+}
+
+impl Client {
+    /// Dispatch one app-state mutation, returning its [`AppStateDispatchOutcome`].
+    ///
+    /// `&mut` so a dispatcher can move the action out of the mutation into
+    /// its event instead of deep-cloning it: a full sync dispatches every
+    /// mutation of every collection through here.
+    ///
+    /// `ctx` is `(collection, version, position, total)` and produces the
+    /// per-mutation record: DEBUG for live sync, TRACE for full sync (see
+    /// [`log_mutation_dispatched`]). The per-batch aggregate is separate and
+    /// is emitted by the processor, not here. Returns the outcome so tests
+    /// can assert on it without parsing logs.
+    ///
+    /// The normal path: event provenance and logging mode agree. The 409
+    /// conflict absorb is the exception — it replays a snapshot at TRACE
+    /// while keeping `event_full_sync=false` — and calls
+    /// `dispatch_app_state_mutation_inner` directly for that.
+    pub(crate) async fn dispatch_app_state_mutation(
         &self,
-        m: &crate::appstate_sync::Mutation,
+        m: &mut crate::appstate_sync::Mutation,
         full_sync: bool,
-    ) {
+        ctx: (WAPatchName, u64, usize, usize),
+    ) -> AppStateDispatchOutcome {
+        self.dispatch_app_state_mutation_inner(m, full_sync, full_sync, Some(ctx))
+            .await
+    }
+
+    /// Split dispatch: `event_full_sync` is public event provenance (lands
+    /// on `*.from_full_sync` in every emitted event) while `log_full_sync`
+    /// only selects the per-mutation log level (DEBUG vs TRACE). They agree
+    /// on every path except the 409 conflict absorb, which replays a
+    /// snapshot's worth of mutations at TRACE volume without claiming the
+    /// events came from a full sync — the base passed `false` there, and
+    /// this PR is observability-only, so the events must keep saying
+    /// `false` too. Separate names so the two can never be confused again.
+    async fn dispatch_app_state_mutation_inner(
+        &self,
+        m: &mut crate::appstate_sync::Mutation,
+        event_full_sync: bool,
+        log_full_sync: bool,
+        ctx: Option<(WAPatchName, u64, usize, usize)>,
+    ) -> AppStateDispatchOutcome {
+        use crate::client::AppStateDispatchOutcome;
         use wacore::types::events::Event;
 
+        // Whether any per-mutation record can be emitted at all: without a
+        // cursor there is no line to write, and without the level there is no
+        // reader. Computed once, before dispatch, so the scalar capture below
+        // and the `format!`s inside the logger cost nothing when observability
+        // is off — a full-sync snapshot can carry thousands of mutations.
+        // Gated on the *logging* mode: a snapshot replayed at TRACE volume
+        // still carries `event_full_sync=false` on the event.
+        let wants_semantic_log = ctx.is_some()
+            && if log_full_sync {
+                log::log_enabled!(target: "Client/AppState", log::Level::Trace)
+            } else {
+                log::log_enabled!(target: "Client/AppState", log::Level::Debug)
+            };
+        // Capture the scalar detail BEFORE dispatch: the sub-dispatchers move
+        // the action out of the mutation with `take()`, so reading it inside
+        // the report closure would see an empty field on every successful
+        // mutation and drop the advertised `archived=`/`pinned=`/`read=`….
+        // A `Copy` enum rendered at the log site: no `String` is allocated
+        // unless a record is actually emitted.
+        let effect_detail = wants_semantic_log
+            .then(|| mutation_effect_detail(m))
+            .flatten();
+        // One small helper so every arm logs the same line shape. `handler`
+        // names the dispatcher that claimed the mutation.
+        let report = |handler: &'static str,
+                      m: &crate::appstate_sync::Mutation,
+                      outcome: AppStateDispatchOutcome,
+                      effect_detail: Option<MutationEffectDetail>| {
+            if let Some((collection, version, position, total)) = ctx {
+                let cursor = MutationLine {
+                    collection,
+                    version,
+                    position,
+                    total,
+                };
+                // The level policy lives in `log_mutation_dispatched`: DEBUG
+                // per mutation for live sync, TRACE for full sync (DEBUG keeps
+                // only the processor aggregate). No gate here, so the helper
+                // cannot disagree with its caller about what "lowered to
+                // TRACE" means. Logging mode, not event provenance.
+                log_mutation_dispatched(cursor, log_full_sync, handler, m, outcome, effect_detail);
+            }
+            // Protocol drift: WARN names the command, DEBUG showed the line.
+            if let AppStateDispatchOutcome::Malformed(event) = outcome {
+                let command = m.index.first().map(String::as_str).unwrap_or("");
+                warn!(
+                    target: "Client/AppState",
+                    "{} mutation missing {event} payload; index has {} element(s)",
+                    render_command(command, outcome),
+                    m.index.len()
+                );
+            }
+            outcome
+        };
+
         if m.index.is_empty() {
-            return;
+            // No command to name and no dispatcher to try; still reported so
+            // the batch position is accounted for. Routes through the same
+            // level policy as every other mutation (TRACE in full sync).
+            if let Some((collection, version, position, total)) = ctx {
+                log_mutation_dispatched(
+                    MutationLine {
+                        collection,
+                        version,
+                        position,
+                        total,
+                    },
+                    log_full_sync,
+                    "none",
+                    m,
+                    AppStateDispatchOutcome::EmptyIndex,
+                    None,
+                );
+            }
+            return AppStateDispatchOutcome::EmptyIndex;
         }
 
         // NCT salt sync — handles both "set" (store salt) and "remove" (clear salt).
         // Source: WAWebNctSaltSync, syncd collection RegularHigh, action "nct_salt_sync".
+        // Only the byte count reaches the log; the salt itself never does.
         if m.index[0] == "nct_salt_sync" {
-            if m.operation == wa::syncd_mutation::SyncdOperation::Remove {
+            let outcome = if m.operation == wa::syncd_mutation::SyncdOperation::Remove {
                 debug!(target: "Client/AppState", "Removing NCT salt via app state sync");
                 self.persistence_manager
                     .process_command(DeviceCommand::SetNctSalt(None))
                     .await;
+                AppStateDispatchOutcome::Event("NctSaltCleared")
             } else if let Some(val) = &m.action_value
                 && let Some(act) = val.nct_salt_sync_action.as_option()
                 && let Some(salt) = &act.salt
             {
                 if salt.is_empty() {
                     warn!(target: "Client/AppState", "nct_salt_sync mutation has empty salt, ignoring");
+                    AppStateDispatchOutcome::Skipped("empty-salt")
                 } else {
                     debug!(target: "Client/AppState", "Stored NCT salt via app state sync ({} bytes)", salt.len());
                     self.persistence_manager
                         .process_command(DeviceCommand::SetNctSalt(Some(salt.clone())))
                         .await;
+                    AppStateDispatchOutcome::Event("NctSaltStored")
                 }
             } else {
-                warn!(target: "Client/AppState", "nct_salt_sync mutation missing salt in action value");
-            }
-            return;
+                // Warned once centrally by `report` (Malformed authority).
+                AppStateDispatchOutcome::Malformed("NctSaltStored")
+            };
+            return report("nct_salt", m, outcome, effect_detail);
         }
 
         // Delegate chat-related mutations (mute, pin, archive, star, contact, etc.).
         // Runs before the Set-only gate below because contact deletion arrives as
         // a `Remove`; the handler claims nothing else on that operation.
-        if crate::features::chat_actions::dispatch_chat_mutation(&self.core.event_bus, m, full_sync)
-        {
-            return;
+        // Event provenance, never the logging mode: what the event claims
+        // about `from_full_sync` must not change because the replay was
+        // logged at TRACE volume.
+        let chat_outcome = crate::features::chat_actions::dispatch_chat_mutation_outcome(
+            &self.core.event_bus,
+            m,
+            event_full_sync,
+        );
+        if chat_outcome != AppStateDispatchOutcome::Unclaimed {
+            return report("chat_actions", m, chat_outcome, effect_detail);
         }
 
         // All remaining mutations only care about Set operations
         if m.operation != wa::syncd_mutation::SyncdOperation::Set {
-            return;
+            return report("none", m, AppStateDispatchOutcome::Unclaimed, effect_detail);
         }
 
         // A call's direction is its creator compared against this account; the
         // predicate is only consulted once the mutation is known to be a call
         // log, so the other mutation kinds do not pay for the snapshot.
-        if crate::features::call_log::dispatch_call_log_mutation(
+        let outcome = crate::features::call_log::dispatch_call_log_mutation_outcome(
             &self.core.event_bus,
             m,
-            full_sync,
+            event_full_sync,
             |jid| self.is_own_jid(jid),
-        ) {
-            return;
+        );
+        if outcome != AppStateDispatchOutcome::Unclaimed {
+            return report("call_log", m, outcome, effect_detail);
         }
 
         // Label mutations have their own index shape (labelId, not a chat JID at
         // index[1]), so they are dispatched separately from chat actions.
-        if crate::features::labels::dispatch_label_mutation(&self.core.event_bus, m, full_sync) {
-            return;
+        let outcome = crate::features::labels::dispatch_label_mutation_outcome(
+            &self.core.event_bus,
+            m,
+            event_full_sync,
+        );
+        if outcome != AppStateDispatchOutcome::Unclaimed {
+            return report("labels", m, outcome, effect_detail);
         }
 
         // Quick replies and account-level syncd settings key on their own index
         // shapes (an opaque id, or no argument at all).
-        if crate::features::quick_replies::dispatch_quick_reply_mutation(
+        let outcome = crate::features::quick_replies::dispatch_quick_reply_mutation_outcome(
             &self.core.event_bus,
             m,
-            full_sync,
-        ) {
-            return;
+            event_full_sync,
+        );
+        if outcome != AppStateDispatchOutcome::Unclaimed {
+            return report("quick_replies", m, outcome, effect_detail);
         }
-        if crate::features::app_state_settings::dispatch_app_state_setting_mutation(
-            &self.core.event_bus,
-            m,
-            full_sync,
-        ) {
-            return;
+        let outcome =
+            crate::features::app_state_settings::dispatch_app_state_setting_mutation_outcome(
+                &self.core.event_bus,
+                m,
+                event_full_sync,
+            );
+        if outcome != AppStateDispatchOutcome::Unclaimed {
+            return report("app_state_settings", m, outcome, effect_detail);
         }
 
-        // Handle client-internal mutations that need persistence/presence access
-        if m.index[0] == "setting_pushName"
-            && let Some(val) = &m.action_value
-            && let Some(act) = val.push_name_setting.as_option()
-            && let Some(new_name) = &act.name
-        {
-            let new_name = new_name.clone();
-            let bus = self.core.event_bus.clone();
+        // Handle client-internal mutations that need persistence/presence access.
+        // The name itself never reaches the log: it is account PII, and the
+        // pre-existing DEBUG lines below already say only whether it changed.
+        if m.index[0] == "setting_pushName" {
+            let outcome = if let Some(val) = &m.action_value
+                && let Some(act) = val.push_name_setting.as_option()
+                && let Some(new_name) = &act.name
+            {
+                let new_name = new_name.clone();
+                let bus = self.core.event_bus.clone();
 
-            let snapshot = self.persistence_manager.get_device_snapshot();
-            let old = snapshot.push_name.clone();
-            if old != new_name {
-                debug!(target: "Client/AppState", "Persisting changed push name from app state mutation");
-                self.persistence_manager
-                    .process_command(DeviceCommand::SetPushName(new_name.clone()))
-                    .await;
-                bus.dispatch(Event::SelfPushNameUpdated(
-                    crate::types::events::SelfPushNameUpdated::builder()
-                        .from_server(true)
-                        .old_name(old.clone())
-                        .new_name(new_name.clone())
-                        .build(),
-                ));
+                let snapshot = self.persistence_manager.get_device_snapshot();
+                let old = snapshot.push_name.clone();
+                let outcome = if old != new_name {
+                    debug!(target: "Client/AppState", "Persisting changed push name from app state mutation");
+                    self.persistence_manager
+                        .process_command(DeviceCommand::SetPushName(new_name.clone()))
+                        .await;
+                    bus.dispatch(Event::SelfPushNameUpdated(
+                        crate::types::events::SelfPushNameUpdated::builder()
+                            .from_server(true)
+                            .old_name(old.clone())
+                            .new_name(new_name.clone())
+                            .build(),
+                    ));
 
-                // WhatsApp Web sends presence immediately when receiving pushname
-                if old.is_empty() && !new_name.is_empty() {
-                    debug!(target: "Client/AppState", "Sending presence after receiving initial pushname from app state sync");
-                    if let Err(e) = self.presence().set_available().await {
-                        warn!(target: "Client/AppState", "Failed to send presence after pushname sync: {e:?}");
+                    // WhatsApp Web sends presence immediately when receiving pushname
+                    if old.is_empty() && !new_name.is_empty() {
+                        match self.send_automatic_available().await {
+                            Ok(true) => {
+                                debug!(target: "Client/AppState", "Sent presence after receiving initial pushname from app state sync");
+                            }
+                            Ok(false) => {}
+                            Err(e) => {
+                                warn!(target: "Client/AppState", "Failed to send presence after pushname sync: {e:?}");
+                            }
+                        }
                     }
-                }
+                    AppStateDispatchOutcome::Event("SelfPushNameUpdated")
+                } else {
+                    debug!(target: "Client/AppState", "Push name mutation received but name unchanged");
+                    // No event dispatched, nothing persisted: a no-op. `Event`
+                    // would report a `SelfPushNameUpdated` that never existed;
+                    // `Skipped` says exactly what happened.
+                    AppStateDispatchOutcome::Skipped("unchanged-push-name")
+                };
+                // `report` borrows `m` while the outcome is already owned;
+                // hoist the return out of the `if let` so the borrow ends first.
+                let owned = outcome;
+                return report("push_name", m, owned, effect_detail);
             } else {
-                debug!(target: "Client/AppState", "Push name mutation received but name unchanged");
-            }
+                // Warned once centrally by `report` (Malformed authority).
+                AppStateDispatchOutcome::Malformed("SelfPushNameUpdated")
+            };
+            return report("push_name", m, outcome, effect_detail);
         }
+
+        report("none", m, AppStateDispatchOutcome::Unclaimed, effect_detail)
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.appstate.clean_dirty", level = "debug", skip_all, fields(bit = ?bit), err(Debug)))]
@@ -3103,6 +4580,821 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// JID redaction keeps routing answerable without leaking accounts:
+    /// a value that parses as a JID with a known server redacts to
+    /// `…@server` regardless of user length — even 8 retained digits of an
+    /// 11-digit number leave ~1,000 candidates — while anything else
+    /// fingerprints whole instead of leaking a suffix verbatim. The
+    /// `"0"` participant sentinel passes through: it means "no
+    /// participant", not an identifier.
+    #[test]
+    fn redact_jid_or_fingerprint_masks_every_jid_shape() {
+        assert_eq!(
+            redact_jid_or_fingerprint("5511999990042@s.whatsapp.net"),
+            "…@s.whatsapp.net"
+        );
+        assert_eq!(
+            redact_jid_or_fingerprint("120363000000000042@g.us"),
+            "…@g.us"
+        );
+        // Short users mask whole: length is no evidence of "not an
+        // account", and index strings are unvalidated wire text.
+        assert_eq!(
+            redact_jid_or_fingerprint("1@s.whatsapp.net"),
+            "…@s.whatsapp.net"
+        );
+        assert_eq!(
+            redact_jid_or_fingerprint("42@s.whatsapp.net"),
+            "…@s.whatsapp.net"
+        );
+        assert_eq!(redact_jid_or_fingerprint("12345678@g.us"), "…@g.us");
+        // LID and other known servers redact the same way.
+        assert_eq!(redact_jid_or_fingerprint("1234567890123456@lid"), "…@lid");
+        // An unknown server is not a JID at all: fingerprint whole instead
+        // of leaking the suffix verbatim.
+        assert_eq!(
+            redact_jid_or_fingerprint("x@CUSTOMER_INTERNAL_ID_42"),
+            fingerprint_id("x@CUSTOMER_INTERNAL_ID_42")
+        );
+        // Malformed values (no JID shape) fingerprint, never leak verbatim.
+        assert_eq!(
+            redact_jid_or_fingerprint("qr-id-1"),
+            fingerprint_id("qr-id-1")
+        );
+        assert_eq!(redact_jid_or_fingerprint("0"), "0");
+    }
+
+    /// Parsing — not `contains('@')` — is the trust boundary, and it must
+    /// be character-safe for any (unvalidated, JSON-decoded) input: a
+    /// multibyte user can never land a byte slice inside a code point, and
+    /// a control character smuggled into either half can neither forge log
+    /// lines nor emit escapes.
+    #[test]
+    fn redact_jid_or_fingerprint_never_panics_or_forges() {
+        let redacted = redact_jid_or_fingerprint("a\u{1F600}foooooooo@s.whatsapp.net");
+        assert_eq!(redacted, "…@s.whatsapp.net");
+        assert_eq!(
+            redact_jid_or_fingerprint("\u{00E9}b@s.whatsapp.net"),
+            "…@s.whatsapp.net"
+        );
+        for c in ['\n', '\u{85}', '\u{2028}', '\u{202E}'] {
+            // A control char anywhere in the value must not survive into
+            // the line — either the value redacts to a fixed server that
+            // cannot carry it, or it fingerprints whole.
+            for value in [
+                format!("user{c}name@s.whatsapp.net"),
+                format!("user@s.whatsapp.net{c}FORGED"),
+                format!("{c}@s.whatsapp.net"),
+            ] {
+                let redacted = redact_jid_or_fingerprint(&value);
+                assert!(!redacted.contains(c), "{value:?} leaked {c:?}");
+            }
+        }
+    }
+
+    /// TRACE must carry the redacted projection, never `m.index` verbatim:
+    /// the tail of `star` / `deleteMessageForMe` / `label_message` indexes can
+    /// hold chat JIDs, message ids and participant JIDs.
+    ///
+    /// Fingerprints are HMAC-SHA256 prefixes under a per-process random
+    /// key: nothing of the input leaks — not even for short ids — while the
+    /// same id stays correlatable across lines within this process.
+    #[test]
+    fn fingerprint_id_masks_short_and_long_ids_stably() {
+        // Keyed by a process-local secret: stable within this run (so lines
+        // correlate), meaningless across runs (so offline enumeration of
+        // low-entropy ids buys nothing). Assert shape + stability + masking,
+        // never a fixed digest — the key is random per process.
+        for id in ["MSGID123", "call-42", "abc"] {
+            let fp = fingerprint_id(id);
+            assert!(fp.starts_with("id#"), "{id} fingerprints, got {fp}");
+            assert_eq!(fp.len(), 3 + 16);
+            assert!(!fp.contains(id));
+        }
+        // Stable within the process; distinct inputs diverge (including the
+        // old head/tail-collision pair, which a prefix scheme conflated).
+        assert_eq!(fingerprint_id("abc"), fingerprint_id("abc"));
+        assert_ne!(
+            fingerprint_id("ABCD1111WXYZ"),
+            fingerprint_id("ABCD2222WXYZ")
+        );
+        // No byte of the input survives, whatever its length or charset.
+        for id in ["MSGID123", "3EB0284A7C9112345678", "a\u{1F600}bcdefghij"] {
+            let fp = fingerprint_id(id);
+            assert!(!fp.contains(id));
+            assert!(fp.starts_with("id#"));
+        }
+    }
+
+    #[test]
+    fn redacted_index_redacts_every_jid_shaped_element() {
+        use crate::appstate_sync::Mutation;
+
+        let msg_id = "3EB0284A7C9112345678";
+        let m = Mutation {
+            index: vec![
+                "star".to_string(),
+                "120363000000000042@g.us".to_string(),
+                msg_id.to_string(),
+                "1".to_string(),
+                "5511999990042@s.whatsapp.net".to_string(),
+            ],
+            operation: wa::syncd_mutation::SyncdOperation::SET,
+            action_value: None,
+        };
+        let redacted = redacted_index(&m, AppStateDispatchOutcome::Event("StarUpdate"));
+        assert_eq!(
+            redacted,
+            vec![
+                "star".to_string(),
+                "…@g.us".to_string(),
+                format!("msg={}", fingerprint_id(msg_id)),
+                "from_me=1".to_string(),
+                "…@s.whatsapp.net".to_string(),
+            ]
+        );
+        // No verbatim account or message id survives the projection.
+        for element in &redacted {
+            assert!(!element.contains("120363000000000042"));
+            assert!(!element.contains("5511999990042"));
+            assert!(!element.contains(msg_id));
+        }
+    }
+
+    /// Single-char opaque values fingerprint too: the length of the value
+    /// Only declared `from_me`/`writer_flag` slots pass through.
+    #[test]
+    fn redacted_index_fingerprints_single_char_ids() {
+        use crate::appstate_sync::Mutation;
+
+        for (command, index) in [
+            (
+                "star",
+                vec!["star", "120363000000000042@g.us", "X", "1", "0"],
+            ),
+            (
+                "call_log",
+                vec!["call_log", "5511999990042@s.whatsapp.net", "A", "0"],
+            ),
+        ] {
+            let m = Mutation {
+                index: index.into_iter().map(str::to_string).collect(),
+                operation: wa::syncd_mutation::SyncdOperation::SET,
+                action_value: None,
+            };
+            let redacted = redacted_index(&m, AppStateDispatchOutcome::Event("test"));
+            assert!(
+                redacted[2].starts_with("msg=id#") || redacted[2].starts_with("call=id#"),
+                "{command}: single-char id must fingerprint, got {}",
+                redacted[2]
+            );
+            assert!(!redacted[2].ends_with("=X") && !redacted[2].ends_with("=A"));
+        }
+        // …while the real flags still pass through untouched.
+        let flags = Mutation {
+            index: vec![
+                "star".to_string(),
+                "120363000000000042@g.us".to_string(),
+                "3EB0284A7C9112345678".to_string(),
+                "1".to_string(),
+                "0".to_string(),
+            ],
+            operation: wa::syncd_mutation::SyncdOperation::SET,
+            action_value: None,
+        };
+        let redacted = redacted_index(&flags, AppStateDispatchOutcome::Event("StarUpdate"));
+        assert_eq!(redacted[3], "from_me=1");
+        // The `"0"` participant sentinel means "no participant" and
+        // passes through untouched.
+        assert_eq!(redacted[4], "0");
+    }
+
+    /// A malformed index with tens of thousands of elements must not turn
+    /// the TRACE record into a memory/CPU amplification vector: the
+    /// projection shows [`MAX_LOG_INDEX_PARTS`]-worth of positions (here
+    /// via the 8-part cap) plus an explicit tail count.
+    #[test]
+    fn redacted_index_caps_huge_indexes() {
+        use crate::appstate_sync::Mutation;
+
+        let mut index = vec!["star".to_string(), "120363000000000042@g.us".to_string()];
+        index.extend((0..50_000).map(|i| format!("pad-{i}")));
+        let m = Mutation {
+            index,
+            operation: wa::syncd_mutation::SyncdOperation::SET,
+            action_value: None,
+        };
+        let redacted = redacted_index(&m, AppStateDispatchOutcome::Event("StarUpdate"));
+        // Verb + 8 parts + tail count.
+        assert_eq!(redacted.len(), 10);
+        assert_eq!(redacted[1], "…@g.us");
+        assert!(redacted.last().is_some_and(|t| t.starts_with("… +")));
+        for element in &redacted {
+            assert!(!element.contains("pad-"));
+        }
+    }
+
+    /// `call_log`'s fourth element is a writer flag with disputed meaning
+    /// (see `call_log.rs`): TRACE reports it as `writer_flag=`, asserting
+    /// the wire value without claiming the semantics.
+    #[test]
+    fn redacted_index_reports_call_log_writer_flag() {
+        use crate::appstate_sync::Mutation;
+
+        let call_id = "3EB0284A7C9112345678";
+        let m = Mutation {
+            index: vec![
+                "call_log".to_string(),
+                "5511999990042@s.whatsapp.net".to_string(),
+                call_id.to_string(),
+                "0".to_string(),
+            ],
+            operation: wa::syncd_mutation::SyncdOperation::SET,
+            action_value: None,
+        };
+        assert_eq!(
+            redacted_index(&m, AppStateDispatchOutcome::Event("CallLogSync")),
+            vec![
+                "call_log".to_string(),
+                "…@s.whatsapp.net".to_string(),
+                format!("call={}", fingerprint_id(call_id)),
+                "writer_flag=0".to_string(),
+            ]
+        );
+    }
+
+    /// `deleteChat`/`clearChat` carry their destructive flags in the index
+    /// tail, so TRACE must name them: `delete_media=1` instead of a bare
+    /// `id#…` (the old `&[Jid]` shape left `"1"` to the JID-or-fingerprint
+    /// fallback, which reads `false`/`true` as `"0"`/`id#…` — backwards).
+    /// Labeled `"0"`/`"1"` flags (`from_me`, `writer_flag`) render labeled
+    /// too; anything else in a flag slot is opaque wire data and
+    /// fingerprints.
+    #[test]
+    fn redacted_index_names_delete_and_clear_flags() {
+        use crate::appstate_sync::Mutation;
+
+        let m = Mutation {
+            index: vec![
+                "deleteChat".to_string(),
+                "120363000000000042@g.us".to_string(),
+                "1".to_string(),
+            ],
+            operation: wa::syncd_mutation::SyncdOperation::SET,
+            action_value: None,
+        };
+        assert_eq!(
+            redacted_index(&m, AppStateDispatchOutcome::Event("DeleteChatUpdate")),
+            vec![
+                "deleteChat".to_string(),
+                "…@g.us".to_string(),
+                "delete_media=1".to_string(),
+            ]
+        );
+        let m = Mutation {
+            index: vec![
+                "clearChat".to_string(),
+                "120363000000000042@g.us".to_string(),
+                "0".to_string(),
+                "1".to_string(),
+            ],
+            operation: wa::syncd_mutation::SyncdOperation::SET,
+            action_value: None,
+        };
+        assert_eq!(
+            redacted_index(&m, AppStateDispatchOutcome::Event("ClearChatUpdate")),
+            vec![
+                "clearChat".to_string(),
+                "…@g.us".to_string(),
+                "delete_starred=0".to_string(),
+                "delete_media=1".to_string(),
+            ]
+        );
+    }
+
+    /// Unknown commands: verb renders as `unknown=id#…`.
+    #[test]
+    fn redacted_index_is_conservative_on_unknown_commands() {
+        use crate::appstate_sync::Mutation;
+
+        let opaque = "CUSTOMER_INTERNAL_ID_42";
+        for index in [
+            vec![
+                "some_new_whatsapp_action".to_string(),
+                "120363000000000042@g.us".to_string(),
+                "3EB0284A7C9112345678".to_string(),
+            ],
+            vec!["some_new_whatsapp_action".to_string(), opaque.to_string()],
+        ] {
+            let m = Mutation {
+                index,
+                operation: wa::syncd_mutation::SyncdOperation::SET,
+                action_value: None,
+            };
+            let redacted = redacted_index(&m, AppStateDispatchOutcome::Unclaimed);
+            for element in redacted.iter().skip(1) {
+                assert!(!element.contains("120363000000000042"));
+                assert!(!element.contains("3EB0284A7C9112345678"));
+                assert!(!element.contains(opaque));
+            }
+        }
+        // The JID case keeps its redaction; the opaque case fingerprints.
+        let jid_case = Mutation {
+            index: vec![
+                "some_new_whatsapp_action".to_string(),
+                "120363000000000042@g.us".to_string(),
+            ],
+            operation: wa::syncd_mutation::SyncdOperation::SET,
+            action_value: None,
+        };
+        assert_eq!(
+            redacted_index(&jid_case, AppStateDispatchOutcome::Unclaimed)[1],
+            "…@g.us"
+        );
+        let opaque_case = Mutation {
+            index: vec!["some_new_whatsapp_action".to_string(), opaque.to_string()],
+            operation: wa::syncd_mutation::SyncdOperation::SET,
+            action_value: None,
+        };
+        assert_eq!(
+            redacted_index(&opaque_case, AppStateDispatchOutcome::Unclaimed)[1],
+            fingerprint_id(opaque)
+        );
+        // The verb never renders verbatim: a JID or message id smuggled
+        // into `index[0]` becomes `unknown=id#…`.
+        let smuggled = Mutation {
+            index: vec!["5511999999999@s.whatsapp.net".to_string()],
+            operation: wa::syncd_mutation::SyncdOperation::SET,
+            action_value: None,
+        };
+        let verb = &redacted_index(&smuggled, AppStateDispatchOutcome::Unclaimed)[0];
+        assert!(
+            verb.starts_with("unknown=id#"),
+            "smuggled verb must fingerprint, got {verb}"
+        );
+        assert!(!verb.contains("5511999999999"));
+    }
+
+    /// `label_message` carries the full message-key tail (`from_me`,
+    /// `participant`) after the label/chat/msg triple: `from_me` is a
+    /// declared flag rendering `from_me=1` (never a fingerprint), the
+    /// participant redacts as a JID with the `"0"` sentinel passing
+    /// through — the same positions star already models.
+    #[test]
+    fn redacted_index_models_label_message_tail() {
+        use crate::appstate_sync::Mutation;
+
+        let m = Mutation {
+            index: vec![
+                "label_message".to_string(),
+                "5".to_string(),
+                "120363000000000042@g.us".to_string(),
+                "3EB0284A7C9112345678".to_string(),
+                "1".to_string(),
+                "5511999990042@s.whatsapp.net".to_string(),
+            ],
+            operation: wa::syncd_mutation::SyncdOperation::SET,
+            action_value: None,
+        };
+        let msg_id = "3EB0284A7C9112345678";
+        assert_eq!(
+            redacted_index(
+                &m,
+                AppStateDispatchOutcome::Event("MessageLabelAssociationUpdate")
+            ),
+            vec![
+                "label_message".to_string(),
+                format!("label={}", fingerprint_id("5")),
+                "…@g.us".to_string(),
+                format!("msg={}", fingerprint_id(msg_id)),
+                "from_me=1".to_string(),
+                "…@s.whatsapp.net".to_string(),
+            ]
+        );
+        // The `"0"` absent-participant sentinel passes through bare.
+        let mut absent = m.clone();
+        absent.index[5] = "0".to_string();
+        assert_eq!(
+            redacted_index(&absent, AppStateDispatchOutcome::Event("test"))[5],
+            "0"
+        );
+    }
+
+    /// The line renders `cursor=`, not `@`: the version is the page end
+    /// cursor (snapshot + patches concatenate), never each mutation's birth
+    /// version — per-patch `Decoded … vN` lines keep that granularity.
+    #[test]
+    fn mutation_line_names_the_page_end_cursor() {
+        let cursor = MutationLine {
+            collection: WAPatchName::RegularLow,
+            version: 365,
+            position: 1,
+            total: 20,
+        };
+        let rendered = format!(
+            "{:?} cursor={} [{}/{}]",
+            cursor.collection, cursor.version, cursor.position, cursor.total
+        );
+        assert_eq!(rendered, "RegularLow cursor=365 [1/20]");
+    }
+
+    /// Dispatched and not-dispatched must read differently: a malformed
+    /// `archive` (known command, payload absent) renders `ArchiveUpdate
+    /// (malformed: no event)`, never the bare event name a success produces.
+    #[test]
+    fn outcome_effect_distinguishes_malformed_from_applied() {
+        assert_eq!(
+            AppStateDispatchOutcome::Event("ArchiveUpdate")
+                .effect()
+                .as_ref(),
+            "ArchiveUpdate"
+        );
+        assert_eq!(
+            AppStateDispatchOutcome::Malformed("ArchiveUpdate")
+                .effect()
+                .as_ref(),
+            "ArchiveUpdate (malformed: no event)"
+        );
+        assert_eq!(
+            AppStateDispatchOutcome::Skipped("empty-salt")
+                .effect()
+                .as_ref(),
+            "empty-salt (skipped: no event)"
+        );
+        assert_eq!(
+            AppStateDispatchOutcome::Unclaimed.effect().as_ref(),
+            "unclaimed"
+        );
+    }
+
+    /// `mutation_effect_detail` projects booleans/counters only: archived,
+    /// pinned, mute-until, read, starred, locked. Contact names, push names,
+    /// quick-reply text, salts and full action values must never appear.
+    #[test]
+    fn mutation_effect_detail_reports_scalars_not_payloads() {
+        use crate::appstate_sync::Mutation;
+
+        let scalar = |index: &[&str], value: wa::SyncActionValue| Mutation {
+            index: index.iter().map(|s| s.to_string()).collect(),
+            operation: wa::syncd_mutation::SyncdOperation::SET,
+            action_value: Some(value),
+        };
+        let archived = scalar(
+            &["archive", "120363000000000042@g.us"],
+            wa::SyncActionValue {
+                archive_chat_action: buffa::MessageField::some(
+                    wa::sync_action_value::ArchiveChatAction {
+                        archived: Some(true),
+                        ..Default::default()
+                    },
+                ),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            mutation_effect_detail(&archived),
+            Some(MutationEffectDetail::Bool("archived", true))
+        );
+
+        let muted = scalar(
+            &["mute", "5511999990042@s.whatsapp.net"],
+            wa::SyncActionValue {
+                mute_action: buffa::MessageField::some(wa::sync_action_value::MuteAction {
+                    muted: Some(true),
+                    mute_end_timestamp: Some(1_789_834_000_000),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            mutation_effect_detail(&muted),
+            Some(MutationEffectDetail::BoolUntil(
+                "muted",
+                true,
+                1_789_834_000_000
+            ))
+        );
+        // The enum renders at the log site, with no intermediate `String`.
+        let mut rendered = String::new();
+        mutation_effect_detail(&archived)
+            .expect("archived detail")
+            .render(&mut rendered);
+        assert_eq!(rendered, "archived=true");
+        rendered.clear();
+        mutation_effect_detail(&muted)
+            .expect("mute detail")
+            .render(&mut rendered);
+        assert_eq!(rendered, "muted=true until=1789834000000");
+
+        // Contact carries names: the detail is None, so the log line shows the
+        // redacted target and the event name but no PII.
+        let contact = scalar(
+            &["contact", "5511999990042@s.whatsapp.net"],
+            wa::SyncActionValue {
+                contact_action: buffa::MessageField::some(wa::sync_action_value::ContactAction {
+                    full_name: Some("Alex Doe".to_string()),
+                    first_name: Some("Alex".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        assert_eq!(mutation_effect_detail(&contact), None);
+        assert_eq!(
+            mutation_target(&contact),
+            Some("target=…@s.whatsapp.net".to_string())
+        );
+
+        // Unknown commands and missing payloads have no scalar to report.
+        let unknown = scalar(
+            &["some_new_whatsapp_action"],
+            wa::SyncActionValue::default(),
+        );
+        assert_eq!(mutation_effect_detail(&unknown), None);
+    }
+
+    /// `deleteChat`/`clearChat` answer "what was actually deleted" on the
+    /// DEBUG line: the flags live in the index tail (same defaults as
+    /// dispatch), not the proto. Missing elements keep the dispatch
+    /// defaults (`deleteChat` media defaults true, `clearChat` both false).
+    ///
+    /// The split-dispatch contract behind this: `event_full_sync=false` +
+    /// `log_full_sync=true` (the 409 snapshot-absorb combination) must keep
+    /// `ArchiveUpdate.from_full_sync == false` — logging volume never
+    /// rewrites event provenance. Covered by
+    /// `snapshot_conflict_logging_does_not_change_event_full_sync_provenance`
+    /// at the bottom of this module, which drives
+    /// `dispatch_app_state_mutation_inner` directly.
+    #[test]
+    fn mutation_effect_detail_reports_delete_and_clear_flags() {
+        use crate::appstate_sync::Mutation;
+
+        let scalar = |index: &[&str], value: wa::SyncActionValue| Mutation {
+            index: index.iter().map(|s| s.to_string()).collect(),
+            operation: wa::syncd_mutation::SyncdOperation::SET,
+            action_value: Some(value),
+        };
+        let delete_chat = || wa::SyncActionValue {
+            delete_chat_action: buffa::MessageField::some(
+                wa::sync_action_value::DeleteChatAction::default(),
+            ),
+            ..Default::default()
+        };
+        let clear_chat = || wa::SyncActionValue {
+            clear_chat_action: buffa::MessageField::some(
+                wa::sync_action_value::ClearChatAction::default(),
+            ),
+            ..Default::default()
+        };
+        assert_eq!(
+            mutation_effect_detail(&scalar(
+                &["deleteChat", "120363000000000042@g.us", "1"],
+                delete_chat()
+            )),
+            Some(MutationEffectDetail::Bool("delete_media", true))
+        );
+        assert_eq!(
+            mutation_effect_detail(&scalar(
+                &["deleteChat", "120363000000000042@g.us", "0"],
+                delete_chat()
+            )),
+            Some(MutationEffectDetail::Bool("delete_media", false))
+        );
+        assert_eq!(
+            mutation_effect_detail(&scalar(
+                &["clearChat", "120363000000000042@g.us", "0", "1"],
+                clear_chat()
+            )),
+            Some(MutationEffectDetail::TwoBools(
+                "delete_starred",
+                false,
+                "delete_media",
+                true
+            ))
+        );
+        let mut rendered = String::new();
+        mutation_effect_detail(&scalar(
+            &["clearChat", "120363000000000042@g.us", "1", "1"],
+            clear_chat(),
+        ))
+        .expect("clear detail")
+        .render(&mut rendered);
+        assert_eq!(rendered, "delete_starred=true delete_media=true");
+        // Absent payload means no scalar, even with flags present.
+        assert_eq!(
+            mutation_effect_detail(&scalar(
+                &["deleteChat", "120363000000000042@g.us", "1"],
+                wa::SyncActionValue::default()
+            )),
+            None
+        );
+    }
+
+    /// `deleteMessageForMe.delete_media` is applied by the dispatcher from
+    /// the proto (not the index tail): DEBUG must distinguish a
+    /// media-preserving replay from a media-deleting one.
+    #[test]
+    fn mutation_effect_detail_reports_delete_for_me_media() {
+        use crate::appstate_sync::Mutation;
+
+        let scalar = |delete_media: Option<bool>| Mutation {
+            index: vec![
+                "deleteMessageForMe".to_string(),
+                "120363000000000042@g.us".to_string(),
+                "3EB0284A7C9112345678".to_string(),
+                "1".to_string(),
+                "0".to_string(),
+            ],
+            operation: wa::syncd_mutation::SyncdOperation::SET,
+            action_value: Some(wa::SyncActionValue {
+                delete_message_for_me_action: buffa::MessageField::some(
+                    wa::sync_action_value::DeleteMessageForMeAction {
+                        delete_media,
+                        ..Default::default()
+                    },
+                ),
+                ..Default::default()
+            }),
+        };
+        assert_eq!(
+            mutation_effect_detail(&scalar(Some(true))),
+            Some(MutationEffectDetail::Bool("delete_media", true))
+        );
+        assert_eq!(
+            mutation_effect_detail(&scalar(Some(false))),
+            Some(MutationEffectDetail::Bool("delete_media", false))
+        );
+        // Omitted field reads as false, the protobuf default.
+        assert_eq!(
+            mutation_effect_detail(&scalar(None)),
+            Some(MutationEffectDetail::Bool("delete_media", false))
+        );
+    }
+
+    /// Unknown verbs fingerprint, never render. Protocol-known but
+    /// unhandled verbs render verbatim so the gap stays visible.
+    #[test]
+    fn render_command_never_prints_unknown_verbs() {
+        use AppStateDispatchOutcome::{EmptyIndex, Event, Unclaimed};
+
+        assert_eq!(render_command("archive", Event("ArchiveUpdate")), "archive");
+        assert_eq!(render_command("", Event("test")), "<no-command>");
+        assert_eq!(render_command("", EmptyIndex), "<no-command>");
+        assert_eq!(render_command("settings_sync", Unclaimed), "settings_sync");
+        // Claimed verbs render even when hostile-looking: dispatch proved
+        // the command exists, `sanitize_command` handles the controls.
+        assert!(render_command("archive\nFORGED", Event("ArchiveUpdate")).starts_with("archive"));
+        for hostile in [
+            "5511999999999@s.whatsapp.net".to_string(),
+            "CUSTOMER_SECRET_MESSAGE_ID".to_string(),
+            "a".repeat(2_000_000),
+        ] {
+            let rendered = render_command(&hostile, Unclaimed);
+            assert!(
+                rendered.starts_with("unknown=id#"),
+                "{hostile:?} must fingerprint, got {rendered}"
+            );
+            assert!(!rendered.contains(&hostile[..hostile.len().min(8)]));
+        }
+    }
+
+    #[test]
+    fn sanitize_command_escapes_and_bounds_hostile_verbs() {
+        assert_eq!(sanitize_command("archive"), "archive");
+        let forged = sanitize_command("archive\nFORGED: yes\u{1B}[2J");
+        assert!(!forged.contains('\n'));
+        assert!(!forged.contains('\u{1B}'));
+        assert!(forged.starts_with("archive"));
+        assert!(forged.contains('\u{FFFD}'));
+        // The full Unicode unsafe set, not just C0 + DEL.
+        for c in [
+            '\u{85}', '\u{9B}', '\u{2028}', '\u{2029}', '\u{202E}', '\u{061C}', '\u{200E}',
+            '\u{200F}', '\u{2067}', '\u{206A}',
+        ] {
+            let rendered = sanitize_command(&format!("archive{c}FORGED"));
+            assert!(!rendered.contains(c), "verb must not carry {c:?}");
+            assert!(rendered.contains('\u{FFFD}'));
+        }
+        let long = "a".repeat(200);
+        let bounded = sanitize_command(&long);
+        assert!(bounded.chars().count() <= 48 + 1);
+        assert!(bounded.contains('…'));
+        // Bounded during processing, not just in the output: a hostile
+        // multi-MB verb costs O(48) output, never O(input).
+        let huge = "a".repeat(2_000_000);
+        let bounded = sanitize_command(&huge);
+        assert!(bounded.chars().count() <= 48 + 1);
+    }
+
+    /// DEBUG targets are command-aware too: quick-reply and label ids are
+    /// caller-provided free-form strings, so they fingerprint instead of
+    /// printing whole; `label_jid` additionally names the affected chat,
+    /// which the old `target=<label id>` rendering hid.
+    #[test]
+    fn mutation_target_fingerprints_caller_provided_ids() {
+        use crate::appstate_sync::Mutation;
+
+        let target_of = |index: &[&str]| {
+            mutation_target(&Mutation {
+                index: index.iter().map(|s| s.to_string()).collect(),
+                operation: wa::syncd_mutation::SyncdOperation::SET,
+                action_value: None,
+            })
+        };
+        let qr_id = "my-quick-reply";
+        assert_eq!(
+            target_of(&["quick_reply", qr_id]),
+            Some(format!("id={}", fingerprint_id(qr_id)))
+        );
+        let label = "my-label";
+        assert_eq!(
+            target_of(&["label_edit", label]),
+            Some(format!("label={}", fingerprint_id(label)))
+        );
+        let chat = "120363000000000042@g.us";
+        assert_eq!(
+            target_of(&["label_jid", label, chat]),
+            Some(format!("label={} chat=…@g.us", fingerprint_id(label)))
+        );
+        // JID-targeted commands keep the redacted target.
+        assert_eq!(
+            target_of(&["archive", chat]),
+            Some("target=…@g.us".to_string())
+        );
+        // No verbatim caller-provided id survives any of these.
+        for target in [
+            target_of(&["quick_reply", qr_id]),
+            target_of(&["label_edit", label]),
+            target_of(&["label_jid", label, chat]),
+        ] {
+            let target = target.expect("target present");
+            assert!(!target.contains(qr_id));
+            assert!(!target.contains(label));
+        }
+        // A malformed chat where a JID belongs fingerprints instead of
+        // leaking verbatim on the DEBUG line.
+        let evil = "CUSTOMER_SECRET_VALUE";
+        let target = target_of(&["label_jid", label, evil]).expect("target present");
+        assert!(!target.contains(evil));
+        assert!(target.contains(&fingerprint_id(evil)));
+    }
+
+    /// Neither retry scheduler may keep the client alive while it sleeps.
+    ///
+    /// The backoff doubles to an hour, so a strong reference held across it
+    /// pins the whole graph — caches, stores, the persistence manager — and
+    /// defers the `Drop` that signals shutdown, for as long after the
+    /// application let go of the client. Both loops re-acquire a strong
+    /// reference for the round they are about to run and release it again.
+    #[tokio::test]
+    async fn a_sleeping_app_state_retry_does_not_hold_the_client() {
+        let client = crate::test_utils::create_test_client_with_name("appstate_retry_weak").await;
+        let scope = client.sync_scope(None);
+        // Let construction settle before the count is taken: a startup task
+        // still holding its own clone would otherwise release it during the
+        // yields below and read as this scheduler letting one go.
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        let before = Arc::strong_count(&client);
+
+        client.schedule_app_state_task_retry(WAPatchName::RegularLow, false);
+        client.schedule_app_state_retry(
+            vec![WAPatchName::RegularHigh],
+            scope,
+            SyncSettles::JustTheCollections,
+            false,
+        );
+
+        // Time is not advanced here on purpose: both tasks park in their first
+        // backoff sleep, which is exactly the state being asserted about. Polled
+        // rather than counted in yields, because under a loaded test host the
+        // spawned tasks may not have reached their sleep after any fixed number
+        // of yields; a task that held the client across its backoff would keep
+        // the count above `before` for the whole (minutes-long) sleep, which the
+        // poll's deadline turns into a failure. `<=` tolerates a startup task
+        // releasing its own clone in the meantime.
+        crate::test_utils::poll_until(
+            "both retry schedulers to park in their backoff holding the client weakly",
+            || Arc::strong_count(&client) <= before,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn collection_replay_reports_unknown_collection() {
+        let client =
+            crate::test_utils::create_test_client_with_name("appstate_replay_unknown").await;
+
+        let error = client
+            .resync_app_state_collection(WAPatchName::Unknown)
+            .await
+            .expect_err("unknown collection must not be replayed");
+
+        assert!(matches!(error, AppStateError::InvalidRequest(_)));
+    }
 
     #[tokio::test]
     async fn key_arrival_finishes_before_a_slow_fanout() {
@@ -3282,7 +5574,11 @@ mod send_patch_response_tests {
     use wacore_binary::node::Node;
 
     /// Seed the client's store with an app-state key so `build_patch` can sign,
-    /// and give the collection a non-zero base so the IQ carries a `version`.
+    /// and give the collection a bootstrapped, non-zero base so the IQ carries a
+    /// `version`. The base has to say it bootstrapped: `send_app_state_patch`
+    /// syncs a collection that never completed one instead of building on it,
+    /// and these tests are about what the send does with the server's answer to
+    /// a patch, not about reaching that state.
     async fn seed_collection(client: &Arc<Client>, collection: &str) -> Vec<u8> {
         let backend = client.persistence_manager.backend();
         let key_id = b"send-patch-key".to_vec();
@@ -3301,6 +5597,7 @@ mod send_patch_response_tests {
                 collection,
                 wacore::appstate::hash::HashState {
                     version: 7,
+                    bootstrapped: true,
                     ..Default::default()
                 },
             )
@@ -3343,6 +5640,21 @@ mod send_patch_response_tests {
             .build()
     }
 
+    /// An IQ-level failure, which `send_iq` raises. A collection-level error is
+    /// bucketed into the sync outcome instead, so it is not the shape that makes
+    /// a re-sync fail from the caller's point of view.
+    fn iq_error_result(request_id: &str) -> Node {
+        NodeBuilder::new("iq")
+            .attr("type", "error")
+            .attr("id", request_id)
+            .attr("from", "s.whatsapp.net")
+            .children([NodeBuilder::new("error")
+                .attr("code", "500")
+                .attr("text", "server-error")
+                .build()])
+            .build()
+    }
+
     const COLLECTION: &str = "regular_low";
 
     /// Answers every IQ the client writes, in order, with whatever `reply`
@@ -3377,10 +5689,47 @@ mod send_patch_response_tests {
             } else {
                 0
             };
-            let response = match reply(attempt) {
+            // Evaluated once: `reply` is `FnMut`, so asking it twice for the same
+            // frame is asking a different question.
+            let verdict = reply(attempt);
+            let response = match verdict {
+                Some("iq-error") => iq_error_result(&id),
                 Some(code) => collection_error_result(&id, response_collection, code),
                 None => empty_sync_result(&id, response_collection),
             };
+            // A re-sync the server answers cleanly is one that found it ahead of
+            // us, so it moves the base -- which is what makes the next patch a
+            // different request rather than the same one. The real
+            // `process_patch_list` does this from the patches it applies; the
+            // empty fixture has none, so the harness stands in for it. Without
+            // this the mock says "your base is stale" and then "nothing new",
+            // which no server does, and the retry it provoked was measuring an
+            // impossible sequence.
+            //
+            // Moved before the answer on purpose. `answer_iq` releases the
+            // waiter, so the sender resumes and `absorb_conflicting_patches`
+            // reads the base to decide whether the recovery moved it. Bumping
+            // afterwards races that read: lose it and the absorb sees the base
+            // it started from, calls the recovery failed and breaks the retry
+            // loop early. A real server has already moved before it answers.
+            if attempt == 0 && verdict.is_none() {
+                let backend = client.persistence_manager.backend();
+                let current = backend
+                    .get_version(COLLECTION)
+                    .await
+                    .expect("the test backend should be readable")
+                    .unwrap_or_default();
+                backend
+                    .set_version(
+                        COLLECTION,
+                        wacore::appstate::hash::HashState {
+                            version: current.version + 1,
+                            ..current
+                        },
+                    )
+                    .await
+                    .expect("the test backend should accept a version");
+            }
             crate::test_utils::answer_iq(client, &id, &response).await;
             frame += 1;
         }
@@ -3397,6 +5746,14 @@ mod send_patch_response_tests {
         reply: impl FnMut(usize) -> Option<&'static str>,
     ) -> (Result<()>, usize) {
         let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        // Reachable, so the re-sync between attempts actually runs: an
+        // unreachable client defers it and reports Ok, which hides whether the
+        // collection was recovered at all.
+        client.is_logged_in.store(true, Ordering::Relaxed);
+        client.authenticated_generation.store(
+            client.connection_generation.load(Ordering::SeqCst),
+            Ordering::SeqCst,
+        );
         seed_collection(&client, COLLECTION).await;
 
         let mut send = {
@@ -3443,9 +5800,16 @@ mod send_patch_response_tests {
     /// A 409 means the patch was built on a stale base and did NOT land. A
     /// server that keeps rejecting must end as an error, never as success — a
     /// `markChatAsRead` that silently lost must not be reported as done.
+    ///
+    /// The re-sync between attempts is answered cleanly here, so each rebuild
+    /// starts from a base that may have moved and the attempts are worth
+    /// spending. When the re-sync fails, is deferred, or is refused, see the
+    /// three `a_conflict_whose_resync_*` tests — those stop at the first attempt.
     #[tokio::test]
     async fn unresolvable_conflict_is_not_reported_as_success() {
-        let (result, patches) = send_against(|_| Some("409")).await;
+        // attempt 0 is the re-sync between patches; only the patches conflict.
+        let (result, patches) =
+            send_against(|attempt| if attempt == 0 { None } else { Some("409") }).await;
         assert!(
             result.is_err(),
             "a 409 conflict means the mutation was dropped; reporting Ok hides the loss"
@@ -3456,6 +5820,166 @@ mod send_patch_response_tests {
         );
     }
 
+    /// Production symptom: `regular_low` sat at v0 because its sync never
+    /// landed, and a `markChatAsRead` was still built on it. A patch over an
+    /// empty ltHash against a server at v61 is refused by construction, not by a
+    /// race, and that refusal is what drags the send into the rebuild loop.
+    ///
+    /// WA Web holds those mutations back instead
+    /// (`pendingCollectionsInBootstrap`, "skipping N collections in sync iq
+    /// patch because initial full sync is incomplete").
+    #[tokio::test]
+    async fn a_collection_that_never_synced_is_synced_before_it_is_patched() {
+        let (client, transport) = crate::test_utils::create_iq_test_client().await;
+        client.is_logged_in.store(true, Ordering::Relaxed);
+        client.authenticated_generation.store(
+            client.connection_generation.load(Ordering::SeqCst),
+            Ordering::SeqCst,
+        );
+        // A sync key, but deliberately no version: the collection has never
+        // synced, which is (0, all-zero ltHash).
+        let backend = client.persistence_manager.backend();
+        backend
+            .set_sync_key(
+                b"send-patch-key",
+                crate::store::traits::AppStateSyncKey {
+                    key_data: vec![5u8; 32],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("test backend should accept a sync key");
+
+        let patch_attempts = Arc::new(AtomicUsize::new(0));
+        let first_iq_carried_a_patch = Arc::new(AtomicUsize::new(0));
+
+        let mut send = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                client
+                    .send_app_state_patch(COLLECTION, vec![wa::SyncdMutation::default()])
+                    .await
+            })
+        };
+
+        let server = {
+            let client = Arc::clone(&client);
+            let transport = Arc::clone(&transport);
+            let patch_attempts = Arc::clone(&patch_attempts);
+            let first_iq_carried_a_patch = Arc::clone(&first_iq_carried_a_patch);
+            async move {
+                let mut frame = 0usize;
+                loop {
+                    let node = crate::test_utils::decode_sent_iq(&transport, frame).await;
+                    let node = node.get().to_owned();
+                    let id = node
+                        .attrs()
+                        .optional_string("id")
+                        .expect("every IQ carries an id")
+                        .into_owned();
+                    let is_patch = node
+                        .get_optional_child_by_tag(&["sync", "collection", "patch"])
+                        .is_some();
+                    if is_patch {
+                        patch_attempts.fetch_add(1, Ordering::Relaxed);
+                        if frame == 0 {
+                            first_iq_carried_a_patch.store(1, Ordering::Relaxed);
+                        }
+                    }
+                    // An empty result is what the server sends a bootstrap with
+                    // nothing in it: WA Web writes version 0 with an empty
+                    // ltHash and the collection is synced from then on.
+                    let response = empty_sync_result(&id, COLLECTION);
+                    crate::test_utils::answer_iq(&client, &id, &response).await;
+                    frame += 1;
+                }
+            }
+        };
+        futures::pin_mut!(server);
+        let result = futures::select! {
+            result = (&mut send).fuse() => result.expect("the send task should not panic"),
+            () = server.fuse() => unreachable!("the server loop never returns"),
+        };
+
+        result.expect("the bootstrap sync lifts the collection out of never-synced");
+        assert_eq!(
+            first_iq_carried_a_patch.load(Ordering::Relaxed),
+            0,
+            "the first thing on the wire must be the bootstrap sync, not a patch built \
+             on an empty ltHash"
+        );
+        assert!(
+            patch_attempts.load(Ordering::Relaxed) >= 1,
+            "once the collection has a record the patch is legitimate and must be sent"
+        );
+    }
+
+    /// A conflict the server says has nothing more coming is not a recovery
+    /// either. It is the benign shape -- the scheduler should not burn its retry
+    /// budget rediscovering it -- but it applies nothing, so the base is exactly
+    /// where the refused patch was built and re-sending is the same request.
+    #[tokio::test]
+    async fn a_conflict_whose_resync_also_conflicts_stops_at_the_first_attempt() {
+        let (result, patches) = send_against(|_| Some("409")).await;
+        let err = result.expect_err("a re-sync that applied nothing is not a recovery");
+        assert!(
+            format!("{err:#}").contains("could not be recovered"),
+            "the error should say the collection could not be recovered, got: {err:#}"
+        );
+        assert_eq!(
+            patches, 1,
+            "a base that did not move makes the next attempt the same request"
+        );
+    }
+    /// Production shape, and review of #1365: a re-sync whose collection comes
+    /// back with an error advances nothing, but the loop around it still ends,
+    /// so `SyncOutcome::Completed` said "recovered" and the send re-tried the
+    /// same patch against the same base until the cap.
+    ///
+    /// `Completed` has to mean the collection synced, not that the loop stopped.
+    #[tokio::test]
+    async fn a_conflict_whose_resync_is_refused_stops_at_the_first_attempt() {
+        // Patch IQs conflict; the re-sync between them is answered with a
+        // collection-level error, which advances nothing.
+        let (result, patches) =
+            send_against(|attempt| Some(if attempt == 0 { "500" } else { "409" })).await;
+        let err = result.expect_err("a re-sync the server refused is not a recovery");
+        assert!(
+            format!("{err:#}").contains("could not be recovered"),
+            "the error should say the collection could not be recovered, got: {err:#}"
+        );
+        assert_eq!(
+            patches, 1,
+            "a refused re-sync leaves the base where it was, so re-sending is the \
+             same request"
+        );
+    }
+    /// Production symptom: `regular_low` conflicted on v0, the re-sync that
+    /// would have moved the base answered `snapshot MAC mismatch`, and the send
+    /// spent all five attempts re-asking the same question — holding the
+    /// collection's sync reservation for the whole run — before reporting the
+    /// `markChatAsRead` lost.
+    ///
+    /// A recovery that failed leaves the base exactly where the refused patch
+    /// was built, so the remaining attempts are the same bytes and the same
+    /// refusal.
+    #[tokio::test]
+    async fn a_conflict_whose_resync_fails_stops_at_the_first_attempt() {
+        // Patch IQs (attempt >= 1) conflict; the re-sync in between (attempt 0)
+        // fails outright, so the collection cannot be recovered and the base
+        // cannot move.
+        let (result, patches) =
+            send_against(|attempt| Some(if attempt == 0 { "iq-error" } else { "409" })).await;
+        let err = result.expect_err("an unrecoverable conflict is not a successful send");
+        assert!(
+            format!("{err:#}").contains("could not be recovered"),
+            "the error should say the collection could not be recovered, got: {err:#}"
+        );
+        assert_eq!(
+            patches, 1,
+            "once the re-sync fails the base cannot move, so re-sending is the same request"
+        );
+    }
     /// The resolution path: the first attempt loses the race, the client
     /// rebuilds against the new base, and the second attempt lands. That is WA
     /// Web's conflict loop, and the mutation survives it.
@@ -4001,6 +6525,43 @@ pub(crate) mod batched_sync_outcome_tests {
 
 #[cfg(test)]
 mod batched_sync_reconciliation_tests {
+    use super::{Unaccounted, unaccounted_for};
+    use std::collections::HashSet;
+
+    /// Production symptom: a snapshot whose MAC would not validate stopped the
+    /// apply loop, and every collection left over -- `regular_low` first, since
+    /// it sorts last -- was logged as omitted by the server. The server had sent
+    /// it.
+    #[test]
+    fn a_collection_that_came_back_and_failed_is_not_blamed_on_the_server() {
+        let responded = HashSet::from([WAPatchName::RegularLow]);
+        let answered = HashSet::new();
+        assert_eq!(
+            unaccounted_for(WAPatchName::RegularLow, &responded, &answered),
+            Some(Unaccounted::NotApplied)
+        );
+    }
+
+    #[test]
+    fn a_collection_the_response_never_mentioned_is_an_omission() {
+        let responded = HashSet::from([WAPatchName::Regular]);
+        let answered = HashSet::from([WAPatchName::Regular]);
+        assert_eq!(
+            unaccounted_for(WAPatchName::RegularLow, &responded, &answered),
+            Some(Unaccounted::Omitted)
+        );
+    }
+
+    #[test]
+    fn a_collection_that_applied_is_accounted_for() {
+        let responded = HashSet::from([WAPatchName::RegularLow]);
+        let answered = HashSet::from([WAPatchName::RegularLow]);
+        assert_eq!(
+            unaccounted_for(WAPatchName::RegularLow, &responded, &answered),
+            None
+        );
+    }
+
     use super::*;
     use crate::client::app_state::batched_sync_outcome_tests::{batch_result, sync_against};
 
@@ -5995,5 +8556,71 @@ mod critical_bootstrap_tests {
             client.needs_initial_full_sync.is_armed(),
             "and the replacement inherits the work through the gate"
         );
+    }
+
+    /// A 409 conflict absorb replays a snapshot's worth of mutations at TRACE
+    /// volume — but the events it emits are conflict resolutions, not a full
+    /// sync. The base passed `event_full_sync=false` here unconditionally,
+    /// and this PR is observability-only, so the split dispatch must keep
+    /// `ArchiveUpdate.from_full_sync == false` while `log_full_sync=true`.
+    /// Guards the `event_full_sync`/`log_full_sync` split in
+    /// `dispatch_app_state_mutation_inner` against reunification.
+    #[tokio::test]
+    async fn snapshot_conflict_logging_does_not_change_event_full_sync_provenance() {
+        use std::sync::{Arc, Mutex};
+        use wacore::types::events::{Event, EventHandler, EventInterest};
+
+        struct Recorder(Mutex<Vec<Arc<Event>>>);
+        impl EventHandler for Recorder {
+            fn handle_event(&self, event: Arc<Event>) {
+                self.0.lock().expect("recorder mutex").push(event);
+            }
+            fn interest(&self) -> EventInterest {
+                EventInterest::ALL
+            }
+        }
+
+        let client =
+            crate::test_utils::create_test_client_with_name("appstate_conflict_provenance").await;
+        let recorder = Arc::new(Recorder(Mutex::new(Vec::new())));
+        // `subscribe_handler` registers the handler's `ALL` interest;
+        // `_subscription` holds the lease alive for the dispatch below.
+        let _subscription = client
+            .core
+            .event_bus
+            .subscribe_handler(Arc::clone(&recorder) as _);
+
+        let mut m = crate::appstate_sync::Mutation {
+            index: vec!["archive".to_string(), "120363000000000042@g.us".to_string()],
+            operation: wa::syncd_mutation::SyncdOperation::SET,
+            action_value: Some(wa::SyncActionValue {
+                archive_chat_action: buffa::MessageField::some(
+                    wa::sync_action_value::ArchiveChatAction {
+                        archived: Some(true),
+                        ..Default::default()
+                    },
+                ),
+                timestamp: Some(1_700_000_000_000),
+                ..Default::default()
+            }),
+        };
+        let outcome = client
+            .dispatch_app_state_mutation_inner(
+                &mut m,
+                false, // event provenance: a conflict absorb is not a full sync
+                true,  // logging mode: snapshot replays stay at TRACE
+                Some((WAPatchName::RegularLow, 42, 1, 1)),
+            )
+            .await;
+        assert_eq!(outcome, AppStateDispatchOutcome::Event("ArchiveUpdate"));
+        let events = recorder.0.lock().expect("recorder mutex").clone();
+        assert_eq!(events.len(), 1, "one archive mutation emits one event");
+        match &*events[0] {
+            Event::ArchiveUpdate(update) => assert!(
+                !update.from_full_sync,
+                "conflict-absorb replay must not claim from_full_sync"
+            ),
+            other => panic!("expected ArchiveUpdate, got {other:?}"),
+        }
     }
 }

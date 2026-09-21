@@ -8,11 +8,15 @@ use serde::Serialize;
 use thiserror::Error;
 use wacore::WireEnum;
 use wacore::iq::mex::MexQuerySpec;
-use wacore::iq::mex_operations::{fetch_new_chat_message_capping_info, fetch_reachout_timelock};
+use wacore::iq::mex_operations::{
+    fetch_new_chat_message_capping_info, fetch_reachout_timelock, get_username,
+};
 use wacore_binary::jid::JidError;
 
 // Re-export types from wacore
-pub use wacore::iq::mex::{MexDoc, MexErrorExtensions, MexGraphQLError, MexResponse};
+pub use wacore::iq::mex::{
+    MexDoc, MexErrorExtensions, MexFatalError, MexGraphQLError, MexResponse,
+};
 pub use wacore::iq::mex_operations::fetch_reachout_timelock::Xwa2FetchAccountReachoutTimelock as ReachoutTimelock;
 
 /// Error types for MEX operations.
@@ -47,19 +51,53 @@ pub enum MexError {
 pub struct MexRequest<V> {
     /// GraphQL persisted-query descriptor (name + id).
     pub doc: MexDoc,
+    /// The variable names the persisted document declares, from the op module's
+    /// `VARIABLE_KEYS`. Carried so a payload can be checked against them even
+    /// when the variables are a loosely-typed `json!`.
+    pub declared_variables: &'static [&'static str],
     /// Typed query variables: a generated `Variables`, or any `Serialize` value
     /// (e.g. a `json!` object) for inputs the generated mirror types too loosely.
     pub variables: V,
 }
 
 impl<V> MexRequest<V> {
-    /// Pair a `(name, id)` from a generated op module with its variables.
-    /// Prefer the `mex_request!` macro, which names the op once.
-    pub fn new(name: &'static str, id: &'static str, variables: V) -> Self {
+    /// Pair a `(name, id, declared variables)` from a generated op module with
+    /// its variables. Prefer the `mex_request!` macro, which names the op once.
+    pub fn new(
+        name: &'static str,
+        id: &'static str,
+        declared_variables: &'static [&'static str],
+        variables: V,
+    ) -> Self {
         Self {
             doc: MexDoc { name, id },
+            declared_variables,
             variables,
         }
+    }
+}
+
+impl<V: Serialize> MexRequest<V> {
+    /// Declared variables this request's payload does not carry.
+    ///
+    /// A persisted query the server cannot bind every variable of comes back as
+    /// a bare `400 Bad Request`, so serializing and looking is the only way to
+    /// see the omission before it reaches the wire. A non-empty result is not
+    /// automatically wrong: WhatsApp Web omits an optional variable it has no
+    /// value for, and this reports that the same way. That is also why the send
+    /// path does not check it: an assert here would fire on `fetch_all_subgroups`,
+    /// which is correct precisely because it omits one. Tests know the wanted set.
+    pub fn missing_variables(&self) -> Result<Vec<&'static str>, serde_json::Error> {
+        let value = serde_json::to_value(&self.variables)?;
+        let Some(object) = value.as_object() else {
+            return Ok(self.declared_variables.to_vec());
+        };
+        Ok(self
+            .declared_variables
+            .iter()
+            .copied()
+            .filter(|key| !object.contains_key(*key))
+            .collect())
     }
 }
 
@@ -78,12 +116,18 @@ macro_rules! mex_request {
         $crate::features::mex::MexRequest::new(
             __mex_op::NAME,
             __mex_op::DOC_ID,
+            __mex_op::VARIABLE_KEYS,
             __mex_op::Variables { $($body)* },
         )
     }};
     ($op:path, $vars:expr $(,)?) => {{
         use $op as __mex_op;
-        $crate::features::mex::MexRequest::new(__mex_op::NAME, __mex_op::DOC_ID, $vars)
+        $crate::features::mex::MexRequest::new(
+            __mex_op::NAME,
+            __mex_op::DOC_ID,
+            __mex_op::VARIABLE_KEYS,
+            $vars,
+        )
     }};
 }
 pub(crate) use mex_request;
@@ -168,6 +212,22 @@ impl NewChatMessageCapping {
     }
 }
 
+/// This account's own Meta username, as MEX reports it.
+///
+/// Every field is optional because the server omits the ones that do not apply;
+/// an account that never set a username answers 404, which surfaces as `None`
+/// from [`Mex::get_username`] rather than as an error.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct OwnUsername {
+    /// The handle, without the display-only `@` prefix.
+    pub username: Option<String>,
+    /// `ACTIVE` or `RESERVED`.
+    pub state: Option<String>,
+    /// The numeric username key that guards lookups of this account by handle.
+    pub key: Option<String>,
+}
+
 /// Feature handle for MEX GraphQL operations.
 pub struct Mex<'a> {
     client: &'a Client,
@@ -222,6 +282,25 @@ impl<'a> Mex<'a> {
         decode_new_chat_message_capping(response.data)
     }
 
+    /// Read this account's own username, its state, and its username key.
+    ///
+    /// `None` means no username is set: WhatsApp Web reads the same 404 that
+    /// way. Only reads are exposed; setting a username or its key changes the
+    /// account's identity in a way the server does not undo, so those two
+    /// persisted operations stay unwrapped.
+    pub async fn get_username(&self) -> Result<Option<OwnUsername>, MexError> {
+        let response = match self.query(mex_request!(get_username {})).await {
+            Ok(response) => response,
+            // The official job reads a 404 as "this account has no username",
+            // and reaches it from both shapes: WAWebMexNativeClient raises the
+            // same error for a fatal GraphQL extension code and for an IQ one.
+            Err(MexError::ExtensionError { code: 404, .. })
+            | Err(MexError::Request(IqError::ServerError { code: 404, .. })) => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        decode_own_username(response.data)
+    }
+
     #[inline]
     async fn execute_request<V: Serialize>(
         &self,
@@ -236,18 +315,20 @@ impl<'a> Mex<'a> {
     // Non-generic so the execute/error-handling body instantiates once, not
     // per variables type.
     async fn execute_spec(&self, spec: MexQuerySpec) -> Result<MexResponse, MexError> {
-        let response = self.client.execute(spec).await?;
-
-        // Check for fatal errors (the IqSpec already checks, but we want to return our error type)
-        if let Some(fatal) = response.fatal_error() {
-            let code = fatal.error_code().unwrap_or(500);
-            return Err(MexError::ExtensionError {
-                code,
-                message: fatal.message.clone(),
-            });
+        // A fatal GraphQL error fails the spec's own parse, so it arrives as an
+        // `IqError::ParseError` carrying the typed source. Recovering the code
+        // here is what lets a caller act on one, rather than on a message.
+        match self.client.execute(spec).await {
+            Ok(response) => Ok(response),
+            Err(IqError::ParseError(err)) => Err(match err.downcast_ref::<MexFatalError>() {
+                Some(fatal) => MexError::ExtensionError {
+                    code: fatal.code,
+                    message: fatal.message.clone(),
+                },
+                None => MexError::Request(IqError::ParseError(err)),
+            }),
+            Err(err) => Err(err.into()),
         }
-
-        Ok(response)
     }
 }
 
@@ -261,6 +342,23 @@ fn decode_reachout_timelock(data: Option<serde_json::Value>) -> Result<ReachoutT
         .ok_or_else(|| {
             MexError::PayloadParsing("reachout timelock response missing account state".into())
         })
+}
+
+fn decode_own_username(data: Option<serde_json::Value>) -> Result<Option<OwnUsername>, MexError> {
+    let data =
+        data.ok_or_else(|| MexError::PayloadParsing("username response missing data".into()))?;
+    let response: get_username::Response = serde_json::from_value(data)?;
+    let Some(info) = response
+        .xwa2_username_get
+        .and_then(|username_get| username_get.username_info)
+    else {
+        return Ok(None);
+    };
+    Ok(Some(OwnUsername {
+        username: info.username,
+        state: info.state,
+        key: info.pin,
+    }))
 }
 
 /// Read a GraphQL scalar that the schema types as a string but the server has
@@ -331,11 +429,49 @@ mod tests {
         };
         let request = MexRequest {
             doc: DOC,
+            declared_variables: &[],
             variables: json!({}),
         };
 
         assert_eq!(request.doc.id, "29829202653362039");
         assert_eq!(request.doc.name, "WAWebMexTestQuery");
+    }
+
+    /// The guard for the loosely-typed form of `mex_request!`, where the
+    /// compiler cannot see the variables at all: a `json!` payload is still
+    /// checked against the op's own `VARIABLE_KEYS`.
+    #[test]
+    fn missing_variables_names_what_a_payload_leaves_out() {
+        use wacore::iq::mex_operations::fetch_all_newsletters_metadata as op;
+
+        let complete = MexRequest::new(
+            op::NAME,
+            op::DOC_ID,
+            op::VARIABLE_KEYS,
+            json!({ "fetch_status_metadata": false, "fetch_wamo_sub": false }),
+        );
+        assert_eq!(
+            complete.missing_variables().expect("serialize"),
+            Vec::<&str>::new()
+        );
+
+        let partial = MexRequest::new(
+            op::NAME,
+            op::DOC_ID,
+            op::VARIABLE_KEYS,
+            json!({ "fetch_wamo_sub": true }),
+        );
+        assert_eq!(
+            partial.missing_variables().expect("serialize"),
+            vec!["fetch_status_metadata"]
+        );
+
+        // A payload that is not an object binds nothing at all.
+        let bogus = MexRequest::new(op::NAME, op::DOC_ID, op::VARIABLE_KEYS, json!("nope"));
+        assert_eq!(
+            bogus.missing_variables().expect("serialize"),
+            vec!["fetch_status_metadata", "fetch_wamo_sub"]
+        );
     }
 
     #[test]
@@ -635,5 +771,36 @@ mod tests {
         let src = std::error::Error::source(&me).expect("source preserved");
         let inner = src.downcast_ref::<IqError>().expect("downcasts to IqError");
         assert!(matches!(inner, IqError::ServerError { code: 404, .. }));
+    }
+
+    #[test]
+    fn own_username_decodes_the_username_state_and_key() {
+        let decoded = decode_own_username(Some(json!({
+            "xwa2_username_get": {
+                "username_info": {
+                    "username": "example.handle",
+                    "state": "ACTIVE",
+                    "pin": "1234"
+                }
+            }
+        })))
+        .expect("decode")
+        .expect("username info");
+
+        assert_eq!(decoded.username.as_deref(), Some("example.handle"));
+        assert_eq!(decoded.state.as_deref(), Some("ACTIVE"));
+        assert_eq!(decoded.key.as_deref(), Some("1234"));
+    }
+
+    #[test]
+    fn own_username_reads_an_account_without_one_as_absent() {
+        assert_eq!(
+            decode_own_username(Some(json!({ "xwa2_username_get": {} }))).expect("decode"),
+            None
+        );
+        assert!(matches!(
+            decode_own_username(None),
+            Err(MexError::PayloadParsing(_))
+        ));
     }
 }

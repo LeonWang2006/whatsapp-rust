@@ -85,18 +85,22 @@ pub fn parse_participants(
 /// cloned into the vector and dropped one line later.
 pub fn collect_simple_message_ids(
     node: &NodeRef<'_>,
-    stanza_id: String,
+    stanza_id: wacore_binary::MessageId,
     is_view: bool,
-) -> Vec<String> {
+) -> Vec<wacore_binary::MessageId> {
     let id_attr = if is_view { "server_id" } else { "id" };
-    let mut ids: Vec<String> = node
+    let mut ids: Vec<wacore_binary::MessageId> = node
         .get_optional_child("list")
         .and_then(|list| {
             list.children().map(|items| {
                 items
                     .iter()
                     .filter(|c| c.tag == "item")
-                    .filter_map(|c| c.attrs().optional_string(id_attr).map(|s| s.into_owned()))
+                    .filter_map(|c| {
+                        c.attrs()
+                            .optional_string(id_attr)
+                            .map(|s| wacore_binary::MessageId::from(s.as_ref()))
+                    })
                     .collect()
             })
         })
@@ -128,7 +132,7 @@ pub fn collect_simple_message_ids(
 /// NOTE: the message-dispatch hot path uses
 /// `crate::client::Client::should_send_delivery_receipt` (in the
 /// `whatsapp-rust` crate), which is authoritative and intentionally diverges
-/// here (it also sends `<receipt context="status">` for status broadcasts,
+/// here (it also sends `<receipt class="status">` for status broadcasts,
 /// which this copy still skips). The self-fanout rule is shared via
 /// [`MessageSource::is_self_fanout`](crate::types::message::MessageSource::is_self_fanout).
 pub fn should_send_delivery_receipt(info: &MessageInfo) -> bool {
@@ -177,6 +181,50 @@ mod tests {
     use super::*;
     use crate::types::message::{MessageCategory, MessageInfo, MessageSource};
 
+    /// The receipt handler gates on the raw parsed type *before* running this
+    /// downgrade, so the gate is only behaviour-preserving while no input can
+    /// come out the other side as a `Retry` (the one type it must not drop
+    /// without a subscriber). The scoping to `Delivered` is what guarantees
+    /// that; this pins it, so widening the downgrade fails here rather than
+    /// silently dropping retries on the receive path.
+    #[test]
+    fn downgrade_never_turns_a_type_into_a_retry() {
+        use wacore_binary::builder::NodeBuilder;
+
+        let node = NodeBuilder::new("receipt")
+            .children([NodeBuilder::new("error")
+                .attr("reason", "lid")
+                .attr("type", "feature-incapable")
+                .build()])
+            .build();
+        let node = node.as_node_ref();
+
+        // Every variant; a new one belongs in this list.
+        for parsed in [
+            ReceiptType::Delivered,
+            ReceiptType::Sent,
+            ReceiptType::Sender,
+            ReceiptType::Retry,
+            ReceiptType::EncRekeyRetry,
+            ReceiptType::Read,
+            ReceiptType::ReadSelf,
+            ReceiptType::Played,
+            ReceiptType::PlayedSelf,
+            ReceiptType::ServerError,
+            ReceiptType::Inactive,
+            ReceiptType::PeerMsg,
+            ReceiptType::HistorySync,
+            ReceiptType::Other("something-new".to_string()),
+        ] {
+            let downgraded = downgrade_for_feature_incapable(&node, parsed.clone());
+            assert_eq!(
+                downgraded == ReceiptType::Retry,
+                parsed == ReceiptType::Retry,
+                "downgrading {parsed:?} changed whether it is a Retry"
+            );
+        }
+    }
+
     #[test]
     fn feature_incapable_error_downgrades_delivery_to_sent() {
         use wacore_binary::builder::NodeBuilder;
@@ -222,7 +270,7 @@ mod tests {
     #[test]
     fn skip_empty_id() {
         let info = MessageInfo {
-            id: "".to_string(),
+            id: "".into(),
             source: MessageSource {
                 chat: "12345@s.whatsapp.net".parse().unwrap(),
                 sender: "12345@s.whatsapp.net".parse().unwrap(),
@@ -237,7 +285,7 @@ mod tests {
     #[test]
     fn skip_status_broadcast() {
         let info = MessageInfo {
-            id: "MSG1".to_string(),
+            id: "MSG1".into(),
             source: MessageSource {
                 chat: "status@broadcast".parse().unwrap(),
                 sender: "12345@s.whatsapp.net".parse().unwrap(),
@@ -253,7 +301,7 @@ mod tests {
     #[test]
     fn skip_newsletter() {
         let info = MessageInfo {
-            id: "NL1".to_string(),
+            id: "NL1".into(),
             source: MessageSource {
                 chat: "120363173003902460@newsletter".parse().unwrap(),
                 sender: "120363173003902460@newsletter".parse().unwrap(),
@@ -268,7 +316,7 @@ mod tests {
     #[test]
     fn skip_own_non_peer_messages() {
         let info = MessageInfo {
-            id: "OWN1".to_string(),
+            id: "OWN1".into(),
             source: MessageSource {
                 chat: "12345@s.whatsapp.net".parse().unwrap(),
                 sender: "12345@s.whatsapp.net".parse().unwrap(),
@@ -283,7 +331,7 @@ mod tests {
     #[test]
     fn allow_peer_self_synced_messages() {
         let info = MessageInfo {
-            id: "PEER1".to_string(),
+            id: "PEER1".into(),
             source: MessageSource {
                 chat: "12345@s.whatsapp.net".parse().unwrap(),
                 sender: "12345@s.whatsapp.net".parse().unwrap(),
@@ -302,7 +350,7 @@ mod tests {
         // sender receipt. A recipient-less own message (skip_own_non_peer_*)
         // stays skipped. Mirrors the hot-path copy in the whatsapp-rust crate.
         let info = MessageInfo {
-            id: "FANOUT1".to_string(),
+            id: "FANOUT1".into(),
             source: MessageSource {
                 chat: "200000000000002@bot".parse().unwrap(),
                 sender: "100000000000001@lid".parse().unwrap(),
@@ -321,7 +369,7 @@ mod tests {
         // self-fanout allowance must NOT leak into own status broadcasts or
         // group messages, even when a recipient is present.
         let own_status = MessageInfo {
-            id: "OWN_STATUS".to_string(),
+            id: "OWN_STATUS".into(),
             source: MessageSource {
                 chat: "status@broadcast".parse().unwrap(),
                 sender: "100000000000001@lid".parse().unwrap(),
@@ -334,7 +382,7 @@ mod tests {
         assert!(!should_send_delivery_receipt(&own_status));
 
         let own_group = MessageInfo {
-            id: "OWN_GROUP".to_string(),
+            id: "OWN_GROUP".into(),
             source: MessageSource {
                 chat: "120363021033254949@g.us".parse().unwrap(),
                 sender: "100000000000001@lid".parse().unwrap(),
@@ -351,7 +399,7 @@ mod tests {
     #[test]
     fn allow_incoming_dm() {
         let info = MessageInfo {
-            id: "DM1".to_string(),
+            id: "DM1".into(),
             source: MessageSource {
                 chat: "12345@s.whatsapp.net".parse().unwrap(),
                 sender: "12345@s.whatsapp.net".parse().unwrap(),
@@ -464,7 +512,7 @@ mod tests {
                 ])
                 .build()])
             .build();
-        let ids = collect_simple_message_ids(&node.as_node_ref(), "STANZA-Z".to_string(), false);
+        let ids = collect_simple_message_ids(&node.as_node_ref(), "STANZA-Z".into(), false);
         assert_eq!(ids, vec!["MSG-A", "MSG-B", "STANZA-Z"]);
     }
 
@@ -472,7 +520,7 @@ mod tests {
     #[test]
     fn simple_message_ids_without_list() {
         let node = NodeBuilder::new("receipt").attr("id", "SOLO").build();
-        let ids = collect_simple_message_ids(&node.as_node_ref(), "SOLO".to_string(), false);
+        let ids = collect_simple_message_ids(&node.as_node_ref(), "SOLO".into(), false);
         assert_eq!(ids, vec!["SOLO"]);
     }
 
@@ -489,7 +537,7 @@ mod tests {
                 ])
                 .build()])
             .build();
-        let ids = collect_simple_message_ids(&node.as_node_ref(), "VIEW-STANZA".to_string(), true);
+        let ids = collect_simple_message_ids(&node.as_node_ref(), "VIEW-STANZA".into(), true);
         assert_eq!(ids, vec!["100", "101"]);
     }
 
@@ -505,7 +553,7 @@ mod tests {
     #[test]
     fn listless_receipt_ids_are_sized_to_what_they_hold() {
         let node = NodeBuilder::new("receipt").attr("id", "SOLO").build();
-        let ids = collect_simple_message_ids(&node.as_node_ref(), "SOLO".to_string(), false);
+        let ids = collect_simple_message_ids(&node.as_node_ref(), "SOLO".into(), false);
         assert_eq!(ids.len(), 1);
         assert!(
             ids.capacity() < 4,
@@ -524,7 +572,7 @@ mod tests {
                 .children([NodeBuilder::new("item").attr("id", "MSG-A").build()])
                 .build()])
             .build();
-        let ids = collect_simple_message_ids(&node.as_node_ref(), "VIEW-STANZA".to_string(), true);
+        let ids = collect_simple_message_ids(&node.as_node_ref(), "VIEW-STANZA".into(), true);
         assert!(
             ids.is_empty(),
             "items without server_id contribute nothing and the stanza id is not appended"
