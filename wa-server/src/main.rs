@@ -89,6 +89,91 @@ impl StorageFactory for PostgresStorageFactoryAdapter {
             .map_err(|e| anyhow::anyhow!("{e}"))
     }
 
+    async fn biz_user_by_device_uuid(
+        &self,
+        device_uuid: &str,
+    ) -> anyhow::Result<Option<wa_server::storage_factory::BizUserRecord>> {
+        self.0
+            .biz_user_by_device_uuid(device_uuid)
+            .await
+            .map(|u| {
+                u.map(|u| wa_server::storage_factory::BizUserRecord {
+                    id: u.id,
+                    device_uuid: u.device_uuid,
+                    phone_number: u.phone_number,
+                    wa_device_id: u.wa_device_id,
+                })
+            })
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn upsert_biz_user(
+        &self,
+        device_uuid: &str,
+        phone_number: &str,
+        platform: Option<i16>,
+        os_version: Option<&str>,
+        manufacturer: Option<&str>,
+        device_model: Option<&str>,
+        os_build_number: Option<&str>,
+        locale_language: Option<&str>,
+        locale_country: Option<&str>,
+        device_info_raw: Option<&str>,
+        firebase_token: Option<&str>,
+        apns_token: Option<&str>,
+        notification: bool,
+        clear_wa_device_id: bool,
+    ) -> anyhow::Result<wa_server::storage_factory::BizUserRecord> {
+        self.0
+            .upsert_biz_user(
+                device_uuid,
+                phone_number,
+                platform,
+                os_version,
+                manufacturer,
+                device_model,
+                os_build_number,
+                locale_language,
+                locale_country,
+                device_info_raw,
+                firebase_token,
+                apns_token,
+                notification,
+                clear_wa_device_id,
+            )
+            .await
+            .map(|u| wa_server::storage_factory::BizUserRecord {
+                id: u.id,
+                device_uuid: u.device_uuid,
+                phone_number: u.phone_number,
+                wa_device_id: u.wa_device_id,
+            })
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    async fn record_pair_history(
+        &self,
+        user_id: i64,
+        phone_number: Option<&str>,
+        wa_device_id: Option<i32>,
+        action: &str,
+        pair_code: Option<&str>,
+        detail: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.0
+            .record_pair_history(
+                user_id,
+                phone_number,
+                wa_device_id,
+                action,
+                pair_code,
+                detail,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
     async fn record_presence_event(
         &self,
         owner_phone: &str,
@@ -138,10 +223,13 @@ async fn main() {
     let max_sessions = env_or_parse("MAX_SESSIONS", 0usize);
     let pair_code_key_prefix = env_or("PAIR_CODE_KEY_PREFIX", PAIR_CODE_KEY_PREFIX);
     let link_status_key_prefix = env_or("LINK_STATUS_KEY_PREFIX", LINK_STATUS_KEY_PREFIX);
-    let restore_on_start = env_or_parse("RESTORE_ON_START", true);
+    let wa_friend_webhook_url = std::env::var("WA_FRIEND_WEBHOOK_URL").ok();
+    let wa_friend_http_client = wa_friend_webhook_url
+        .as_ref()
+        .map(|_| reqwest::Client::new());
 
     info!(
-        "starting wa-server pod={pod_id} api={api_addr} max_sessions={max_sessions} redis={redis_url} restore_on_start={restore_on_start}"
+        "starting wa-server pod={pod_id} api={api_addr} max_sessions={max_sessions} redis={redis_url} restore_on_start={restore_on_start} wa_friend_webhook={wa_friend_webhook_url:?}"
     );
 
     // Connect to Redis.
@@ -188,9 +276,9 @@ async fn main() {
     });
 
     // Build the server. Clone its registry out up-front so the API shares the
-    // same in-process session map the shard consumers write to. The raw client
+    // same in-process session map the command channels. The raw client
     // is carried into `ServerContext` so each blocking consumer can open its
-    // own dedicated connection.
+    // dedicated connection.
     let server = Server::new(
         storage_factory.clone(),
         redis.clone(),
@@ -198,6 +286,8 @@ async fn main() {
         pod_id.clone(),
         pair_code_key_prefix.clone(),
         link_status_key_prefix.clone(),
+        wa_friend_webhook_url,
+        wa_friend_http_client,
     )
     .with_max_sessions(max_sessions)
     .with_shutdown(shutdown.clone());

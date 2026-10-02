@@ -26,6 +26,7 @@ use crate::storage_factory::StorageFactory;
 use crate::task::{
     PairCodePayload, ReactPayload, SendMessagePayload, SessionCommand, TaskEnvelope, TaskType,
 };
+use crate::wa_friend_plugin::WaFriendBridgePlugin;
 
 /// TTL for the Redis key that shares a contact's tc token across pods
 /// ([`tc_token_key`]). Long enough that a restarting pod re-finds tokens its
@@ -65,6 +66,10 @@ pub struct ServerContext {
     /// Prefix for per-phone link-status keys written to Redis for the API to
     /// serve (`GET /link-status`).
     pub link_status_key_prefix: String,
+    /// Webhook URL for external client integration (e.g. wa_friend).
+    pub wa_friend_webhook_url: Option<String>,
+    /// HTTP client for external client integration (e.g. wa_friend).
+    pub wa_friend_http_client: Option<reqwest::Client>,
 }
 
 /// Build and run one session for `jid`. `first_task` (if present) is delivered
@@ -256,6 +261,10 @@ pub async fn run_session(ctx: ServerContext, jid: String, first_task: Option<Tas
     // (WA_PROXY_URL, e.g. http://127.0.0.1:7890). Unset keeps the default.
     if let Some(proxy) = crate::proxy_transport::proxy_factory_from_env() {
         builder = builder.with_transport_factory(proxy);
+    }
+
+    if let (Some(url), Some(client)) = (&ctx.wa_friend_webhook_url, &ctx.wa_friend_http_client) {
+        builder = builder.with_plugin(WaFriendBridgePlugin::new(url.clone(), client.clone()));
     }
 
     let bot = builder.build().await;

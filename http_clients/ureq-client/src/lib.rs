@@ -158,6 +158,7 @@ impl Default for UreqHttpClient {
 }
 
 fn build_agent() -> ureq::Agent {
+    use std::env;
     use ureq::config::Config;
 
     #[allow(unused_mut)]
@@ -168,6 +169,16 @@ fn build_agent() -> ureq::Agent {
         .output_buffer_size(OUTPUT_BUFFER_BYTES as usize)
         .max_idle_connections(MAX_IDLE_CONNECTIONS as usize)
         .max_idle_connections_per_host(2);
+
+    if let Ok(proxy_url) = env::var("HTTP_PROXY") {
+        if !proxy_url.is_empty() {
+            builder = builder.proxy(proxy_url);
+        }
+    } else if let Ok(proxy_url) = env::var("HTTPS_PROXY") {
+        if !proxy_url.is_empty() {
+            builder = builder.proxy(proxy_url);
+        }
+    }
 
     #[cfg(feature = "danger-skip-tls-verify")]
     {

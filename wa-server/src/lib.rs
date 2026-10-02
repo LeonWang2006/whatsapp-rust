@@ -15,12 +15,11 @@ pub mod registry;
 pub mod server;
 pub mod session;
 pub mod storage_factory;
-pub mod task;
-
-pub use api::Api;
+pub mod wa_friend_plugin;
 pub use in_memory_factory::InMemoryStorageFactory;
 pub use registry::SessionRegistry;
 pub use server::Server;
 pub use session::ServerContext;
 pub use storage_factory::StorageFactory;
 pub use task::{TaskEnvelope, TaskType};
+pub use wa_friend_plugin::WaFriendBridgePlugin;

@@ -44,6 +44,10 @@ pub struct Server {
     /// Prefix for per-phone link-status keys written to Redis for the API to
     /// serve (`GET /link-status`).
     link_status_key_prefix: String,
+    /// Webhook URL for external client integration (e.g. wa_friend).
+    wa_friend_webhook_url: Option<String>,
+    /// HTTP client for external client integration (e.g. wa_friend).
+    wa_friend_http_client: Option<reqwest::Client>,
 }
 
 impl Server {
@@ -54,6 +58,8 @@ impl Server {
         pod_id: String,
         pair_code_key_prefix: String,
         link_status_key_prefix: String,
+        wa_friend_webhook_url: Option<String>,
+        wa_friend_http_client: Option<reqwest::Client>,
     ) -> Self {
         Self {
             storage_factory,
@@ -65,6 +71,8 @@ impl Server {
             max_sessions: 0,
             pair_code_key_prefix,
             link_status_key_prefix,
+            wa_friend_webhook_url,
+            wa_friend_http_client,
         }
     }
 
@@ -113,6 +121,8 @@ impl Server {
             max_sessions: self.max_sessions,
             pair_code_key_prefix: self.pair_code_key_prefix.clone(),
             link_status_key_prefix: self.link_status_key_prefix.clone(),
+            wa_friend_webhook_url: self.wa_friend_webhook_url.clone(),
+            wa_friend_http_client: self.wa_friend_http_client.clone(),
         };
 
         // One BRPOP task per shard. Each pulls tasks off its own shard key.

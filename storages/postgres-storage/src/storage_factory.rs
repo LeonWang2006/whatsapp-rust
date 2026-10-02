@@ -233,6 +233,77 @@ impl PostgresStorageFactory {
         crate::biz::biz_user_by_phone(&self.database_url, phone).await
     }
 
+    /// Look up a `biz.wa_user` by its `device_uuid` (init path).
+    pub async fn biz_user_by_device_uuid(
+        &self,
+        device_uuid: &str,
+    ) -> StoreResult<Option<crate::biz::BizUserFull>> {
+        crate::biz::biz_user_by_device_uuid(&self.database_url, device_uuid).await
+    }
+
+    /// Upsert a `biz.wa_user` keyed by `device_uuid`. Returns the resolved row
+    /// so the caller can detect a phone-number change and clear the stale
+    /// `wa_device_id` reference.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_biz_user(
+        &self,
+        device_uuid: &str,
+        phone_number: &str,
+        platform: Option<i16>,
+        os_version: Option<&str>,
+        manufacturer: Option<&str>,
+        device_model: Option<&str>,
+        os_build_number: Option<&str>,
+        locale_language: Option<&str>,
+        locale_country: Option<&str>,
+        device_info_raw: Option<&str>,
+        firebase_token: Option<&str>,
+        apns_token: Option<&str>,
+        notification: bool,
+        clear_wa_device_id: bool,
+    ) -> StoreResult<crate::biz::BizUserFull> {
+        crate::biz::upsert_biz_user(
+            &self.database_url,
+            device_uuid,
+            phone_number,
+            platform,
+            os_version,
+            manufacturer,
+            device_model,
+            os_build_number,
+            locale_language,
+            locale_country,
+            device_info_raw,
+            firebase_token,
+            apns_token,
+            notification,
+            clear_wa_device_id,
+        )
+        .await
+    }
+
+    /// Record a pairing-flow lifecycle event in `biz.pair_history`.
+    pub async fn record_pair_history(
+        &self,
+        user_id: i64,
+        phone_number: Option<&str>,
+        wa_device_id: Option<i32>,
+        action: &str,
+        pair_code: Option<&str>,
+        detail: Option<&str>,
+    ) -> StoreResult<()> {
+        crate::biz::record_pair_history(
+            &self.database_url,
+            user_id,
+            phone_number,
+            wa_device_id,
+            action,
+            pair_code,
+            detail,
+        )
+        .await
+    }
+
     /// Return the contact phone numbers a user has added, in insertion order.
     pub async fn biz_contacts_for_user(&self, user_id: i64) -> StoreResult<Vec<String>> {
         crate::biz::biz_contacts_for_user(&self.database_url, user_id).await

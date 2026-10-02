@@ -25,7 +25,7 @@ serde_json = { workspace = true, features = ["std"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "signal", "net", "io-util"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring"] }
 tokio-util = { version = "0.7", features = ["rt"] }
-tokio-websockets = { version = "0.13.3", features = ["client", "ring"] }
+reqwest = { version = "0.12", features = ["json"] }
 webpki-roots = "1.0.9"
 whatsapp-rust = { path = "..", version = "0.7.0" }
 whatsapp-rust-postgres-storage = { path = "../storages/postgres-storage", version = "0.7.0" }

@@ -22,6 +22,11 @@
 //! - `POST /link`  — business link action: push a `pair_code` task onto the
 //!   shared Redis `wa-queue` so any pod's server loop consumes it (the
 //!   multi-pod path; `/pair` stays for local single-pod debugging).
+//! - `POST /init`  — register/re-register a client device (`biz.wa_user`),
+//!   keyed by its `device_uuid` (idempotent upsert). `platform` is read from
+//!   the `X-Platform` header. A phone-number change clears the stale
+//!   `wa_device_id` and records `replace_phone` to `biz.pair_history`;
+//!   re-pairing is then driven by `/link`.
 //!
 //! `/send`, `/react`, `/pair` are synchronous dispatch: they enqueue into the
 //! local session's command channel (or spawn a session for pairing tasks) and
@@ -31,7 +36,7 @@
 
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Request, Response, Server, StatusCode};
-use log::{error, info};
+use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -113,6 +118,75 @@ struct LinkRequest {
     phone_number: String,
 }
 
+/// Business `init` request: a client registers (or re-registers) the device
+/// with the service, keyed by its `device_uuid`. The `platform` is carried in
+/// the `X-Platform` header (official WhatsApp PlatformType), not the body.
+///
+/// Idempotent: upserts `biz.wa_user` by `device_uuid`. A phone-number change
+/// (换卡) under the same `device_uuid` clears the stale `wa_device_id` so the
+/// old WhatsApp pairing is not restored; the client then drives re-pairing via
+/// `POST /link`.
+#[derive(Debug, Serialize, Deserialize)]
+struct InitRequest {
+    /// Client-generated device identity = user entity. Required, immutable for
+    /// the lifetime of the install.
+    device_uuid: String,
+    /// E.164 phone number, digits only. Required; updated on every call so a
+    /// SIM swap lands here.
+    phone_number: String,
+    /// `device_info.osVersion`, e.g. `"12"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    os_version: Option<String>,
+    /// `device_info.manufacturer`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    manufacturer: Option<String>,
+    /// `device_info.device` (model).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    device: Option<String>,
+    /// `device_info.osBuildNumber`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    os_build_number: Option<String>,
+    /// `device_info.localeLanguageIso6391`, e.g. `"en"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    locale_language: Option<String>,
+    /// `device_info.localeCountryIso31661Alpha2`, e.g. `"US"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    locale_country: Option<String>,
+    /// The raw `device_info` JSON the client sent, retained for audit and for
+    /// reproducing the platform fingerprint later.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    device_info_raw: Option<String>,
+    /// Android FCM push token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    firebase_token: Option<String>,
+    /// Apple APNs push token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    apns_token: Option<String>,
+    /// Push-message toggle. Accepts `true`/`false` or `1`/`0` (the client's
+    /// Postman convention sends an integer).
+    #[serde(default, deserialize_with = "deserialize_bool_loose")]
+    notification: bool,
+}
+
+/// Deserialize a JSON boolean that may arrive as `true`/`false` or `1`/`0`.
+fn deserialize_bool_loose<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    let v = serde_json::Value::deserialize(deserializer)?;
+    match v {
+        serde_json::Value::Bool(b) => Ok(b),
+        serde_json::Value::Number(n) => n
+            .as_i64()
+            .map(|i| i != 0)
+            .ok_or_else(|| D::Error::custom("notification must be 0/1/true/false")),
+        serde_json::Value::String(s) if s == "true" => Ok(true),
+        serde_json::Value::String(s) if s == "false" => Ok(false),
+        _ => Err(D::Error::custom("notification must be 0/1/true/false")),
+    }
+}
+
 enum ApiError {
     NotFound,
     #[allow(dead_code)]
@@ -166,6 +240,7 @@ impl Api {
             ("POST", "/react") => Self::handle_react(ctx, req).await,
             ("POST", "/pair") => Self::handle_pair(ctx, req).await,
             ("POST", "/link") => Self::handle_link(ctx, req).await,
+            ("POST", "/init") => Self::handle_init(ctx, req).await,
             _ => Self::handle_not_found(),
         };
         Ok(response)
@@ -347,6 +422,137 @@ impl Api {
             }
         }
     }
+
+    /// Business `init`: register/re-register a client device keyed by its
+    /// `device_uuid`.
+    ///
+    /// `platform` comes from the `X-Platform` request header (official
+    /// WhatsApp PlatformType, e.g. `14`=IOS_PHONE, `16`=ANDROID_PHONE); the
+    /// body carries the rest. Idempotent upsert on `device_uuid`.
+    ///
+    /// 换卡: when the client re-inits with a different `phone_number` under the
+    /// same `device_uuid`, the stale `wa_device_id` (the old WhatsApp pairing)
+    /// is cleared and recorded to `pair_history(action='replace_phone')`. The
+    /// client then calls `/link` to re-pair the new number. The stale infra
+    /// device row is deliberately NOT deleted here — the /link flow for the new
+    /// number supersedes it (WhatsApp replaces the old device on pair), and
+    /// deleting it would drop Signal state mid-flow.
+    async fn handle_init(ctx: ServerContext, req: Request<Body>) -> Response<Body> {
+        // Official WhatsApp PlatformType, from the X-Platform header. Absent or
+        // unparseable leaves the column NULL (the pairing path can derive it
+        // later from DeviceProps); it is never a hard error. Read before
+        // consuming the body, which takes ownership of `req`.
+        let platform = req
+            .headers()
+            .get("x-platform")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<i16>().ok());
+
+        let parsed: Result<InitRequest, serde_json::Error> =
+            serde_json::from_slice(&body_bytes(req).await);
+        let request = match parsed {
+            Ok(r) => r,
+            Err(e) => return Self::error_to_response(ApiError::BadRequest(e.to_string())),
+        };
+        if request.device_uuid.trim().is_empty() {
+            return Self::error_to_response(ApiError::BadRequest(
+                "missing required field: device_uuid".to_string(),
+            ));
+        }
+        let device_uuid = request.device_uuid.trim().to_string();
+        let phone = request.phone_number.trim().to_string();
+        if phone.is_empty() {
+            return Self::error_to_response(ApiError::BadRequest(
+                "missing required field: phone_number".to_string(),
+            ));
+        }
+
+        // Look up the current row first so we can detect a phone-number change.
+        // A lookup miss means a brand-new user — nothing to clear.
+        let existing = match ctx
+            .storage_factory
+            .biz_user_by_device_uuid(&device_uuid)
+            .await
+        {
+            Ok(u) => u,
+            Err(e) => {
+                error!("init: lookup failed device_uuid={device_uuid}: {e}");
+                return Self::error_to_response(ApiError::InternalServerError);
+            }
+        };
+        let phone_changed = existing.as_ref().is_some_and(|u| u.phone_number != phone);
+
+        // Clear the stale pairing reference on a phone-number change. Only ever
+        // clears, never sets: the pairing path owns setting `wa_device_id`.
+        let clear_wa_device_id = phone_changed;
+
+        let user = match ctx
+            .storage_factory
+            .upsert_biz_user(
+                &device_uuid,
+                &phone,
+                platform,
+                request.os_version.as_deref(),
+                request.manufacturer.as_deref(),
+                request.device.as_deref(),
+                request.os_build_number.as_deref(),
+                request.locale_language.as_deref(),
+                request.locale_country.as_deref(),
+                request.device_info_raw.as_deref(),
+                request.firebase_token.as_deref(),
+                request.apns_token.as_deref(),
+                request.notification,
+                clear_wa_device_id,
+            )
+            .await
+        {
+            Ok(u) => u,
+            Err(e) => {
+                error!("init: upsert failed device_uuid={device_uuid}: {e}");
+                return Self::error_to_response(ApiError::InternalServerError);
+            }
+        };
+
+        if phone_changed {
+            let old_phone = existing.as_ref().map(|u| u.phone_number.as_str());
+            let old_wa_device_id = existing.as_ref().and_then(|u| u.wa_device_id);
+            if let Err(e) = ctx
+                .storage_factory
+                .record_pair_history(
+                    user.id,
+                    old_phone,
+                    old_wa_device_id,
+                    "replace_phone",
+                    None,
+                    Some(&format!(
+                        "device_uuid={device_uuid} re-init from {old_phone:?} to {phone}"
+                    )),
+                )
+                .await
+            {
+                warn!(
+                    "init: record_pair_history failed for user={} (non-fatal): {e}",
+                    user.id
+                );
+            }
+        }
+
+        info!(
+            "init: user id={} device_uuid={device_uuid} phone={phone} phone_changed={phone_changed} platform={platform:?}",
+            user.id
+        );
+        json_response(
+            StatusCode::OK,
+            &serde_json::json!({
+                "user_id": user.id,
+                "device_uuid": user.device_uuid,
+                "phone_number": user.phone_number,
+                "wa_device_id": user.wa_device_id,
+                "status": "ok",
+            }),
+        )
+    }
+
     ///
     /// The key is `{prefix}:{phone}` (see [`crate::task::pair_code_key`]).
     /// Accepts either `?phone=861866620688` or `?jid=861866620688@s.whatsapp.net`
